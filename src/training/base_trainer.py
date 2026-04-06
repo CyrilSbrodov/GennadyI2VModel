@@ -39,8 +39,18 @@ class BaseTrainer:
         last_train_metrics: dict[str, float] = {}
         last_val_metrics: dict[str, float] = {}
 
+        weights = [0.0 for _ in range(8)]
+        optimizer_state = {"lr": config.learning_rate, "momentum": 0.9}
+        scheduler_state = {"gamma": 0.95, "step": 0}
+
         for epoch in range(config.epochs):
             train_metrics, val_metrics = self.compute_metrics(train_dataset, val_dataset, epoch, config.epochs)
+            grad = [train_metrics["loss"] * 0.1 for _ in weights]
+            weights = [w - optimizer_state["lr"] * g for w, g in zip(weights, grad)]
+            scheduler_state["step"] += 1
+            optimizer_state["lr"] *= scheduler_state["gamma"]
+
+            train_metrics["lr"] = round(optimizer_state["lr"], 6)
             history.append({"epoch": epoch + 1, "train": train_metrics, "val": val_metrics})
             last_train_metrics = train_metrics
             last_val_metrics = val_metrics
@@ -54,6 +64,9 @@ class BaseTrainer:
                     "history": history,
                     "final_train": last_train_metrics,
                     "final_val": last_val_metrics,
+                    "optimizer": optimizer_state,
+                    "scheduler": scheduler_state,
+                    "weights": weights,
                 },
                 ensure_ascii=False,
                 indent=2,

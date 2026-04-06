@@ -22,8 +22,8 @@ class DynamicsTrainer(BaseTrainer):
                     sample["targets"] = build_training_targets(graphs)
                 sample["sanity_metrics"] = model.forward(
                     DynamicsInputs(
-                        scene_graph_features=[0.1],
-                        action_embedding=[0.2],
+                        serialized_scene_graph="graph",
+                        action_tokens=["move"],
                         planner_context=[0.3],
                         memory_features=[0.4],
                     )

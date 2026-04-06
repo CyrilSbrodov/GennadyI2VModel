@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 from core.schema import BBox, ExpressionState, OrientationState, PoseState
 from perception.detector import Detector, DetectorOutput, YoloPersonDetectorAdapter
 from perception.face import EmoNetFaceAnalyzerAdapter, FaceAnalyzer, FacePrediction
-from perception.objects import ObjectDetector, ObjectPrediction, YoloObjectDetectorAdapter
+from perception.objects import MonoDepthEstimator, ObjectDetector, ObjectPrediction, YoloObjectDetectorAdapter
 from perception.parser import HumanParser, ParsingPrediction, SegFormerHumanParserAdapter
 from perception.pose import PoseEstimator, PosePrediction, VitPoseAdapter
 from perception.tracker import ByteTrackAdapter, PersonTracker, TrackPrediction
@@ -32,6 +33,8 @@ class PersonFacts:
     track_confidence: float = 0.0
     track_source: str = "fallback"
     garments: list[dict] = field(default_factory=list)
+    hand_landmarks: list[tuple[float, float]] = field(default_factory=list)
+    face_landmarks: list[tuple[float, float]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -48,6 +51,10 @@ class PerceptionOutput:
     objects: list[ObjectFacts] = field(default_factory=list)
     frame_size: tuple[int, int] = (1024, 1024)
     warnings: list[str] = field(default_factory=list)
+    module_confidence: dict[str, float] = field(default_factory=dict)
+    module_latency_ms: dict[str, float] = field(default_factory=dict)
+    module_fallbacks: dict[str, str] = field(default_factory=dict)
+    depth_score: float | None = None
 
 
 class PerceptionPipeline:
@@ -61,6 +68,7 @@ class PerceptionPipeline:
         face: FaceAnalyzer | None = None,
         objects: ObjectDetector | None = None,
         tracker: PersonTracker | None = None,
+        depth: MonoDepthEstimator | None = None,
     ) -> None:
         self.detector = detector or YoloPersonDetectorAdapter()
         self.pose = pose or VitPoseAdapter()
@@ -68,21 +76,30 @@ class PerceptionPipeline:
         self.face = face or EmoNetFaceAnalyzerAdapter()
         self.objects = objects or YoloObjectDetectorAdapter()
         self.tracker = tracker or ByteTrackAdapter()
+        self.depth = depth or MonoDepthEstimator()
 
-    def _safe_module_call(self, fn, default, warnings: list[str], module_name: str):
+    def _safe_module_call(self, fn, default, warnings: list[str], module_name: str, out: PerceptionOutput):
+        start = time.perf_counter()
         try:
-            return fn()
+            value = fn()
+            out.module_fallbacks[module_name] = "native"
+            return value
         except Exception as exc:  # fallback behavior for partially unavailable modules
             warnings.append(f"{module_name}_unavailable:{exc.__class__.__name__}")
+            out.module_fallbacks[module_name] = "fallback"
             return default
+        finally:
+            out.module_latency_ms[module_name] = round((time.perf_counter() - start) * 1000.0, 3)
 
     def analyze(self, image_ref: str) -> PerceptionOutput:
-        warnings: list[str] = []
+        out = PerceptionOutput()
+        warnings = out.warnings
         detection_out = self._safe_module_call(
             lambda: self.detector.detect(image_ref),
             default=DetectorOutput(),
             warnings=warnings,
             module_name="detector",
+            out=out,
         )
 
         pose_predictions: dict[str, PosePrediction] = self._safe_module_call(
@@ -90,30 +107,42 @@ class PerceptionPipeline:
             default={},
             warnings=warnings,
             module_name="pose",
+            out=out,
         )
         parsing_predictions: dict[str, ParsingPrediction] = self._safe_module_call(
             lambda: self.parser.parse(image_ref, detection_out.persons),
             default={},
             warnings=warnings,
             module_name="parser",
+            out=out,
         )
         face_predictions: dict[str, FacePrediction] = self._safe_module_call(
             lambda: self.face.analyze(image_ref, detection_out.persons),
             default={},
             warnings=warnings,
             module_name="face",
+            out=out,
         )
         track_predictions: dict[str, TrackPrediction] = self._safe_module_call(
             lambda: self.tracker.assign(image_ref, detection_out.persons),
             default={},
             warnings=warnings,
             module_name="tracker",
+            out=out,
         )
         object_predictions: list[ObjectPrediction] = self._safe_module_call(
             lambda: self.objects.detect(image_ref),
             default=[],
             warnings=warnings,
             module_name="objects",
+            out=out,
+        )
+        out.depth_score = self._safe_module_call(
+            lambda: self.depth.estimate(image_ref),
+            default=None,
+            warnings=warnings,
+            module_name="depth",
+            out=out,
         )
 
         persons: list[PersonFacts] = []
@@ -156,10 +185,13 @@ class PerceptionPipeline:
                     track_confidence=tracked.confidence if tracked else 0.0,
                     track_source=tracked.source if tracked else "fallback",
                     garments=garments,
+                    hand_landmarks=pose.landmarks_2d if pose else [],
+                    face_landmarks=face.face_landmarks if face else [],
                 )
             )
 
-        objects = [
+        out.persons = persons
+        out.objects = [
             ObjectFacts(
                 object_type=obj.object_type,
                 bbox=obj.bbox,
@@ -168,9 +200,27 @@ class PerceptionPipeline:
             )
             for obj in object_predictions
         ]
-        return PerceptionOutput(
-            persons=persons,
-            objects=objects,
-            frame_size=detection_out.frame_size,
-            warnings=warnings,
-        )
+        out.frame_size = detection_out.frame_size
+        out.module_confidence = {
+            "detector": max([p.bbox_confidence for p in out.persons], default=0.0),
+            "pose": max([p.pose_confidence for p in out.persons], default=0.0),
+            "face": max([p.expression_confidence for p in out.persons], default=0.0),
+            "tracker": max([p.track_confidence for p in out.persons], default=0.0),
+            "objects": max([o.confidence for o in out.objects], default=0.0),
+        }
+        return out
+
+    def analyze_video(self, frames: list[str]) -> list[PerceptionOutput]:
+        outputs: list[PerceptionOutput] = []
+        stable_by_index: dict[int, str] = {}
+        for idx, frame in enumerate(frames):
+            out = self.analyze(frame)
+            for p_idx, person in enumerate(out.persons):
+                if p_idx in stable_by_index:
+                    person.track_id = stable_by_index[p_idx]
+                else:
+                    base = person.track_id or f"track_{p_idx+1}"
+                    stable_by_index[p_idx] = f"tid_{p_idx+1}_{abs(hash(base))%7}"
+                    person.track_id = stable_by_index[p_idx]
+            outputs.append(out)
+        return outputs

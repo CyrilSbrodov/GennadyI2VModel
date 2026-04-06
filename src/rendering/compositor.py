@@ -2,22 +2,58 @@ from __future__ import annotations
 
 from core.schema import GraphDelta, VideoMemory
 from rendering.roi_renderer import RenderedPatch
+from utils_tensor import blend, roll_x, shape, zeros
+
+
+def _to_frame_tensor(frame: str | list, size: tuple[int, int] = (256, 256)) -> list:
+    if isinstance(frame, list):
+        return frame
+    h, w = size
+    seed = abs(hash(frame)) % 255
+    arr = zeros(h, w, 3)
+    for y in range(h):
+        for x in range(w):
+            arr[y][x][0] = (seed % 101) / 100.0
+            arr[y][x][1] = (seed % 67) / 66.0
+            arr[y][x][2] = (seed % 47) / 46.0
+    return arr
 
 
 class Compositor:
-    def compose(self, current_frame: str, patches: list[RenderedPatch], delta: GraphDelta) -> str:
+    def compose(self, current_frame: str | list, patches: list[RenderedPatch], delta: GraphDelta) -> list:
+        _ = delta
+        frame = _to_frame_tensor(current_frame)
         ordered = sorted(patches, key=lambda p: p.z_index)
-        layers = "|".join(f"{p.region.region_id}:a{p.alpha:.2f}" for p in ordered)
-        edge_hint = "edge-aware"
-        return (
-            f"{current_frame}|compose[{layers}]|{edge_hint}|"
-            f"d={len(delta.pose_deltas)+len(delta.garment_deltas)+len(delta.expression_deltas)}"
-        )
+        h, w, _ = shape(frame)
+
+        for p in ordered:
+            x0 = max(0, min(w - 1, int(p.region.bbox.x * w)))
+            y0 = max(0, min(h - 1, int(p.region.bbox.y * h)))
+            roi_w = min(p.width, w - x0)
+            roi_h = min(p.height, h - y0)
+            if roi_w <= 0 or roi_h <= 0:
+                continue
+            dst = [row[x0 : x0 + roi_w] for row in frame[y0 : y0 + roi_h]]
+            src = [row[:roi_w] for row in p.rgb_patch[:roi_h]]
+            alpha = [row[:roi_w] for row in p.alpha_mask[:roi_h]]
+            blended = blend(dst, src, alpha)
+            for yy in range(roi_h):
+                frame[y0 + yy][x0 : x0 + roi_w] = blended[yy]
+        return frame
 
 
 class TemporalStabilizer:
-    def refine(self, previous_frame: str, new_frame: str, memory: VideoMemory, enabled: bool = True) -> str:
-        _ = memory
+    def refine(self, previous_frame: str | list, new_frame: str | list, memory: VideoMemory, enabled: bool = True) -> list:
+        prev = _to_frame_tensor(previous_frame)
+        cur = _to_frame_tensor(new_frame, size=shape(prev)[:2])
         if not enabled:
-            return new_frame
-        return f"{new_frame}|flow_smooth({previous_frame[-16:]})"
+            return cur
+        flow_strength = min(0.35, 0.1 + 0.02 * len(memory.temporal_history))
+        warped = roll_x(prev, shift=1)
+        h, w, c = shape(cur)
+        out = zeros(h, w, c)
+        for y in range(h):
+            for x in range(w):
+                for k in range(c):
+                    out[y][x][k] = cur[y][x][k] * (1.0 - flow_strength) + warped[y][x][k] * flow_strength
+        return out

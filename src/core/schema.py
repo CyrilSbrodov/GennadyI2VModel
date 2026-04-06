@@ -17,6 +17,7 @@ RelationType = Literal[
     "inside",
     "in_front_of",
     "behind",
+    "held_by",
 ]
 
 
