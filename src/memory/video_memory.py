@@ -4,6 +4,7 @@ from dataclasses import asdict
 import math
 import random
 
+from core.region_ids import make_region_id, parse_region_id
 from core.schema import (
     BBox,
     HiddenRegionSlot,
@@ -13,11 +14,11 @@ from core.schema import (
     TexturePatchMemory,
     VideoMemory,
 )
-from utils_tensor import mean_color
+from utils_tensor import crop, mean_color, shape
 
 
 class MemoryManager:
-    _SEMANTIC_REGIONS = ("face", "hair", "torso", "sleeves", "garments")
+    _SEMANTIC_REGIONS = ("face", "torso", "sleeves", "garments", "left_arm", "right_arm", "pelvis", "legs")
 
     def _encode_visual(self, token: str, dim: int = 8) -> list[float]:
         seed = abs(hash(token)) % (2**32)
@@ -26,28 +27,69 @@ class MemoryManager:
         n = math.sqrt(sum(v * v for v in vec)) or 1.0
         return [v / n for v in vec]
 
+    def _descriptor_to_embedding(self, descriptor: dict[str, float | list[float]]) -> list[float]:
+        mean = descriptor.get("mean", [0.0, 0.0, 0.0])
+        std = descriptor.get("std", [0.0, 0.0, 0.0])
+        edge = float(descriptor.get("edge_density", 0.0))
+        energy = float(descriptor.get("energy", 0.0))
+        raw = [float(mean[0]), float(mean[1]), float(mean[2]), float(std[0]), float(std[1]), float(std[2]), edge, energy]
+        n = math.sqrt(sum(v * v for v in raw)) or 1.0
+        return [v / n for v in raw]
+
+    def _descriptor_similarity(self, left: dict[str, float | list[float]] | None, right: dict[str, float | list[float]] | None) -> float:
+        if not left or not right:
+            return 0.0
+        a = self._descriptor_to_embedding(left)
+        b = self._descriptor_to_embedding(right)
+        return max(-1.0, min(1.0, sum(x * y for x, y in zip(a, b))))
+
+    def _bbox_to_pixels(self, bbox: BBox, frame: list) -> tuple[int, int, int, int]:
+        h, w, _ = shape(frame)
+        x0 = max(0, min(w - 1, int(bbox.x * w)))
+        y0 = max(0, min(h - 1, int(bbox.y * h)))
+        x1 = max(x0 + 1, min(w, int((bbox.x + bbox.w) * w)))
+        y1 = max(y0 + 1, min(h, int((bbox.y + bbox.h) * h)))
+        return x0, y0, x1, y1
+
+    def _patch_descriptor(self, patch: list[list[list[float]]]) -> dict[str, float | list[float]]:
+        h, w, _ = shape(patch)
+        if h == 0 or w == 0:
+            return {"mean": [0.0, 0.0, 0.0], "std": [0.0, 0.0, 0.0], "hist": [0.0] * 12, "edge_density": 0.0, "energy": 0.0}
+        n = float(h * w)
+        means = mean_color(patch)
+        var = [0.0, 0.0, 0.0]
+        hist = [0.0] * 12
+        edge = 0.0
+        energy = 0.0
+        for y in range(h):
+            for x in range(w):
+                px = patch[y][x]
+                for k in range(3):
+                    dv = px[k] - means[k]
+                    var[k] += dv * dv
+                    b = min(3, int(px[k] * 4.0))
+                    hist[k * 4 + b] += 1.0
+                energy += sum(ch * ch for ch in px) / 3.0
+                if x + 1 < w:
+                    npx = patch[y][x + 1]
+                    edge += sum(abs(px[k] - npx[k]) for k in range(3)) / 3.0
+                if y + 1 < h:
+                    npx = patch[y + 1][x]
+                    edge += sum(abs(px[k] - npx[k]) for k in range(3)) / 3.0
+        std = [math.sqrt(v / n) for v in var]
+        hist = [v / n for v in hist]
+        return {"mean": [float(v) for v in means], "std": [float(v) for v in std], "hist": [float(v) for v in hist], "edge_density": float(edge / n), "energy": float(energy / n)}
+
     def initialize(self, scene_graph: SceneGraph) -> VideoMemory:
         return self.initialize_from_scene(scene_graph)
 
     def initialize_from_scene(self, scene_graph: SceneGraph) -> VideoMemory:
         memory = VideoMemory(temporal_history=[scene_graph])
         for person in scene_graph.persons:
-            memory.identity_memory[person.person_id] = MemoryEntry(
-                entity_id=person.person_id,
-                entry_type="identity",
-                embedding=self._encode_visual(f"identity:{person.person_id}"),
-                confidence=person.confidence,
-                last_seen_frames=[scene_graph.frame_index],
-            )
+            memory.identity_memory[person.person_id] = MemoryEntry(entity_id=person.person_id, entry_type="identity", embedding=self._encode_visual(f"identity:{person.person_id}"), confidence=person.confidence, last_seen_frames=[scene_graph.frame_index])
             self._seed_person_semantic_regions(memory, person.person_id, person.bbox, scene_graph.frame_index)
             for garment in person.garments:
-                memory.garment_memory[garment.garment_id] = MemoryEntry(
-                    entity_id=garment.garment_id,
-                    entry_type="garment",
-                    embedding=self._encode_visual(f"garment:{garment.garment_id}"),
-                    confidence=garment.confidence,
-                    last_seen_frames=[scene_graph.frame_index],
-                )
+                memory.garment_memory[garment.garment_id] = MemoryEntry(entity_id=garment.garment_id, entry_type="garment", embedding=self._encode_visual(f"garment:{garment.garment_id}"), confidence=garment.confidence, last_seen_frames=[scene_graph.frame_index])
         return memory
 
     def update(self, memory: VideoMemory, scene_graph: SceneGraph) -> VideoMemory:
@@ -55,115 +97,118 @@ class MemoryManager:
 
     def update_from_graph(self, memory: VideoMemory, scene_graph: SceneGraph) -> VideoMemory:
         memory.temporal_history.append(scene_graph)
-        observed_region_ids: set[str] = set()
         observed_entities: set[str] = set()
-
+        visible_regions: set[str] = set()
         for person in scene_graph.persons:
             observed_entities.add(person.person_id)
             identity = memory.identity_memory.get(person.person_id)
             if identity is not None:
                 self._refresh_entry(identity, scene_graph.frame_index)
             for part in person.body_parts:
-                region_id = f"{person.person_id}:{part.part_type}"
+                region_id = make_region_id(person.person_id, part.part_type)
                 if part.visibility in ("visible", "partially_visible"):
-                    observed_region_ids.add(region_id)
-                    memory.region_descriptors[region_id] = RegionDescriptor(
-                        region_id=region_id,
-                        entity_id=person.person_id,
-                        region_type=part.part_type,
-                        bbox=BBox(person.bbox.x, person.bbox.y, person.bbox.w, person.bbox.h),
-                        visibility=part.visibility,
-                        confidence=part.confidence,
-                        last_update_frame=scene_graph.frame_index,
-                    )
+                    visible_regions.add(region_id)
+                    memory.region_descriptors[region_id] = RegionDescriptor(region_id=region_id, entity_id=person.person_id, region_type=part.part_type, bbox=person.bbox, visibility=part.visibility, confidence=part.confidence, last_update_frame=scene_graph.frame_index)
                 else:
-                    self.apply_visibility_event(
-                        memory,
-                        delta={"region_id": region_id, "entity": person.person_id},
-                        masks={},
-                        visibility="hidden",
-                    )
+                    self.apply_visibility_event(memory, {"region_id": region_id, "entity": person.person_id}, {}, visibility="hidden")
             for garment in person.garments:
                 observed_entities.add(garment.garment_id)
-                garment_entry = memory.garment_memory.get(garment.garment_id)
-                if garment_entry is not None and garment.visibility in ("visible", "partially_visible"):
-                    self._refresh_entry(garment_entry, scene_graph.frame_index)
+                gid = make_region_id(person.person_id, "garments")
+                if garment.visibility in ("visible", "partially_visible"):
+                    visible_regions.add(gid)
+                else:
+                    self.apply_visibility_event(memory, {"region_id": gid, "entity": person.person_id}, {}, visibility="hidden")
 
         for entry in list(memory.identity_memory.values()) + list(memory.garment_memory.values()):
             if entry.entity_id not in observed_entities:
                 entry.confidence *= 0.96
-
         for region_id, descriptor in memory.region_descriptors.items():
-            if region_id not in observed_region_ids:
+            if region_id not in visible_regions:
                 descriptor.confidence *= 0.95
-                descriptor.visibility = "hidden" if descriptor.confidence < 0.3 else descriptor.visibility
-
-        for slot in memory.hidden_region_slots.values():
-            slot.stale_frames += 0 if slot.slot_id in observed_region_ids else 1
-            slot.confidence = max(0.0, slot.confidence * (0.99 if slot.stale_frames < 3 else 0.95))
-
+                if descriptor.confidence < 0.3:
+                    descriptor.visibility = "hidden"
         return memory
 
     def update_from_frame(self, memory: VideoMemory, frame: list, scene_graph: SceneGraph) -> VideoMemory:
-        color = mean_color(frame)
         for person in scene_graph.persons:
-            patch_id = f"patch::{person.person_id}:latest"
-            memory.texture_patches[patch_id] = TexturePatchMemory(
-                patch_id=patch_id,
-                region_type="person",
-                entity_id=person.person_id,
-                source_frame=scene_graph.frame_index,
-                patch_ref=f"rgb://{color[0]:.3f},{color[1]:.3f},{color[2]:.3f}",
-                confidence=min(1.0, 0.6 + person.confidence * 0.3),
-            )
+            semantic_boxes: dict[str, BBox] = {
+                "face": BBox(person.bbox.x + person.bbox.w * 0.3, person.bbox.y, person.bbox.w * 0.4, person.bbox.h * 0.22),
+                "torso": BBox(person.bbox.x + person.bbox.w * 0.15, person.bbox.y + person.bbox.h * 0.2, person.bbox.w * 0.7, person.bbox.h * 0.35),
+                "sleeves": BBox(person.bbox.x + person.bbox.w * 0.05, person.bbox.y + person.bbox.h * 0.22, person.bbox.w * 0.9, person.bbox.h * 0.26),
+                "garments": BBox(person.bbox.x + person.bbox.w * 0.1, person.bbox.y + person.bbox.h * 0.2, person.bbox.w * 0.8, person.bbox.h * 0.55),
+                "pelvis": BBox(person.bbox.x + person.bbox.w * 0.3, person.bbox.y + person.bbox.h * 0.5, person.bbox.w * 0.4, person.bbox.h * 0.2),
+                "legs": BBox(person.bbox.x + person.bbox.w * 0.2, person.bbox.y + person.bbox.h * 0.58, person.bbox.w * 0.6, person.bbox.h * 0.38),
+            }
+            for region_type, bbox in semantic_boxes.items():
+                x0, y0, x1, y1 = self._bbox_to_pixels(bbox, frame)
+                patch = crop(frame, x0, y0, x1, y1)
+                desc = self._patch_descriptor(patch)
+                evidence = 0.45 + 0.3 * float(desc["edge_density"]) + 0.25 * float(sum(desc["std"]) / 3.0)
+                rid = make_region_id(person.person_id, region_type)
+                patch_id = f"patch::{rid}:{scene_graph.frame_index}"
+                memory.texture_patches[patch_id] = TexturePatchMemory(patch_id=patch_id, region_type=region_type, entity_id=person.person_id, source_frame=scene_graph.frame_index, patch_ref=f"roi://{x0},{y0},{x1},{y1}", confidence=min(1.0, 0.35 + person.confidence * 0.3 + evidence * 0.35), descriptor=desc, evidence_score=min(1.0, evidence))
+                memory.patch_cache[patch_id] = patch
+
+                descriptor = memory.region_descriptors.get(rid)
+                if descriptor:
+                    descriptor.last_update_frame = scene_graph.frame_index
+                    descriptor.confidence = min(1.0, descriptor.confidence * 0.8 + 0.2 * evidence)
+
+                identity = memory.identity_memory.get(person.person_id)
+                if identity is not None:
+                    emb = self._descriptor_to_embedding(desc)
+                    identity.embedding = [identity.embedding[i] * 0.8 + emb[i] * 0.2 for i in range(min(len(identity.embedding), len(emb)))]
+                for garment in person.garments:
+                    garment_entry = memory.garment_memory.get(garment.garment_id)
+                    if garment_entry and region_type in {"garments", "sleeves", "torso"}:
+                        emb = self._descriptor_to_embedding(desc)
+                        garment_entry.embedding = [garment_entry.embedding[i] * 0.75 + emb[i] * 0.25 for i in range(min(len(garment_entry.embedding), len(emb)))]
+
+                if region_type in {"sleeves", "garments", "legs"}:
+                    slot = memory.hidden_region_slots.setdefault(rid, HiddenRegionSlot(slot_id=rid, region_type=region_type, owner_entity=person.person_id, candidate_patch_ids=[]))
+                    slot.candidate_patch_ids = [patch_id] + [cid for cid in slot.candidate_patch_ids if cid != patch_id][:4]
+                    slot.confidence = min(1.0, 0.5 + evidence * 0.4)
+                    slot.stale_frames = 0
         return memory
 
     def mark_region_revealed(self, memory: VideoMemory, region_id: str, owner_entity: str) -> None:
         self.apply_visibility_event(memory, {"region_id": region_id, "entity": owner_entity}, {}, visibility="revealed")
 
     def query_hidden_region(self, memory: VideoMemory, region_id: str) -> HiddenRegionSlot | None:
-        return memory.hidden_region_slots.get(region_id)
+        entity, region_type = parse_region_id(region_id)
+        return memory.hidden_region_slots.get(make_region_id(entity, region_type))
 
-    def retrieve_for_region(self, memory: VideoMemory, region_type: str, owner_entity: str | None = None) -> list[TexturePatchMemory]:
+    def retrieve_for_region(self, memory: VideoMemory, region_type: str, owner_entity: str | None = None, query_descriptor: dict[str, float | list[float]] | None = None) -> list[TexturePatchMemory]:
         patches = [p for p in memory.texture_patches.values() if p.region_type == region_type]
         if owner_entity is not None:
             patches = [p for p in patches if p.entity_id == owner_entity]
-        return sorted(patches, key=lambda p: p.confidence, reverse=True)
+        return sorted(patches, key=lambda p: (p.confidence + 0.2 * self._descriptor_similarity(query_descriptor, p.descriptor), p.evidence_score, p.source_frame), reverse=True)
 
     def apply_visibility_event(self, memory: VideoMemory, delta: dict[str, str], masks: dict[str, object], visibility: str) -> None:
         _ = masks
-        region_id = delta.get("region_id", "unknown")
-        owner = delta.get("entity", "unknown")
+        entity_id, region_type = parse_region_id(delta.get("region_id", "scene:unknown"))
+        region_id = make_region_id(entity_id, region_type)
+        owner = delta.get("entity", entity_id)
         slot = memory.hidden_region_slots.get(region_id)
         if slot is None:
-            memory.hidden_region_slots[region_id] = HiddenRegionSlot(
-                slot_id=region_id,
-                region_type=region_id.split(":")[-1],
-                owner_entity=owner,
-                candidate_patch_ids=[],
-                confidence=0.55,
-            )
-            slot = memory.hidden_region_slots[region_id]
+            slot = HiddenRegionSlot(slot_id=region_id, region_type=region_type, owner_entity=owner, candidate_patch_ids=[], confidence=0.55)
+            memory.hidden_region_slots[region_id] = slot
         if visibility == "revealed":
             slot.confidence = min(1.0, slot.confidence + 0.15)
             slot.stale_frames = 0
-        else:
-            slot.confidence = max(0.0, slot.confidence - 0.1)
+        elif visibility == "hidden":
+            slot.confidence = max(0.1, slot.confidence - 0.12)
             slot.stale_frames += 1
 
     def retrieve(self, memory: VideoMemory, query_embedding: list[float], bank: str = "texture", top_k: int = 3) -> list[dict[str, object]]:
         qn = math.sqrt(sum(v * v for v in query_embedding)) or 1.0
         q = [v / qn for v in query_embedding]
-
         if bank == "identity":
             entries = list(memory.identity_memory.values())
         elif bank == "garment":
             entries = list(memory.garment_memory.values())
         else:
-            entries = [
-                MemoryEntry(entity_id=v.patch_id, entry_type="texture", embedding=self._encode_visual(v.patch_id), confidence=v.confidence)
-                for v in memory.texture_patches.values()
-            ]
+            entries = [MemoryEntry(entity_id=v.patch_id, entry_type="texture", embedding=self._descriptor_to_embedding(v.descriptor) if v.descriptor else self._encode_visual(v.patch_id), confidence=v.confidence) for v in memory.texture_patches.values()]
 
         scored: list[tuple[float, MemoryEntry]] = []
         for e in entries:
@@ -172,14 +217,7 @@ class MemoryManager:
             sim = sum(a * b for a, b in zip(q, emb))
             scored.append((float(sim), e))
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [
-            {
-                "entity_id": e.entity_id,
-                "similarity": round(sim, 4),
-                "confidence": round((sim + e.confidence) / 2.0, 4),
-            }
-            for sim, e in scored[:top_k]
-        ]
+        return [{"entity_id": e.entity_id, "similarity": round(sim, 4), "confidence": round((sim + e.confidence) / 2.0, 4)} for sim, e in scored[:top_k]]
 
     def query_by_region(self, memory: VideoMemory, region_type: str) -> list[RegionDescriptor]:
         return [descriptor for descriptor in memory.region_descriptors.values() if descriptor.region_type == region_type]
@@ -187,33 +225,25 @@ class MemoryManager:
     def query_by_entity(self, memory: VideoMemory, entity_id: str) -> dict[str, object]:
         regions = [descriptor for descriptor in memory.region_descriptors.values() if descriptor.entity_id == entity_id]
         patches = [patch for patch in memory.texture_patches.values() if patch.entity_id == entity_id]
-        return {
-            "identity": memory.identity_memory.get(entity_id),
-            "garment": memory.garment_memory.get(entity_id),
-            "regions": regions,
-            "patches": patches,
-        }
+        return {"identity": memory.identity_memory.get(entity_id), "garment": memory.garment_memory.get(entity_id), "regions": regions, "patches": patches}
 
     def query_hidden_candidate(self, memory: VideoMemory, region_type: str) -> TexturePatchMemory | None:
         candidates = [p for p in memory.texture_patches.values() if p.region_type == region_type]
         if not candidates:
             return None
-        return max(candidates, key=lambda c: c.confidence)
+        return max(candidates, key=lambda c: (c.confidence, c.evidence_score))
 
     def to_dict(self, memory: VideoMemory) -> dict[str, object]:
         return asdict(memory)
 
     def from_dict(self, payload: dict[str, object]) -> VideoMemory:
         memory = VideoMemory()
-
         for key, value in (payload.get("identity_memory") or {}).items():
             memory.identity_memory[key] = MemoryEntry(**value)
         for key, value in (payload.get("garment_memory") or {}).items():
             memory.garment_memory[key] = MemoryEntry(**value)
-
         memory.patch_cache = dict(payload.get("patch_cache") or {})
         memory.temporal_history = []
-
         for key, value in (payload.get("texture_patches") or {}).items():
             memory.texture_patches[key] = TexturePatchMemory(**value)
         for key, value in (payload.get("hidden_region_slots") or {}).items():
@@ -221,7 +251,6 @@ class MemoryManager:
         for key, value in (payload.get("region_descriptors") or {}).items():
             bbox = BBox(**value["bbox"])
             memory.region_descriptors[key] = RegionDescriptor(**{**value, "bbox": bbox})
-
         return memory
 
     def _refresh_entry(self, entry: MemoryEntry, frame_index: int) -> None:
@@ -230,31 +259,7 @@ class MemoryManager:
 
     def _seed_person_semantic_regions(self, memory: VideoMemory, person_id: str, bbox: BBox, frame_index: int) -> None:
         for offset, region_type in enumerate(self._SEMANTIC_REGIONS):
-            region_id = f"{person_id}:{region_type}"
-            memory.region_descriptors[region_id] = RegionDescriptor(
-                region_id=region_id,
-                entity_id=person_id,
-                region_type=region_type,
-                bbox=BBox(bbox.x, bbox.y + 0.02 * offset, bbox.w, bbox.h),
-                visibility="visible" if region_type in ("face", "torso") else "partially_visible",
-                confidence=0.8,
-                last_update_frame=frame_index,
-            )
+            region_id = make_region_id(person_id, region_type)
+            memory.region_descriptors[region_id] = RegionDescriptor(region_id=region_id, entity_id=person_id, region_type=region_type, bbox=BBox(bbox.x, bbox.y + 0.01 * offset, bbox.w, bbox.h), visibility="visible" if region_type in ("face", "torso") else "partially_visible", confidence=0.75, last_update_frame=frame_index)
             patch_id = f"patch::{region_id}"
-            memory.texture_patches[patch_id] = TexturePatchMemory(
-                patch_id=patch_id,
-                region_type=region_type,
-                entity_id=person_id,
-                source_frame=frame_index,
-                patch_ref=f"mem://{patch_id}",
-                confidence=0.75,
-            )
-            if region_type in ("sleeves", "garments"):
-                slot_id = f"{person_id}:{region_type}"
-                memory.hidden_region_slots[slot_id] = HiddenRegionSlot(
-                    slot_id=slot_id,
-                    region_type=region_type,
-                    owner_entity=person_id,
-                    candidate_patch_ids=[patch_id],
-                    confidence=0.7,
-                )
+            memory.texture_patches[patch_id] = TexturePatchMemory(patch_id=patch_id, region_type=region_type, entity_id=person_id, source_frame=frame_index, patch_ref=f"seed://{region_id}", confidence=0.5, descriptor={}, evidence_score=0.2)

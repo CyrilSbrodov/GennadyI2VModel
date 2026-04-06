@@ -16,7 +16,7 @@ from rendering.roi_renderer import PatchRenderer, ROISelector
 from representation.graph_builder import SceneGraphBuilder
 from runtime.profiles import PROFILES, RuntimeProfile
 from text.intent_parser import IntentParser
-from utils_tensor import mean_color, shape, zeros
+from utils_tensor import shape, zeros
 
 
 @dataclass(slots=True)
@@ -60,9 +60,8 @@ class GennadyEngine:
 
         first_frame = request.unified_asset.frames[0] if request.unified_asset and request.unified_asset.frames else None
         current_frame = first_frame.tensor if first_frame else self._debug_seed_frame_tensor(profile)
-        source_ref = self._frame_ref(current_frame, first_frame.source if first_frame else "debug://blank")
-
-        perception_output = self.perception.analyze(source_ref)
+        perception_input = first_frame if first_frame else current_frame
+        perception_output = self.perception.analyze(perception_input)
         perception_output.frame_size = (shape(current_frame)[1], shape(current_frame)[0])
         scene_graph = self.graph_builder.build(perception_output, frame_index=0)
         scene_graph.global_context.fps = fps
@@ -101,7 +100,15 @@ class GennadyEngine:
                 for region in changed_regions[: profile.max_roi_count]
             ]
             composed = self.compositor.compose(current_frame, patches, delta)
-            stable_frame = self.stabilizer.refine(frames[-1], composed, memory, enabled=profile.temporal_refinement)
+            avg_patch_conf = (sum(p.confidence for p in patches) / len(patches)) if patches else 0.5
+            stable_frame = self.stabilizer.refine(
+                frames[-1],
+                composed,
+                memory,
+                enabled=profile.temporal_refinement,
+                updated_regions=[p.region for p in patches],
+                region_confidence=avg_patch_conf,
+            )
 
             scene_graph = apply_delta(scene_graph, delta)
             memory = self.memory_manager.update_from_graph(memory, scene_graph)
@@ -142,11 +149,6 @@ class GennadyEngine:
                 },
             },
         )
-
-    def _frame_ref(self, frame: list, source_hint: str) -> str:
-        h, w, _ = shape(frame)
-        mc = mean_color(frame)
-        return f"frame://{Path(source_hint).name}?w={w}&h={h}&mean={mc[0]:.3f},{mc[1]:.3f},{mc[2]:.3f}"
 
     def _debug_seed_frame_tensor(self, profile: RuntimeProfile) -> list:
         h, w = profile.internal_resolution

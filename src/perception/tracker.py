@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from core.input_layer import AssetFrame
 from typing import Protocol
 
 from core.schema import BBox
-from perception.backend import BackendInferenceEngine, image_ref_to_features
+from perception.backend import BackendInferenceEngine, frame_to_features
 from perception.detector import BackendConfig, PersonDetection
 
 
@@ -16,7 +18,7 @@ class TrackPrediction:
 
 
 class PersonTracker(Protocol):
-    def assign(self, image_ref: str, persons: list[PersonDetection]) -> dict[str, TrackPrediction]:
+    def assign(self, frame: AssetFrame | list[list[list[float]]] | str, persons: list[PersonDetection]) -> dict[str, TrackPrediction]:
         ...
 
 
@@ -42,8 +44,8 @@ class ByteTrackAdapter:
         self._tracks: dict[str, BBox] = {}
         self._next_id = 1
 
-    def assign(self, image_ref: str, persons: list[PersonDetection]) -> dict[str, TrackPrediction]:
-        feats = image_ref_to_features(image_ref)
+    def assign(self, frame: AssetFrame | list[list[list[float]]] | str, persons: list[PersonDetection]) -> dict[str, TrackPrediction]:
+        feats = frame_to_features(frame)
         if self.config.backend in {"torch", "onnx"}:
             feats = self.engine.infer(feats)
         out: dict[str, TrackPrediction] = {}

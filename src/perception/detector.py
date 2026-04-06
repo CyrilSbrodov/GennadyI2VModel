@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from core.input_layer import AssetFrame
 from core.schema import BBox
-from perception.backend import BackendInferenceEngine, CheckpointManager, CheckpointSpec, image_ref_to_features
+from perception.backend import BackendInferenceEngine, CheckpointManager, CheckpointSpec, frame_to_features
 
 
 @dataclass(slots=True)
@@ -30,7 +31,7 @@ class DetectorOutput:
 
 
 class Detector(Protocol):
-    def detect(self, image_ref: str) -> DetectorOutput:
+    def detect(self, frame: AssetFrame | list[list[list[float]]] | str) -> DetectorOutput:
         ...
 
 
@@ -41,12 +42,12 @@ class YoloPersonDetectorAdapter:
         self.config = config or BackendConfig()
         self.engine = BackendInferenceEngine(self.source_name, self.config.backend, self.config.checkpoint)
 
-    def _run_backend(self, image_ref: str) -> list[float]:
+    def _run_backend(self, frame: AssetFrame | list[list[list[float]]] | str) -> list[float]:
         if self.config.backend in {"torch", "onnx"}:
-            return self.engine.infer(image_ref_to_features(image_ref))
+            return self.engine.infer(frame_to_features(frame))
 
         # builtin fallback: dynamic per input (not constant stubs)
-        feats = image_ref_to_features(image_ref)
+        feats = frame_to_features(frame)
         return [
             (feats[0] + feats[3]) / 2,
             (feats[1] + feats[4]) / 2,
@@ -61,9 +62,9 @@ class YoloPersonDetectorAdapter:
                 CheckpointSpec(self.source_name, self.config.backend, self.config.checkpoint)
             )
 
-    def detect(self, image_ref: str) -> DetectorOutput:
+    def detect(self, frame: AssetFrame | list[list[list[float]]] | str) -> DetectorOutput:
         self.validate_checkpoint()
-        pred = self._run_backend(image_ref)
+        pred = self._run_backend(frame)
         x = min(0.8, max(0.02, pred[0] * 0.6))
         y = min(0.8, max(0.02, pred[1] * 0.5))
         w = min(0.9 - x, max(0.1, pred[2] * 0.55 + 0.25))
@@ -72,7 +73,7 @@ class YoloPersonDetectorAdapter:
         return DetectorOutput(
             persons=[
                 PersonDetection(
-                    detection_id=f"det::{image_ref}::person_1",
+                    detection_id="det::person_1",
                     bbox=BBox(x, y, w, h),
                     confidence=conf,
                     source=f"{self.source_name}:{self.config.backend}",

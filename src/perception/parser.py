@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from perception.backend import BackendInferenceEngine, image_ref_to_features
+from perception.backend import BackendInferenceEngine, frame_to_features
 from perception.detector import BackendConfig, PersonDetection
 
 
@@ -25,7 +25,7 @@ class ParsingPrediction:
 
 
 class HumanParser(Protocol):
-    def parse(self, image_ref: str, persons: list[PersonDetection]) -> dict[str, ParsingPrediction]:
+    def parse(self, frame: AssetFrame | list[list[list[float]]] | str, persons: list[PersonDetection]) -> dict[str, ParsingPrediction]:
         ...
 
 
@@ -36,16 +36,16 @@ class SegFormerHumanParserAdapter:
         self.config = config or BackendConfig(checkpoint="checkpoints/segformer.torch")
         self.engine = BackendInferenceEngine(self.source_name, self.config.backend, self.config.checkpoint)
 
-    def parse(self, image_ref: str, persons: list[PersonDetection]) -> dict[str, ParsingPrediction]:
+    def parse(self, frame: AssetFrame | list[list[list[float]]] | str, persons: list[PersonDetection]) -> dict[str, ParsingPrediction]:
         result: dict[str, ParsingPrediction] = {}
-        feats = image_ref_to_features(image_ref)
+        feats = frame_to_features(frame)
         if self.config.backend in {"torch", "onnx"}:
             feats = self.engine.infer(feats)
         for person in persons:
             coat_conf = min(0.95, max(0.1, feats[0]))
             shirt_conf = min(0.95, max(0.1, feats[1]))
             result[person.detection_id] = ParsingPrediction(
-                mask_ref=f"mask::{image_ref}::{person.detection_id}",
+                mask_ref=f"mask::{person.detection_id}",
                 mask_confidence=min(0.99, max(0.2, feats[2])),
                 source=f"{self.source_name}:{self.config.backend}",
                 garments=[

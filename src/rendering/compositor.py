@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from core.schema import GraphDelta, VideoMemory
+from core.schema import GraphDelta, RegionRef, VideoMemory
 from rendering.roi_renderer import RenderedPatch
-from utils_tensor import blend, roll_x, shape, zeros
+from utils_tensor import blend, shape
 
 
 class Compositor:
@@ -29,17 +29,38 @@ class Compositor:
 
 
 class TemporalStabilizer:
-    def refine(self, previous_frame: list, new_frame: list, memory: VideoMemory, enabled: bool = True) -> list:
+    def _bbox_to_pixels(self, bbox, frame: list) -> tuple[int, int, int, int]:
+        h, w, _ = shape(frame)
+        x0 = max(0, min(w - 1, int(bbox.x * w)))
+        y0 = max(0, min(h - 1, int(bbox.y * h)))
+        x1 = max(x0 + 1, min(w, int((bbox.x + bbox.w) * w)))
+        y1 = max(y0 + 1, min(h, int((bbox.y + bbox.h) * h)))
+        return x0, y0, x1, y1
+
+    def refine(
+        self,
+        previous_frame: list,
+        new_frame: list,
+        memory: VideoMemory,
+        enabled: bool = True,
+        updated_regions: list[RegionRef] | None = None,
+        region_confidence: float = 0.7,
+    ) -> list:
+        _ = memory
         prev = previous_frame
         cur = new_frame
         if not enabled:
             return cur
-        flow_strength = min(0.35, 0.08 + 0.015 * len(memory.temporal_history))
-        warped = roll_x(prev, shift=1)
+        out = [[px[:] for px in row] for row in cur]
+        if not updated_regions:
+            return out
+
         h, w, c = shape(cur)
-        out = zeros(h, w, c)
-        for y in range(h):
-            for x in range(w):
-                for k in range(c):
-                    out[y][x][k] = cur[y][x][k] * (1.0 - flow_strength) + warped[y][x][k] * flow_strength
+        temporal_weight = min(0.85, 0.2 + 0.5 * region_confidence)
+        for region in updated_regions:
+            x0, y0, x1, y1 = self._bbox_to_pixels(region.bbox, cur)
+            for y in range(max(0, y0), min(h, y1)):
+                for x in range(max(0, x0), min(w, x1)):
+                    for k in range(c):
+                        out[y][x][k] = cur[y][x][k] * (1.0 - temporal_weight) + prev[y][x][k] * temporal_weight
         return out

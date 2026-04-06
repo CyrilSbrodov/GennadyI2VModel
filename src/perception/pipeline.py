@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
+from core.input_layer import AssetFrame
 from core.schema import BBox, ExpressionState, OrientationState, PoseState
 from perception.detector import Detector, DetectorOutput, YoloPersonDetectorAdapter
 from perception.face import EmoNetFaceAnalyzerAdapter, FaceAnalyzer, FacePrediction
@@ -10,6 +11,7 @@ from perception.objects import MonoDepthEstimator, ObjectDetector, ObjectPredict
 from perception.parser import HumanParser, ParsingPrediction, SegFormerHumanParserAdapter
 from perception.pose import PoseEstimator, PosePrediction, VitPoseAdapter
 from perception.tracker import ByteTrackAdapter, PersonTracker, TrackPrediction
+from utils_tensor import shape
 
 
 @dataclass(slots=True)
@@ -94,11 +96,11 @@ class PerceptionPipeline:
         finally:
             out.module_latency_ms[module_name] = round((time.perf_counter() - start) * 1000.0, 3)
 
-    def analyze(self, image_ref: str) -> PerceptionOutput:
+    def analyze(self, frame: AssetFrame | list[list[list[float]]] | str) -> PerceptionOutput:
         out = PerceptionOutput()
         warnings = out.warnings
         detection_out = self._safe_module_call(
-            lambda: self.detector.detect(image_ref),
+            lambda: self.detector.detect(frame),
             default=DetectorOutput(),
             warnings=warnings,
             module_name="detector",
@@ -106,42 +108,42 @@ class PerceptionPipeline:
         )
 
         pose_predictions: dict[str, PosePrediction] = self._safe_module_call(
-            lambda: self.pose.estimate(image_ref, detection_out.persons),
+            lambda: self.pose.estimate(frame, detection_out.persons),
             default={},
             warnings=warnings,
             module_name="pose",
             out=out,
         )
         parsing_predictions: dict[str, ParsingPrediction] = self._safe_module_call(
-            lambda: self.parser.parse(image_ref, detection_out.persons),
+            lambda: self.parser.parse(frame, detection_out.persons),
             default={},
             warnings=warnings,
             module_name="parser",
             out=out,
         )
         face_predictions: dict[str, FacePrediction] = self._safe_module_call(
-            lambda: self.face.analyze(image_ref, detection_out.persons),
+            lambda: self.face.analyze(frame, detection_out.persons),
             default={},
             warnings=warnings,
             module_name="face",
             out=out,
         )
         track_predictions: dict[str, TrackPrediction] = self._safe_module_call(
-            lambda: self.tracker.assign(image_ref, detection_out.persons),
+            lambda: self.tracker.assign(frame, detection_out.persons),
             default={},
             warnings=warnings,
             module_name="tracker",
             out=out,
         )
         object_predictions: list[ObjectPrediction] = self._safe_module_call(
-            lambda: self.objects.detect(image_ref),
+            lambda: self.objects.detect(frame),
             default=[],
             warnings=warnings,
             module_name="objects",
             out=out,
         )
         out.depth_score = self._safe_module_call(
-            lambda: self.depth.estimate(image_ref),
+            lambda: self.depth.estimate(frame),
             default=None,
             warnings=warnings,
             module_name="depth",
@@ -207,7 +209,14 @@ class PerceptionPipeline:
             )
             for obj in object_predictions
         ]
-        out.frame_size = detection_out.frame_size
+        if isinstance(frame, str):
+            out.frame_size = detection_out.frame_size
+            out.module_fallbacks["input_mode"] = "string_ref_fallback"
+        else:
+            tensor = frame.tensor if isinstance(frame, AssetFrame) else frame
+            h, w, _ = shape(tensor)
+            out.frame_size = (w, h)
+            out.module_fallbacks["input_mode"] = "frame_tensor"
         out.module_confidence = {
             "detector": max([p.bbox_confidence for p in out.persons], default=0.0),
             "pose": max([p.pose_confidence for p in out.persons], default=0.0),
@@ -217,7 +226,7 @@ class PerceptionPipeline:
         }
         return out
 
-    def analyze_video(self, frames: list[str], batch_size: int = 4) -> list[PerceptionOutput]:
+    def analyze_video(self, frames: list[AssetFrame | list[list[list[float]]] | str], batch_size: int = 4) -> list[PerceptionOutput]:
         outputs: list[PerceptionOutput] = []
         if not frames:
             return outputs

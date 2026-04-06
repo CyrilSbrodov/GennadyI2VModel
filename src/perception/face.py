@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from core.input_layer import AssetFrame
 from typing import Protocol
 
 from core.schema import ExpressionState, OrientationState
-from perception.backend import BackendInferenceEngine, image_ref_to_features
+from perception.backend import BackendInferenceEngine, frame_to_features
 from perception.detector import BackendConfig, PersonDetection
 
 
@@ -19,7 +21,7 @@ class FacePrediction:
 
 
 class FaceAnalyzer(Protocol):
-    def analyze(self, image_ref: str, persons: list[PersonDetection]) -> dict[str, FacePrediction]:
+    def analyze(self, frame: AssetFrame | list[list[list[float]]] | str, persons: list[PersonDetection]) -> dict[str, FacePrediction]:
         ...
 
 
@@ -30,9 +32,9 @@ class EmoNetFaceAnalyzerAdapter:
         self.config = config or BackendConfig(checkpoint="checkpoints/emonet.torch")
         self.engine = BackendInferenceEngine(self.source_name, self.config.backend, self.config.checkpoint)
 
-    def analyze(self, image_ref: str, persons: list[PersonDetection]) -> dict[str, FacePrediction]:
+    def analyze(self, frame: AssetFrame | list[list[list[float]]] | str, persons: list[PersonDetection]) -> dict[str, FacePrediction]:
         result: dict[str, FacePrediction] = {}
-        feats = image_ref_to_features(image_ref)
+        feats = frame_to_features(frame)
         if self.config.backend in {"torch", "onnx"}:
             feats = self.engine.infer(feats)
         for person in persons:

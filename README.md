@@ -2,29 +2,44 @@
 
 Модульный прототип **image-to-video scene engine**: входное изображение + текстовая инструкция → sequence of scene states → graph deltas → ROI patch rendering → composited video.
 
-## Текущее состояние (честно)
+## Статус проекта (честно)
 
-### Уже working baseline
-- **Real image grounding**: runtime стартует из реального входного изображения (через `InputAssetLayer`), а не из hash-seed кадра.
-- **Input layer**: чтение single/multi image, базовое видео-плечо (decode при наличии OpenCV, иначе metadata fallback), unified asset container.
-- **Text understanding v2**: нормализация, action lexicon + regex fallback, slot extraction, parser confidence/trace, sequential/parallel decomposition.
-- **Scene graph builder**: построение graph из perception facts, relation inference (`part_of`, `covers`, `supports`, `occludes`), confidence/provenance, валидация ссылочной целостности.
-- **Graph delta flow**: `graph + planned state -> GraphDelta`, затем `apply_delta(graph, delta)`.
-- **ROI patch pipeline**: ROI selector → patch warp/refine baseline → alpha blend compositor → temporal stabilizer.
-- **Memory subsystem**: identity/garment entries, texture patches, hidden-region slots, update/retrieve API.
-- **Training data pipeline**: synthetic + real/pseudo path для Perception/Representation/Dynamics/Renderer/TextAction/Memory datasets.
+### Реально working baseline (сейчас)
+- **Perception реально получает frame tensor / `AssetFrame`** и строит признаки от пикселей (mean/std luminance, edge density, aspect), а не от строкового `frame://...mean=...` как primary path.
+- **Runtime действительно image-grounded**: `GennadyEngine` передаёт первый реальный кадр в perception.
+- **Visual memory baseline стал image-driven**:
+  - region mean/std,
+  - coarse histogram,
+  - edge density / energy,
+  - patch cache по нескольким semantic regions (face/torso/sleeves/garments/pelvis/legs).
+- **PatchRenderer реально использует memory**: region-specific retrieval (face / garments / generic), hidden-region candidates и debug trace о причинах выбора.
+- **ROISelector стал graph/delta-semantics-aware**: учитывает `semantic_reasons`, `affected_regions`, sit/arm/face/garment сценарии.
+- **GraphDelta расширен**: `affected_entities`, `affected_regions`, `semantic_reasons`, `predicted_visibility_changes`.
+- **Canonical region-id contract**: единый формат `entity_id:region_type` во всех модулях (`GraphDelta`, `ROISelector`, `MemoryManager`, `PatchRenderer`).
+- **TemporalStabilizer weak baseline**: стабилизация только внутри обновлённых ROI (без константного fake flow по всему кадру).
+- **Training data builders расширены**:
+  - `RepresentationDataset.from_perception_cache(...)`
+  - `DynamicsDataset.from_transition_manifest(...)`
+  - `RendererDataset.from_video_manifest(...)`
+  - `TextActionDataset.from_annotation_manifest(...)`
+  - `MemoryDataset.from_graph_sequence(...)`
+  - graph cache `save_graph_cache(...)` / `load_graph_cache(...)`
 
-### Что пока baseline / future learned hooks
-- Perception adapters сейчас lightweight и largely deterministic.
-- Dynamics rules + tiny learned-ready stub, без физически корректной симуляции.
-- ROI patch renderer — deterministic local transform baseline (warp/refine), не diffusion/video foundation model.
-- Continual-learning scaffold: контракты replay/mix/freeze/distillation готовы, но full production CL loop не реализован.
+### Deterministic baseline (и это явно deterministic)
+- Перцепция и рендер по-прежнему heuristic/детерминированные адаптеры и hand-crafted processing, без полноценного learned visual backbone.
+- ROI rendering — memory-aware compositional baseline, не diffusion/video model.
+- Dynamics predictor использует rule-guided deltas + tiny learned-ready scaling stub.
+
+### Future learned hooks (ещё не реализовано как learned)
+- Замена perception adapters на полноценно обученные детекторы/парсеры/pose/face.
+- Learned patch synthesis вместо deterministic blend/refine.
+- Learned temporal model (optical-flow/transformer-level), а не weak ROI smoothing baseline.
+- Полноценное обучение на production-scale аннотациях (текущий pipeline mostly pseudo/manifest-driven).
 
 ---
 
-## Архитектура
-
-1. `core/input_layer.py` — unified assets, resize profile, image/video loading.
+## Архитектура (сохранена модульность)
+1. `core/input_layer.py` — unified assets, image/video loading.
 2. `perception/*` — detector/pose/parser/face/objects/tracker adapters.
 3. `representation/graph_builder.py` — scene graph build + relation reasoning.
 4. `memory/video_memory.py` — appearance/garment/hidden region memory.
@@ -37,90 +52,28 @@
 
 ---
 
-## Runtime data flow
+## Training data contracts
+- `PerceptionDataset.from_image_manifest(...)` — ingestion из image manifest.
+- `RepresentationDataset.from_perception_dataset(...)` / `from_perception_cache(...)` — graph samples.
+- `DynamicsDataset.from_graph_sequence(...)` / `from_transition_manifest(...)` — transition/delta samples.
+- `RendererDataset.from_frame_pairs(...)` / `from_video_manifest(...)` — ROI before/after pairs.
+- `TextActionDataset.from_jsonl(...)` / `from_annotation_manifest(...)` — text-action alignment.
+- `MemoryDataset.from_representation_dataset(...)` / `from_graph_sequence(...)` — memory records from visible regions.
+- `save_graph_cache(...)` / `load_graph_cache(...)` — cache serialization helpers.
 
-```text
-input image/video
-  -> InputAssetLayer (decode + normalize + unified asset)
-  -> PerceptionPipeline (facts)
-  -> SceneGraphBuilder (scene graph)
-  -> IntentParser (structured action plan)
-  -> TransitionPlanner (intermediate states)
-  -> GraphDeltaPredictor (state deltas)
-  -> ROISelector + PatchRenderer (local patch updates)
-  -> Compositor + TemporalStabilizer
-  -> frames/video export
-```
+### Graph cache contract (partial but useful)
+- `frame_index`
+- `global_context` (`frame_size`, `fps`, `source_type`)
+- `persons`: `person_id`, `track_id`, `bbox`, `confidence`, `garments`, `body_parts` (включая keypoint summary)
+- `objects`: `object_id`, `object_type`, `bbox`, `confidence`
+- `relations`: `source`, `relation`, `target`, `confidence`, `provenance`
 
----
+### Perception cache contract for `RepresentationDataset.from_perception_cache(...)`
+- ожидается `records[]` с cached perception facts:
+  - `frame_index`
+  - `frame_size`
+  - `persons[]` (обязательно, включая `bbox`)
+  - `objects[]` (опционально)
+- builder строит graph из cached facts напрямую; если `persons` отсутствует и `strict=True`, выбрасывается ошибка.
 
-## Быстрый запуск
-
-```python
-from runtime.orchestrator import GennadyEngine
-
-engine = GennadyEngine()
-artifacts = engine.run(
-    images=["/path/to/input.ppm"],
-    text="Снимает пальто и садится на стул, затем улыбается",
-    quality_profile="balanced",  # debug / balanced / quality
-)
-print("frames:", len(artifacts.frames))
-print("source mode:", artifacts.debug["input_metadata"]["source_mode"])
-```
-
----
-
-## Synthetic test mode
-
-Если изображения не переданы, runtime использует explicit debug fallback frame (`source_mode=debug_fallback`).
-Synthetic datasets сохраняются для smoke/integration тестов через `*.synthetic(...)` в `training/datasets.py`.
-
----
-
-## Real input mode
-
-- Передайте `images=[...]` (single или multi).
-- Для видео используйте `video=...` через `InputAssetLayer.build_request(...)`.
-- Resize зависит от `quality_profile` (`debug`, `balanced`, `quality`).
-
----
-
-## Как добавить новый action
-
-1. Добавить phrase/action mapping в `IntentParser._action_lexicon`.
-2. Добавить fallback pattern в `_regex_fallback` (опционально).
-3. Добавить transition labels в `TransitionPlanner._templates`.
-4. Добавить rule/learned hook в `GraphDeltaPredictor._apply_action_rules`.
-5. Добавить тест в `tests/test_intent_parser.py` и/или runtime integration tests.
-
----
-
-## Как расширить graph schema
-
-- Новые relation/fields добавляются в `core/schema.py`.
-- Инференс отношений — `SceneGraphBuilder._infer_relations(...)`.
-- Консистентность — `SceneGraphBuilder.validate(...)`.
-- Обновления памяти/динамики — `memory/video_memory.py`, `dynamics/state_update.py`.
-
----
-
-## Training flow
-
-- `PerceptionDataset.from_image_manifest(...)` — real image records.
-- `RepresentationDataset.from_perception_dataset(...)` — pseudo-labeled scene graphs.
-- `DynamicsDataset.from_graph_sequence(...)` — graph delta samples.
-- `RendererDataset.from_frame_pairs(...)` — ROI before/after pairs.
-- `TextActionDataset.from_jsonl(...)` — text-action alignment.
-- `MemoryDataset.from_representation_dataset(...)` — memory training records.
-
-Пример manifest:
-
-```json
-{
-  "records": [
-    {"image": "/data/frame_0001.ppm", "text": "улыбается"}
-  ]
-}
-```
-
+> Важно: часть текущих датасетов остаётся pseudo-labeled baseline для smoke/debug. Контракты и структуры данных уже пригодны как learned-ready входы.

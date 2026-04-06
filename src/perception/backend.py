@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import hashlib
+import math
+
+from core.input_layer import AssetFrame
+from utils_tensor import mean_color, shape
 
 
 @dataclass(slots=True)
@@ -102,3 +106,46 @@ class BackendInferenceEngine:
 def image_ref_to_features(image_ref: str) -> list[float]:
     digest = hashlib.sha256(image_ref.encode("utf-8")).digest()
     return [b / 255.0 for b in digest[:8]]
+
+
+def frame_to_features(frame: AssetFrame | list[list[list[float]]] | str) -> list[float]:
+    if isinstance(frame, str):
+        return image_ref_to_features(frame)
+
+    tensor = frame.tensor if isinstance(frame, AssetFrame) else frame
+    h, w, _ = shape(tensor)
+    if h == 0 or w == 0:
+        return [0.0] * 8
+
+    m = mean_color(tensor)
+    luminance_sum = 0.0
+    luminance_sq = 0.0
+    edge = 0.0
+    for y in range(h):
+        for x in range(w):
+            px = tensor[y][x]
+            lum = (px[0] + px[1] + px[2]) / 3.0
+            luminance_sum += lum
+            luminance_sq += lum * lum
+            if x + 1 < w:
+                n = tensor[y][x + 1]
+                edge += abs(px[0] - n[0]) + abs(px[1] - n[1]) + abs(px[2] - n[2])
+            if y + 1 < h:
+                n = tensor[y + 1][x]
+                edge += abs(px[0] - n[0]) + abs(px[1] - n[1]) + abs(px[2] - n[2])
+    npx = float(h * w)
+    lum_mean = luminance_sum / npx
+    lum_var = max(0.0, luminance_sq / npx - lum_mean * lum_mean)
+    lum_std = math.sqrt(lum_var)
+    edge_density = edge / max(1.0, npx * 3.0)
+    aspect = w / max(1.0, h)
+    return [
+        float(m[0]),
+        float(m[1]),
+        float(m[2]),
+        float(lum_mean),
+        float(lum_std),
+        float(max(0.0, min(1.0, edge_density))),
+        float(max(0.0, min(1.0, min(aspect / 2.0, 1.0)))),
+        float(max(0.0, min(1.0, min(h, w) / max(h, w)))),
+    ]
