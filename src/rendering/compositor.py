@@ -5,24 +5,10 @@ from rendering.roi_renderer import RenderedPatch
 from utils_tensor import blend, roll_x, shape, zeros
 
 
-def _to_frame_tensor(frame: str | list, size: tuple[int, int] = (256, 256)) -> list:
-    if isinstance(frame, list):
-        return frame
-    h, w = size
-    seed = abs(hash(frame)) % 255
-    arr = zeros(h, w, 3)
-    for y in range(h):
-        for x in range(w):
-            arr[y][x][0] = (seed % 101) / 100.0
-            arr[y][x][1] = (seed % 67) / 66.0
-            arr[y][x][2] = (seed % 47) / 46.0
-    return arr
-
-
 class Compositor:
-    def compose(self, current_frame: str | list, patches: list[RenderedPatch], delta: GraphDelta) -> list:
+    def compose(self, current_frame: list, patches: list[RenderedPatch], delta: GraphDelta) -> list:
         _ = delta
-        frame = _to_frame_tensor(current_frame)
+        frame = [[px[:] for px in row] for row in current_frame]
         ordered = sorted(patches, key=lambda p: p.z_index)
         h, w, _ = shape(frame)
 
@@ -43,12 +29,12 @@ class Compositor:
 
 
 class TemporalStabilizer:
-    def refine(self, previous_frame: str | list, new_frame: str | list, memory: VideoMemory, enabled: bool = True) -> list:
-        prev = _to_frame_tensor(previous_frame)
-        cur = _to_frame_tensor(new_frame, size=shape(prev)[:2])
+    def refine(self, previous_frame: list, new_frame: list, memory: VideoMemory, enabled: bool = True) -> list:
+        prev = previous_frame
+        cur = new_frame
         if not enabled:
             return cur
-        flow_strength = min(0.35, 0.1 + 0.02 * len(memory.temporal_history))
+        flow_strength = min(0.35, 0.08 + 0.015 * len(memory.temporal_history))
         warped = roll_x(prev, shift=1)
         h, w, c = shape(cur)
         out = zeros(h, w, c)

@@ -4,7 +4,6 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-
 from core.input_layer import InputAssetLayer
 from core.schema import SceneGraph
 from dynamics.graph_delta_predictor import GraphDeltaPredictor
@@ -17,6 +16,7 @@ from rendering.roi_renderer import PatchRenderer, ROISelector
 from representation.graph_builder import SceneGraphBuilder
 from runtime.profiles import PROFILES, RuntimeProfile
 from text.intent_parser import IntentParser
+from utils_tensor import mean_color, shape, zeros
 
 
 @dataclass(slots=True)
@@ -50,13 +50,26 @@ class GennadyEngine:
         quality_profile: str = "balanced",
     ) -> InferenceArtifacts:
         profile = self._resolve_profile(quality_profile)
-        request = self.input_layer.build_request(images=images, text=text, fps=fps, duration=duration)
-        source_image = request.images[0] if request.images else (request.reference_set[0] if request.reference_set else "generated://blank")
+        request = self.input_layer.build_request(
+            images=images,
+            text=text,
+            fps=fps,
+            duration=duration,
+            quality_profile=quality_profile,
+        )
 
-        perception_output = self.perception.analyze(source_image)
+        first_frame = request.unified_asset.frames[0] if request.unified_asset and request.unified_asset.frames else None
+        current_frame = first_frame.tensor if first_frame else self._debug_seed_frame_tensor(profile)
+        source_ref = self._frame_ref(current_frame, first_frame.source if first_frame else "debug://blank")
+
+        perception_output = self.perception.analyze(source_ref)
+        perception_output.frame_size = (shape(current_frame)[1], shape(current_frame)[0])
         scene_graph = self.graph_builder.build(perception_output, frame_index=0)
         scene_graph.global_context.fps = fps
-        memory = self.memory_manager.initialize(scene_graph)
+        scene_graph.global_context.frame_size = perception_output.frame_size
+        scene_graph.global_context.source_type = request.input_type
+
+        memory = self.memory_manager.initialize_from_scene(scene_graph)
 
         action_plan = self.intent_parser.parse(request.text, scene_graph=scene_graph)
         state_plan = self.planner.expand(
@@ -70,7 +83,6 @@ class GennadyEngine:
             policy="insert" if quality_profile == "debug" else "use_existing",
         )
 
-        current_frame = self._seed_frame_tensor(source_image, profile)
         frames = [current_frame]
         graphs = [scene_graph]
         overlay_log: list[str] = []
@@ -92,7 +104,8 @@ class GennadyEngine:
             stable_frame = self.stabilizer.refine(frames[-1], composed, memory, enabled=profile.temporal_refinement)
 
             scene_graph = apply_delta(scene_graph, delta)
-            memory = self.memory_manager.update(memory, scene_graph)
+            memory = self.memory_manager.update_from_graph(memory, scene_graph)
+            memory = self.memory_manager.update_from_frame(memory, stable_frame, scene_graph)
 
             frames.append(stable_frame)
             current_frame = stable_frame
@@ -125,21 +138,19 @@ class GennadyEngine:
                     "frame_count": request.frame_count,
                     "timestamps_preview": request.timestamps[: min(10, len(request.timestamps))],
                     "reference_set": request.reference_set,
+                    "source_mode": "image_grounded" if first_frame else "debug_fallback",
                 },
             },
         )
 
-    def _seed_frame_tensor(self, source_image: str, profile: RuntimeProfile) -> list:
+    def _frame_ref(self, frame: list, source_hint: str) -> str:
+        h, w, _ = shape(frame)
+        mc = mean_color(frame)
+        return f"frame://{Path(source_hint).name}?w={w}&h={h}&mean={mc[0]:.3f},{mc[1]:.3f},{mc[2]:.3f}"
+
+    def _debug_seed_frame_tensor(self, profile: RuntimeProfile) -> list:
         h, w = profile.internal_resolution
-        seed = abs(hash(source_image)) % 255
-        from utils_tensor import zeros
-        frame = zeros(h, w, 3)
-        for y in range(h):
-            for x in range(w):
-                frame[y][x][0] = (seed % 97) / 96.0
-                frame[y][x][1] = (seed % 73) / 72.0
-                frame[y][x][2] = (seed % 59) / 58.0
-        return frame
+        return zeros(h, w, 3, value=0.5)
 
     def _resolve_profile(self, name: str) -> RuntimeProfile:
         return PROFILES.get(name, PROFILES["balanced"])
@@ -155,7 +166,7 @@ class GennadyEngine:
             import cv2  # type: ignore
             import numpy as np  # type: ignore
 
-            uint8_frames = [np.array([[[(int(max(0,min(1,ch))*255)) for ch in px] for px in row] for row in f], dtype=np.uint8) for f in frames]
+            uint8_frames = [np.array([[[(int(max(0, min(1, ch)) * 255)) for ch in px] for px in row] for row in f], dtype=np.uint8) for f in frames]
             h, w = uint8_frames[0].shape[:2]
             writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
             for frame in uint8_frames:

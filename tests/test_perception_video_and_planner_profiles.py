@@ -1,7 +1,14 @@
+from pathlib import Path
+
 from core.schema import ActionPlan, ActionStep, SceneGraph
 from perception.pipeline import PerceptionPipeline
 from planning.transition_engine import TransitionPlanner
 from runtime.orchestrator import GennadyEngine
+
+
+def _write_ppm(path: Path, w: int, h: int, rgb: tuple[int, int, int]) -> None:
+    pixels = "\n".join(" ".join(map(str, rgb)) for _ in range(w * h))
+    path.write_text(f"P3\n{w} {h}\n255\n{pixels}\n")
 
 
 def test_perception_analyze_video_keeps_track_ids_and_metrics() -> None:
@@ -28,10 +35,12 @@ def test_planner_sit_down_without_chair_policy_modes() -> None:
     assert failed.diagnostics.constraint_warnings
 
 
-def test_profile_smoke_comparison() -> None:
+def test_profile_smoke_comparison(tmp_path: Path) -> None:
     engine = GennadyEngine()
-    out_light = engine.run(["a.png"], "улыбается", quality_profile="lightweight")
-    out_quality = engine.run(["a.png"], "улыбается", quality_profile="quality")
+    img = tmp_path / "a.ppm"
+    _write_ppm(img, 100, 60, (10, 200, 150))
+    out_light = engine.run([str(img)], "улыбается", quality_profile="lightweight")
+    out_quality = engine.run([str(img)], "улыбается", quality_profile="quality")
 
     light_shape = (len(out_light.frames[0]), len(out_light.frames[0][0]))
     quality_shape = (len(out_quality.frames[0]), len(out_quality.frames[0][0]))

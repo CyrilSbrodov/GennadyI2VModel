@@ -11,17 +11,27 @@ def test_parser_extracts_core_actions() -> None:
     assert "smile" in actions
 
 
-def test_parser_extracts_sequence_parallel_and_modifiers() -> None:
+def test_parser_synonyms_and_word_order() -> None:
     parser = IntentParser()
-    plan = parser.parse("Сначала снимает пальто, потом медленно улыбается, одновременно поворачивает голову.")
+    plan = parser.parse("На стул садится и потом улыбнувшись поворачивает голову")
+    actions = [a.type for a in plan.actions]
+    assert "sit_down" in actions
+    assert "smile" in actions
+    assert "turn_head" in actions
 
-    assert len(plan.actions) >= 2
+
+def test_parser_multiple_actions_and_modifiers() -> None:
+    parser = IntentParser()
+    plan = parser.parse("Сначала снимает пальто, затем медленно и слегка улыбается, одновременно поднимает руку")
+
+    assert len(plan.actions) >= 3
     assert any(step.start_after for step in plan.actions[1:])
     assert plan.parallel_groups
     assert any(step.modifiers.get("speed") == "slow" for step in plan.actions)
+    assert any(float(step.modifiers.get("parser_confidence", 0.0)) > 0 for step in plan.actions)
 
 
-def test_parser_validates_against_scene_graph() -> None:
+def test_parser_missing_target_handling() -> None:
     parser = IntentParser()
     person = PersonNode(person_id="p1", track_id="t1", bbox=BBox(0.1, 0.1, 0.5, 0.8), mask_ref=None)
     person.garments = [GarmentNode(garment_id="g1", garment_type="shirt")]

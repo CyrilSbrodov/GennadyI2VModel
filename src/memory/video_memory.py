@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-
-import random
 import math
+import random
 
 from core.schema import (
     BBox,
@@ -14,6 +13,7 @@ from core.schema import (
     TexturePatchMemory,
     VideoMemory,
 )
+from utils_tensor import mean_color
 
 
 class MemoryManager:
@@ -23,10 +23,13 @@ class MemoryManager:
         seed = abs(hash(token)) % (2**32)
         rng = random.Random(seed)
         vec = [rng.uniform(-1.0, 1.0) for _ in range(dim)]
-        n = math.sqrt(sum(v*v for v in vec)) or 1.0
-        return [v/n for v in vec]
+        n = math.sqrt(sum(v * v for v in vec)) or 1.0
+        return [v / n for v in vec]
 
     def initialize(self, scene_graph: SceneGraph) -> VideoMemory:
+        return self.initialize_from_scene(scene_graph)
+
+    def initialize_from_scene(self, scene_graph: SceneGraph) -> VideoMemory:
         memory = VideoMemory(temporal_history=[scene_graph])
         for person in scene_graph.persons:
             memory.identity_memory[person.person_id] = MemoryEntry(
@@ -48,6 +51,9 @@ class MemoryManager:
         return memory
 
     def update(self, memory: VideoMemory, scene_graph: SceneGraph) -> VideoMemory:
+        return self.update_from_graph(memory, scene_graph)
+
+    def update_from_graph(self, memory: VideoMemory, scene_graph: SceneGraph) -> VideoMemory:
         memory.temporal_history.append(scene_graph)
         observed_region_ids: set[str] = set()
         observed_entities: set[str] = set()
@@ -98,6 +104,32 @@ class MemoryManager:
 
         return memory
 
+    def update_from_frame(self, memory: VideoMemory, frame: list, scene_graph: SceneGraph) -> VideoMemory:
+        color = mean_color(frame)
+        for person in scene_graph.persons:
+            patch_id = f"patch::{person.person_id}:latest"
+            memory.texture_patches[patch_id] = TexturePatchMemory(
+                patch_id=patch_id,
+                region_type="person",
+                entity_id=person.person_id,
+                source_frame=scene_graph.frame_index,
+                patch_ref=f"rgb://{color[0]:.3f},{color[1]:.3f},{color[2]:.3f}",
+                confidence=min(1.0, 0.6 + person.confidence * 0.3),
+            )
+        return memory
+
+    def mark_region_revealed(self, memory: VideoMemory, region_id: str, owner_entity: str) -> None:
+        self.apply_visibility_event(memory, {"region_id": region_id, "entity": owner_entity}, {}, visibility="revealed")
+
+    def query_hidden_region(self, memory: VideoMemory, region_id: str) -> HiddenRegionSlot | None:
+        return memory.hidden_region_slots.get(region_id)
+
+    def retrieve_for_region(self, memory: VideoMemory, region_type: str, owner_entity: str | None = None) -> list[TexturePatchMemory]:
+        patches = [p for p in memory.texture_patches.values() if p.region_type == region_type]
+        if owner_entity is not None:
+            patches = [p for p in patches if p.entity_id == owner_entity]
+        return sorted(patches, key=lambda p: p.confidence, reverse=True)
+
     def apply_visibility_event(self, memory: VideoMemory, delta: dict[str, str], masks: dict[str, object], visibility: str) -> None:
         _ = masks
         region_id = delta.get("region_id", "unknown")
@@ -120,8 +152,8 @@ class MemoryManager:
             slot.stale_frames += 1
 
     def retrieve(self, memory: VideoMemory, query_embedding: list[float], bank: str = "texture", top_k: int = 3) -> list[dict[str, object]]:
-        qn = math.sqrt(sum(v*v for v in query_embedding)) or 1.0
-        q = [v/qn for v in query_embedding]
+        qn = math.sqrt(sum(v * v for v in query_embedding)) or 1.0
+        q = [v / qn for v in query_embedding]
 
         if bank == "identity":
             entries = list(memory.identity_memory.values())
@@ -135,9 +167,9 @@ class MemoryManager:
 
         scored: list[tuple[float, MemoryEntry]] = []
         for e in entries:
-            en = math.sqrt(sum(v*v for v in e.embedding)) or 1.0
-            emb = [v/en for v in e.embedding]
-            sim = sum(a*b for a,b in zip(q, emb))
+            en = math.sqrt(sum(v * v for v in e.embedding)) or 1.0
+            emb = [v / en for v in e.embedding]
+            sim = sum(a * b for a, b in zip(q, emb))
             scored.append((float(sim), e))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [
