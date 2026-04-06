@@ -33,8 +33,10 @@ class PersonFacts:
     track_confidence: float = 0.0
     track_source: str = "fallback"
     garments: list[dict] = field(default_factory=list)
-    hand_landmarks: list[tuple[float, float]] = field(default_factory=list)
+    hand_landmarks: dict[str, list[tuple[float, float]]] = field(default_factory=dict)
     face_landmarks: list[tuple[float, float]] = field(default_factory=list)
+    depth_order: float = 0.0
+    occlusion_hints: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -43,6 +45,7 @@ class ObjectFacts:
     bbox: BBox
     confidence: float
     source: str
+    depth_order: float = 0.0
 
 
 @dataclass(slots=True)
@@ -85,7 +88,7 @@ class PerceptionPipeline:
             out.module_fallbacks[module_name] = "native"
             return value
         except Exception as exc:  # fallback behavior for partially unavailable modules
-            warnings.append(f"{module_name}_unavailable:{exc.__class__.__name__}")
+            warnings.append(f"{module_name}_unavailable:{exc}")
             out.module_fallbacks[module_name] = "fallback"
             return default
         finally:
@@ -164,6 +167,7 @@ class PerceptionPipeline:
                     for garment in parsed.garments
                 ]
 
+            person_depth = 1.0 - (person.bbox.y + person.bbox.h)
             persons.append(
                 PersonFacts(
                     bbox=person.bbox,
@@ -185,8 +189,10 @@ class PerceptionPipeline:
                     track_confidence=tracked.confidence if tracked else 0.0,
                     track_source=tracked.source if tracked else "fallback",
                     garments=garments,
-                    hand_landmarks=pose.landmarks_2d if pose else [],
+                    hand_landmarks=pose.hand_landmarks if pose else {},
                     face_landmarks=face.face_landmarks if face else [],
+                    depth_order=person_depth,
+                    occlusion_hints=(parsed.occlusion_hints if parsed else []),
                 )
             )
 
@@ -197,6 +203,7 @@ class PerceptionPipeline:
                 bbox=obj.bbox,
                 confidence=obj.confidence,
                 source=obj.source,
+                depth_order=obj.depth_order,
             )
             for obj in object_predictions
         ]
@@ -210,17 +217,13 @@ class PerceptionPipeline:
         }
         return out
 
-    def analyze_video(self, frames: list[str]) -> list[PerceptionOutput]:
+    def analyze_video(self, frames: list[str], batch_size: int = 4) -> list[PerceptionOutput]:
         outputs: list[PerceptionOutput] = []
-        stable_by_index: dict[int, str] = {}
-        for idx, frame in enumerate(frames):
-            out = self.analyze(frame)
-            for p_idx, person in enumerate(out.persons):
-                if p_idx in stable_by_index:
-                    person.track_id = stable_by_index[p_idx]
-                else:
-                    base = person.track_id or f"track_{p_idx+1}"
-                    stable_by_index[p_idx] = f"tid_{p_idx+1}_{abs(hash(base))%7}"
-                    person.track_id = stable_by_index[p_idx]
-            outputs.append(out)
+        if not frames:
+            return outputs
+
+        for start in range(0, len(frames), max(1, batch_size)):
+            chunk = frames[start : start + max(1, batch_size)]
+            for frame in chunk:
+                outputs.append(self.analyze(frame))
         return outputs
