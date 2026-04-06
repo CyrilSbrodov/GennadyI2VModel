@@ -48,20 +48,6 @@ class VisibilityOcclusionReasoner:
         return relations
 
 
-class LegacySceneGraphAdapter:
-    def to_legacy(self, scene_graph: SceneGraph) -> SceneGraph:
-        legacy_relations = [
-            replace(
-                relation,
-                confidence=round(relation.confidence, 4),
-                alternatives=relation.alternatives,
-                provenance=relation.provenance or "legacy_adapter",
-            )
-            for relation in scene_graph.relations
-        ]
-        return replace(scene_graph, relations=legacy_relations)
-
-
 class SceneGraphBuilder:
     def __init__(self) -> None:
         self._source_reliability = {
@@ -85,7 +71,6 @@ class SceneGraphBuilder:
             "unknown": 1,
             "visibility_reasoner": 4,
         }
-        self._legacy_adapter = LegacySceneGraphAdapter()
         self._visibility = VisibilityOcclusionReasoner()
 
     def build(self, perception: PerceptionOutput, frame_index: int = 0) -> SceneGraph:
@@ -130,7 +115,7 @@ class SceneGraphBuilder:
                 garment_id = f"{garment['type']}_{idx}_{g_idx}"
                 layering = "outerwear" if garment["type"] in {"coat", "jacket", "hoodie"} else "innerwear"
                 coverage = [f"{person_id}_torso"]
-                if garment["type"] in {"coat", "jacket", "shirt"}:
+                if garment["type"] in {"coat", "jacket", "shirt", "hoodie"}:
                     coverage.extend([f"{person_id}_left_upper_arm", f"{person_id}_right_upper_arm"])
                 garments.append(
                     GarmentNode(
@@ -193,7 +178,17 @@ class SceneGraphBuilder:
             relations=relations,
             global_context=GlobalSceneContext(frame_size=perception.frame_size),
         )
-        return self._legacy_adapter.to_legacy(scene_graph)
+        self.validate(scene_graph)
+        return scene_graph
+
+    def validate(self, graph: SceneGraph) -> None:
+        ids = {p.person_id for p in graph.persons} | {o.object_id for o in graph.objects}
+        ids |= {part.part_id for p in graph.persons for part in p.body_parts}
+        ids |= {g.garment_id for p in graph.persons for g in p.garments}
+        for rel in graph.relations:
+            if rel.source not in ids or rel.target not in ids:
+                rel.provenance = f"{rel.provenance}:dangling"
+                rel.confidence = min(rel.confidence, 0.2)
 
     def _calibrate_confidence(self, raw_confidence: float, source: str) -> float:
         source_key = source.lower().split(":")[0]
@@ -243,11 +238,11 @@ class SceneGraphBuilder:
                     )
         if persons:
             for obj in objects:
+                rel = "supports" if obj.object_type in {"chair", "sofa", "bench"} else "interacts_with"
                 relations.extend(
                     [
                         RelationEdge(persons[0].person_id, "near", obj.object_id, 0.6, "heuristic", frame_index),
-                        RelationEdge(persons[0].person_id, "interacts_with", obj.object_id, 0.68, "heuristic", frame_index),
-                        RelationEdge(persons[0].person_id, "supports", obj.object_id, 0.55, "heuristic", frame_index),
+                        RelationEdge(persons[0].person_id, rel, obj.object_id, 0.68, "heuristic", frame_index),
                         RelationEdge(persons[0].person_id, "touches", obj.object_id, 0.52, "heuristic", frame_index),
                     ]
                 )
@@ -270,4 +265,4 @@ class SceneGraphBuilder:
                 right_priority = self._source_priority.get(current.provenance.lower().split(":")[0], 0) + priority.get(current.relation, 0)
                 if left_priority > right_priority:
                     winners[key] = relation
-        return list(winners.values())
+        return [replace(v, confidence=round(v.confidence, 4)) for v in winners.values()]

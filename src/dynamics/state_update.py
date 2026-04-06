@@ -18,11 +18,15 @@ def apply_delta(scene_graph: SceneGraph, delta: GraphDelta) -> SceneGraph:
             person.pose_state.coarse_pose = "transition"
             if delta.interaction_deltas.get("chair_contact", 0.0) > 0.5:
                 person.pose_state.coarse_pose = "seated"
+            elif delta.interaction_deltas.get("chair_contact", 1.0) < 0.3:
+                person.pose_state.coarse_pose = "standing"
 
         for garment in person.garments:
             if garment.garment_type == "coat" and "coat_state" in delta.garment_deltas:
                 garment.garment_state = str(delta.garment_deltas["coat_state"])
-            if garment.garment_id in delta.visibility_deltas:
+            if garment.garment_type in delta.visibility_deltas:
+                garment.visibility = delta.visibility_deltas[garment.garment_type]
+            elif garment.garment_id in delta.visibility_deltas:
                 garment.visibility = delta.visibility_deltas[garment.garment_id]
 
     scene_graph.frame_index += 1

@@ -15,6 +15,9 @@ class TrainingConfig:
     batch_size: int = 2
     learning_rate: float = 1e-3
     checkpoint_dir: str = "artifacts/checkpoints"
+    dataset_mix: dict[str, float] = field(default_factory=lambda: {"synthetic": 0.3, "real": 0.7})
+    freeze_base: bool = True
+    train_head_only: bool = True
 
 
 @dataclass(slots=True)
@@ -29,4 +32,9 @@ class StageTrainer(Protocol):
     stage_name: str
 
     def train(self, config: TrainingConfig) -> StageResult:
+        ...
+
+
+class DistillationHook(Protocol):
+    def __call__(self, stage_name: str, result: StageResult) -> dict[str, float]:
         ...
