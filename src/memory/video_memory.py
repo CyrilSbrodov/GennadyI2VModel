@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
+import random
+import math
+
 from core.schema import (
     BBox,
     HiddenRegionSlot,
@@ -16,13 +19,20 @@ from core.schema import (
 class MemoryManager:
     _SEMANTIC_REGIONS = ("face", "hair", "torso", "sleeves", "garments")
 
+    def _encode_visual(self, token: str, dim: int = 8) -> list[float]:
+        seed = abs(hash(token)) % (2**32)
+        rng = random.Random(seed)
+        vec = [rng.uniform(-1.0, 1.0) for _ in range(dim)]
+        n = math.sqrt(sum(v*v for v in vec)) or 1.0
+        return [v/n for v in vec]
+
     def initialize(self, scene_graph: SceneGraph) -> VideoMemory:
         memory = VideoMemory(temporal_history=[scene_graph])
         for person in scene_graph.persons:
             memory.identity_memory[person.person_id] = MemoryEntry(
                 entity_id=person.person_id,
                 entry_type="identity",
-                embedding=[0.1, 0.2, 0.3],
+                embedding=self._encode_visual(f"identity:{person.person_id}"),
                 confidence=person.confidence,
                 last_seen_frames=[scene_graph.frame_index],
             )
@@ -31,7 +41,7 @@ class MemoryManager:
                 memory.garment_memory[garment.garment_id] = MemoryEntry(
                     entity_id=garment.garment_id,
                     entry_type="garment",
-                    embedding=[0.3, 0.1, 0.4],
+                    embedding=self._encode_visual(f"garment:{garment.garment_id}"),
                     confidence=garment.confidence,
                     last_seen_frames=[scene_graph.frame_index],
                 )
@@ -48,8 +58,8 @@ class MemoryManager:
             if identity is not None:
                 self._refresh_entry(identity, scene_graph.frame_index)
             for part in person.body_parts:
+                region_id = f"{person.person_id}:{part.part_type}"
                 if part.visibility in ("visible", "partially_visible"):
-                    region_id = f"{person.person_id}:{part.part_type}"
                     observed_region_ids.add(region_id)
                     memory.region_descriptors[region_id] = RegionDescriptor(
                         region_id=region_id,
@@ -59,6 +69,13 @@ class MemoryManager:
                         visibility=part.visibility,
                         confidence=part.confidence,
                         last_update_frame=scene_graph.frame_index,
+                    )
+                else:
+                    self.apply_visibility_event(
+                        memory,
+                        delta={"region_id": region_id, "entity": person.person_id},
+                        masks={},
+                        visibility="hidden",
                     )
             for garment in person.garments:
                 observed_entities.add(garment.garment_id)
@@ -80,6 +97,57 @@ class MemoryManager:
             slot.confidence = max(0.0, slot.confidence * (0.99 if slot.stale_frames < 3 else 0.95))
 
         return memory
+
+    def apply_visibility_event(self, memory: VideoMemory, delta: dict[str, str], masks: dict[str, object], visibility: str) -> None:
+        _ = masks
+        region_id = delta.get("region_id", "unknown")
+        owner = delta.get("entity", "unknown")
+        slot = memory.hidden_region_slots.get(region_id)
+        if slot is None:
+            memory.hidden_region_slots[region_id] = HiddenRegionSlot(
+                slot_id=region_id,
+                region_type=region_id.split(":")[-1],
+                owner_entity=owner,
+                candidate_patch_ids=[],
+                confidence=0.55,
+            )
+            slot = memory.hidden_region_slots[region_id]
+        if visibility == "revealed":
+            slot.confidence = min(1.0, slot.confidence + 0.15)
+            slot.stale_frames = 0
+        else:
+            slot.confidence = max(0.0, slot.confidence - 0.1)
+            slot.stale_frames += 1
+
+    def retrieve(self, memory: VideoMemory, query_embedding: list[float], bank: str = "texture", top_k: int = 3) -> list[dict[str, object]]:
+        qn = math.sqrt(sum(v*v for v in query_embedding)) or 1.0
+        q = [v/qn for v in query_embedding]
+
+        if bank == "identity":
+            entries = list(memory.identity_memory.values())
+        elif bank == "garment":
+            entries = list(memory.garment_memory.values())
+        else:
+            entries = [
+                MemoryEntry(entity_id=v.patch_id, entry_type="texture", embedding=self._encode_visual(v.patch_id), confidence=v.confidence)
+                for v in memory.texture_patches.values()
+            ]
+
+        scored: list[tuple[float, MemoryEntry]] = []
+        for e in entries:
+            en = math.sqrt(sum(v*v for v in e.embedding)) or 1.0
+            emb = [v/en for v in e.embedding]
+            sim = sum(a*b for a,b in zip(q, emb))
+            scored.append((float(sim), e))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [
+            {
+                "entity_id": e.entity_id,
+                "similarity": round(sim, 4),
+                "confidence": round((sim + e.confidence) / 2.0, 4),
+            }
+            for sim, e in scored[:top_k]
+        ]
 
     def query_by_region(self, memory: VideoMemory, region_type: str) -> list[RegionDescriptor]:
         return [descriptor for descriptor in memory.region_descriptors.values() if descriptor.region_type == region_type]

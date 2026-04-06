@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from core.schema import ActionPlan, PlannerDiagnostics, SceneGraph
+from core.schema import ActionPlan, BBox, PlannerDiagnostics, SceneGraph, SceneObjectNode
 
 
 @dataclass(slots=True)
@@ -20,8 +20,6 @@ class StatePlan:
 
 
 class TransitionPlanner:
-    """Template-based planner that expands each action to plausible intermediates."""
-
     _templates = {
         "remove_garment": ["hand_to_garment", "garment_opening", "garment_half_removed", "garment_removed"],
         "sit_down": ["weight_shift", "knees_bending", "chair_contact", "seated"],
@@ -58,25 +56,37 @@ class TransitionPlanner:
             if not ok:
                 if policy == "insert":
                     diagnostics.inserted_objects.append(reason)
-                    diagnostics.policy_decisions.append(f"insert::{reason}")
+                    diagnostics.policy_decisions.append(f"auto-insert::{reason}")
                     constraints[reason] = True
+                    if reason == "chair":
+                        scene_graph.objects.append(
+                            SceneObjectNode(
+                                object_id="chair_auto",
+                                object_type="chair",
+                                bbox=BBox(0.6, 0.5, 0.3, 0.4),
+                                confidence=0.4,
+                                source="planner:auto_insert",
+                            )
+                        )
                 elif policy == "use_existing":
                     diagnostics.skipped_actions.append(action.type)
-                    diagnostics.policy_decisions.append(f"skip::{action.type}")
+                    diagnostics.policy_decisions.append(f"soft-skip::{action.type}")
                     continue
                 else:
                     diagnostics.skipped_actions.append(action.type)
-                    diagnostics.constraint_warnings.append(reason)
-                    diagnostics.policy_decisions.append(f"fail::{action.type}:{reason}")
+                    diagnostics.constraint_warnings.append(f"hard-fail::{reason}")
+                    diagnostics.policy_decisions.append(f"hard-fail::{action.type}:{reason}")
                     continue
 
             labels = self._templates.get(action.type, [action.type])
+            intensity = float(action.intensity if action.intensity is not None else 0.5)
             step_duration = self._step_duration_frames(
                 num_labels=len(labels),
                 action_duration_sec=action.duration_sec,
                 fps=effective_fps,
                 target_duration_sec=target_duration_sec,
                 action_count=max(1, len(action_plan.actions)),
+                intensity=intensity,
             )
             for label in labels:
                 if cursor >= max_steps:
@@ -85,7 +95,7 @@ class TransitionPlanner:
                 steps.append(
                     PlannedState(
                         step_index=cursor,
-                        labels=[action.type, label],
+                        labels=[action.type, label, f"intensity={intensity:.2f}"],
                         start_frame=current_frame,
                         end_frame=current_frame + step_duration,
                     )
@@ -105,6 +115,7 @@ class TransitionPlanner:
         return {
             "chair": "chair" in object_types,
             "outer_garment": has_outer,
+            "anatomy": any(person.body_parts for person in scene_graph.persons),
         }
 
     def _precheck_action(self, action_type: str, constraints: dict[str, bool]) -> tuple[bool, str]:
@@ -112,6 +123,8 @@ class TransitionPlanner:
             return False, "chair"
         if action_type == "remove_garment" and not constraints.get("outer_garment", False):
             return False, "outer_garment"
+        if action_type in {"raise_arm", "turn_head"} and not constraints.get("anatomy", False):
+            return False, "anatomy"
         return True, ""
 
     def _step_duration_frames(
@@ -121,9 +134,11 @@ class TransitionPlanner:
         fps: int,
         target_duration_sec: float | None,
         action_count: int,
+        intensity: float,
     ) -> int:
+        intensity_scale = max(0.6, min(1.4, 1.2 - intensity * 0.4))
         if action_duration_sec is not None:
-            return max(1, int((action_duration_sec * fps) / max(1, num_labels)))
+            return max(1, int(((action_duration_sec * intensity_scale) * fps) / max(1, num_labels)))
         if target_duration_sec is not None:
             return max(1, int((target_duration_sec * fps) / max(1, action_count * num_labels)))
         return 1

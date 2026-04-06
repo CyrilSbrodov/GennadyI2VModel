@@ -14,15 +14,47 @@ from core.schema import (
 from perception.pipeline import PerceptionOutput
 
 
-class LegacySceneGraphAdapter:
-    """Keeps runtime orchestrator compatibility with the pre-enrichment format."""
+class VisibilityOcclusionReasoner:
+    def infer(self, persons: list[PersonNode], objects: list[SceneObjectNode]) -> list[RelationEdge]:
+        relations: list[RelationEdge] = []
+        for person in persons:
+            for part in person.body_parts:
+                if part.confidence < 0.35:
+                    part.visibility = "hidden"
+                elif part.confidence < 0.6:
+                    part.visibility = "partially_visible"
+                else:
+                    part.visibility = "visible"
+            for garment in person.garments:
+                if garment.confidence < 0.3:
+                    garment.visibility = "hidden"
+                elif garment.confidence < 0.58:
+                    garment.visibility = "partially_visible"
+                else:
+                    garment.visibility = "visible"
 
+                if garment.visibility in {"hidden", "partially_visible"} and objects:
+                    relations.append(
+                        RelationEdge(
+                            source=objects[0].object_id,
+                            relation="occludes",
+                            target=garment.garment_id,
+                            confidence=0.65,
+                            provenance="visibility_reasoner",
+                            frame_index=garment.frame_index,
+                            alternatives=["in_front_of"],
+                        )
+                    )
+        return relations
+
+
+class LegacySceneGraphAdapter:
     def to_legacy(self, scene_graph: SceneGraph) -> SceneGraph:
         legacy_relations = [
             replace(
                 relation,
                 confidence=round(relation.confidence, 4),
-                alternatives=[],
+                alternatives=relation.alternatives,
                 provenance=relation.provenance or "legacy_adapter",
             )
             for relation in scene_graph.relations
@@ -51,58 +83,61 @@ class SceneGraphBuilder:
             "heuristic": 3,
             "fallback": 2,
             "unknown": 1,
+            "visibility_reasoner": 4,
         }
         self._legacy_adapter = LegacySceneGraphAdapter()
+        self._visibility = VisibilityOcclusionReasoner()
 
     def build(self, perception: PerceptionOutput, frame_index: int = 0) -> SceneGraph:
         persons: list[PersonNode] = []
         objects: list[SceneObjectNode] = []
 
+        taxonomy = [
+            "head",
+            "neck",
+            "torso",
+            "pelvis",
+            "left_upper_arm",
+            "left_lower_arm",
+            "right_upper_arm",
+            "right_lower_arm",
+            "left_hand",
+            "right_hand",
+            "left_upper_leg",
+            "left_lower_leg",
+            "right_upper_leg",
+            "right_lower_leg",
+            "left_foot",
+            "right_foot",
+        ]
+
         for idx, p in enumerate(perception.persons, start=1):
             person_id = f"person_{idx}"
             body_parts = [
                 BodyPartNode(
-                    part_id=f"{person_id}_head",
-                    part_type="head",
-                    confidence=self._calibrate_confidence(0.85, p.pose_source),
-                    visibility="visible",
-                    source=p.pose_source,
-                    frame_index=frame_index,
-                ),
-                BodyPartNode(
-                    part_id=f"{person_id}_torso",
-                    part_type="torso",
-                    confidence=self._calibrate_confidence(0.86, p.mask_source),
-                    visibility="visible",
-                    source=p.mask_source,
-                    frame_index=frame_index,
-                ),
-                BodyPartNode(
-                    part_id=f"{person_id}_left_arm",
-                    part_type="left_arm",
+                    part_id=f"{person_id}_{part_type}",
+                    part_type=part_type,
                     confidence=self._calibrate_confidence(0.82, p.pose_source),
                     visibility="visible",
                     source=p.pose_source,
                     frame_index=frame_index,
-                ),
-                BodyPartNode(
-                    part_id=f"{person_id}_right_arm",
-                    part_type="right_arm",
-                    confidence=self._calibrate_confidence(0.82, p.pose_source),
-                    visibility="visible",
-                    source=p.pose_source,
-                    frame_index=frame_index,
-                ),
+                    alternatives=["torso", "limb"],
+                )
+                for part_type in taxonomy
             ]
             garments: list[GarmentNode] = []
             for g_idx, garment in enumerate(p.garments, start=1):
                 garment_id = f"{garment['type']}_{idx}_{g_idx}"
+                layering = "outerwear" if garment["type"] in {"coat", "jacket", "hoodie"} else "innerwear"
+                coverage = [f"{person_id}_torso"]
+                if garment["type"] in {"coat", "jacket", "shirt"}:
+                    coverage.extend([f"{person_id}_left_upper_arm", f"{person_id}_right_upper_arm"])
                 garments.append(
                     GarmentNode(
                         garment_id=garment_id,
                         garment_type=garment["type"],
                         garment_state=garment.get("state", "worn"),
-                        coverage_targets=[f"{person_id}_torso"],
+                        coverage_targets=coverage,
                         attachment_targets=[f"{person_id}_torso"],
                         confidence=self._calibrate_confidence(
                             float(garment.get("confidence", 0.5)),
@@ -111,7 +146,7 @@ class SceneGraphBuilder:
                         visibility="visible",
                         source=garment.get("source", "unknown"),
                         frame_index=frame_index,
-                        alternatives=["occludes", "touches"],
+                        alternatives=[layering, "sleeve_linked"],
                     )
                 )
 
@@ -129,7 +164,7 @@ class SceneGraphBuilder:
                     confidence=self._calibrate_confidence(p.bbox_confidence, p.bbox_source),
                     source=p.bbox_source,
                     frame_index=frame_index,
-                    alternatives=["scene_object"],
+                    alternatives=["scene_object", "partial_person"],
                 )
             )
 
@@ -143,13 +178,12 @@ class SceneGraphBuilder:
                     confidence=self._calibrate_confidence(obj.confidence, obj.source),
                     source=obj.source,
                     frame_index=frame_index,
-                    alternatives=["unknown_object"],
+                    alternatives=["unknown_object", "held_object"],
                 )
             )
 
         relations = self._infer_relations(persons=persons, objects=objects, frame_index=frame_index)
-        self._infer_visibility(persons=persons)
-        self._infer_occlusions(persons=persons, objects=objects, relations=relations)
+        relations.extend(self._visibility.infer(persons=persons, objects=objects))
         relations = self._resolve_relation_conflicts(relations)
 
         scene_graph = SceneGraph(
@@ -162,17 +196,12 @@ class SceneGraphBuilder:
         return self._legacy_adapter.to_legacy(scene_graph)
 
     def _calibrate_confidence(self, raw_confidence: float, source: str) -> float:
-        source_key = source.lower()
+        source_key = source.lower().split(":")[0]
         reliability = self._source_reliability.get(source_key, self._source_reliability["unknown"])
         calibrated = max(0.0, min(1.0, raw_confidence * reliability))
         return round(calibrated, 4)
 
-    def _infer_relations(
-        self,
-        persons: list[PersonNode],
-        objects: list[SceneObjectNode],
-        frame_index: int,
-    ) -> list[RelationEdge]:
+    def _infer_relations(self, persons: list[PersonNode], objects: list[SceneObjectNode], frame_index: int) -> list[RelationEdge]:
         relations: list[RelationEdge] = []
         for person in persons:
             for body_part in person.body_parts:
@@ -184,6 +213,7 @@ class SceneGraphBuilder:
                         confidence=self._calibrate_confidence(body_part.confidence, body_part.source),
                         provenance="heuristic",
                         frame_index=frame_index,
+                        alternatives=["attached_to"],
                     )
                 )
             for garment in person.garments:
@@ -196,7 +226,7 @@ class SceneGraphBuilder:
                         confidence=self._calibrate_confidence(0.8, garment.source),
                         provenance=garment.source,
                         frame_index=frame_index,
-                        alternatives=["covers", "touches"],
+                        alternatives=["covers", "touches", "held_by"],
                     )
                 )
                 for covered in garment.coverage_targets:
@@ -208,66 +238,24 @@ class SceneGraphBuilder:
                             confidence=self._calibrate_confidence(0.74, garment.source),
                             provenance=garment.source,
                             frame_index=frame_index,
+                            alternatives=["in_front_of", "behind"],
                         )
                     )
         if persons:
             for obj in objects:
-                relations.append(
-                    RelationEdge(
-                        source=persons[0].person_id,
-                        relation="near",
-                        target=obj.object_id,
-                        confidence=self._calibrate_confidence(0.7, "heuristic"),
-                        provenance="heuristic",
-                        frame_index=frame_index,
-                        alternatives=["interacts_with", "touches"],
-                    )
+                relations.extend(
+                    [
+                        RelationEdge(persons[0].person_id, "near", obj.object_id, 0.6, "heuristic", frame_index),
+                        RelationEdge(persons[0].person_id, "interacts_with", obj.object_id, 0.68, "heuristic", frame_index),
+                        RelationEdge(persons[0].person_id, "supports", obj.object_id, 0.55, "heuristic", frame_index),
+                        RelationEdge(persons[0].person_id, "touches", obj.object_id, 0.52, "heuristic", frame_index),
+                    ]
                 )
         return relations
 
-    def _infer_visibility(self, persons: list[PersonNode]) -> None:
-        for person in persons:
-            for part in person.body_parts:
-                if part.confidence < 0.35:
-                    part.visibility = "hidden"
-                elif part.confidence < 0.6:
-                    part.visibility = "partially_visible"
-                else:
-                    part.visibility = "visible"
-            for garment in person.garments:
-                if garment.confidence < 0.3:
-                    garment.visibility = "hidden"
-                elif garment.confidence < 0.58:
-                    garment.visibility = "partially_visible"
-                else:
-                    garment.visibility = "visible"
-
-    def _infer_occlusions(
-        self,
-        persons: list[PersonNode],
-        objects: list[SceneObjectNode],
-        relations: list[RelationEdge],
-    ) -> None:
-        if not objects:
-            return
-        for person in persons:
-            for garment in person.garments:
-                if garment.visibility in {"hidden", "partially_visible"}:
-                    blocker = objects[0].object_id
-                    relations.append(
-                        RelationEdge(
-                            source=blocker,
-                            relation="occludes",
-                            target=garment.garment_id,
-                            confidence=self._calibrate_confidence(0.65, "heuristic"),
-                            provenance="heuristic",
-                            frame_index=garment.frame_index,
-                        )
-                    )
-                    garment.alternatives = [*garment.alternatives, "touches"]
-
     def _resolve_relation_conflicts(self, relations: list[RelationEdge]) -> list[RelationEdge]:
         winners: dict[tuple[str, str, str], RelationEdge] = {}
+        priority = {"touches": 4, "interacts_with": 5, "supports": 6, "in_front_of": 3, "behind": 2}
         for relation in relations:
             key = (relation.source, relation.relation, relation.target)
             current = winners.get(key)
@@ -278,8 +266,8 @@ class SceneGraphBuilder:
                 winners[key] = relation
                 continue
             if relation.confidence == current.confidence:
-                left_priority = self._source_priority.get(relation.provenance.lower(), 0)
-                right_priority = self._source_priority.get(current.provenance.lower(), 0)
+                left_priority = self._source_priority.get(relation.provenance.lower().split(":")[0], 0) + priority.get(relation.relation, 0)
+                right_priority = self._source_priority.get(current.provenance.lower().split(":")[0], 0) + priority.get(current.relation, 0)
                 if left_priority > right_priority:
                     winners[key] = relation
         return list(winners.values())
