@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from core.input_layer import AssetFrame
 from typing import Protocol
 
 from core.schema import BBox
-from perception.backend import BackendInferenceEngine, image_ref_to_features
+from perception.backend import BackendInferenceEngine, frame_to_features
 from perception.detector import BackendConfig
 
 
@@ -18,7 +20,7 @@ class ObjectPrediction:
 
 
 class ObjectDetector(Protocol):
-    def detect(self, image_ref: str) -> list[ObjectPrediction]:
+    def detect(self, frame: AssetFrame | list[list[list[float]]] | str) -> list[ObjectPrediction]:
         ...
 
 
@@ -29,8 +31,8 @@ class YoloObjectDetectorAdapter:
         self.config = config or BackendConfig(checkpoint="checkpoints/yolo_world.torch")
         self.engine = BackendInferenceEngine(self.source_name, self.config.backend, self.config.checkpoint)
 
-    def detect(self, image_ref: str) -> list[ObjectPrediction]:
-        feats = image_ref_to_features(image_ref)
+    def detect(self, frame: AssetFrame | list[list[list[float]]] | str) -> list[ObjectPrediction]:
+        feats = frame_to_features(frame)
         if self.config.backend in {"torch", "onnx"}:
             feats = self.engine.infer(feats)
         return [
@@ -51,8 +53,8 @@ class MonoDepthEstimator:
         self.config = config or BackendConfig(checkpoint="checkpoints/depth.torch")
         self.engine = BackendInferenceEngine(self.source_name, self.config.backend, self.config.checkpoint)
 
-    def estimate(self, image_ref: str) -> float:
-        feats = image_ref_to_features(image_ref)
+    def estimate(self, frame: AssetFrame | list[list[list[float]]] | str) -> float:
+        feats = frame_to_features(frame)
         if self.config.backend in {"torch", "onnx"}:
             feats = self.engine.infer(feats)
         return min(1.0, max(0.0, sum(feats[:4]) / 4))

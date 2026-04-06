@@ -193,6 +193,10 @@ class GraphDelta:
     visibility_deltas: dict[str, VisibilityState] = field(default_factory=dict)
     newly_revealed_regions: list[RegionRef] = field(default_factory=list)
     newly_occluded_regions: list[RegionRef] = field(default_factory=list)
+    affected_entities: list[str] = field(default_factory=list)
+    affected_regions: list[str] = field(default_factory=list)
+    semantic_reasons: list[str] = field(default_factory=list)
+    predicted_visibility_changes: dict[str, VisibilityState] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -212,6 +216,8 @@ class TexturePatchMemory:
     source_frame: int
     patch_ref: str
     confidence: float
+    descriptor: dict[str, float | list[float]] = field(default_factory=dict)
+    evidence_score: float = 0.0
 
 
 @dataclass(slots=True)

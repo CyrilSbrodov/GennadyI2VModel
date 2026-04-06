@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from core.input_layer import AssetFrame
 from typing import Protocol
 
 from core.schema import Keypoint, PoseState
-from perception.backend import BackendInferenceEngine, image_ref_to_features
+from perception.backend import BackendInferenceEngine, frame_to_features
 from perception.detector import BackendConfig, PersonDetection
 
 
@@ -18,7 +20,7 @@ class PosePrediction:
 
 
 class PoseEstimator(Protocol):
-    def estimate(self, image_ref: str, persons: list[PersonDetection]) -> dict[str, PosePrediction]:
+    def estimate(self, frame: AssetFrame | list[list[list[float]]] | str, persons: list[PersonDetection]) -> dict[str, PosePrediction]:
         ...
 
 
@@ -29,9 +31,9 @@ class VitPoseAdapter:
         self.config = config or BackendConfig(checkpoint="checkpoints/vitpose.torch")
         self.engine = BackendInferenceEngine(self.source_name, self.config.backend, self.config.checkpoint)
 
-    def estimate(self, image_ref: str, persons: list[PersonDetection]) -> dict[str, PosePrediction]:
+    def estimate(self, frame: AssetFrame | list[list[list[float]]] | str, persons: list[PersonDetection]) -> dict[str, PosePrediction]:
         result: dict[str, PosePrediction] = {}
-        base = image_ref_to_features(image_ref)
+        base = frame_to_features(frame)
         for person in persons:
             pred = self.engine.infer(base) if self.config.backend in {"torch", "onnx"} else base
             cy = person.bbox.y + person.bbox.h * 0.12

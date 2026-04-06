@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from core.region_ids import make_region_id
 from core.schema import BBox, GraphDelta, RegionRef, SceneGraph, VideoMemory
 from dynamics.model import DynamicsInputs, DynamicsModel
 from planning.transition_engine import PlannedState
@@ -19,66 +20,30 @@ class GraphDeltaPredictor:
         self.model = DynamicsModel()
 
     def _serialize_graph(self, scene_graph: SceneGraph) -> str:
-        return (
-            f"f={scene_graph.frame_index};"
-            f"p={len(scene_graph.persons)};o={len(scene_graph.objects)};"
-            + ";".join(sorted(p.person_id for p in scene_graph.persons))
-        )
+        return f"f={scene_graph.frame_index};p={len(scene_graph.persons)};o={len(scene_graph.objects)};" + ";".join(sorted(p.person_id for p in scene_graph.persons))
 
     def _clamp_pose(self, value: float, lo: float = -45.0, hi: float = 45.0) -> float:
         return max(lo, min(hi, value))
 
-    def _apply_action_rules(self, labels: set[str], delta: GraphDelta, pose_scale: float, garment_scale: float, expr_scale: float, interact_scale: float, vis_scale: float) -> None:
-        if "sit_down" in labels:
-            delta.pose_deltas.update(
-                {
-                    "left_knee": self._clamp_pose(25.0 * pose_scale),
-                    "right_knee": self._clamp_pose(25.0 * pose_scale),
-                    "torso_pitch": self._clamp_pose(8.0 * pose_scale),
-                }
-            )
-            delta.interaction_deltas["chair_contact"] = min(1.0, 0.2 + interact_scale)
-            delta.newly_revealed_regions.append(RegionRef("torso_reveal", BBox(0.4, 0.4, 0.2, 0.18), "posture_change"))
+    def _region_from_person(self, person_id: str, person_bbox: BBox, kind: str, reason: str) -> RegionRef:
+        if kind == "face":
+            box = BBox(person_bbox.x + person_bbox.w * 0.3, person_bbox.y, person_bbox.w * 0.4, person_bbox.h * 0.2)
+        elif kind in {"left_arm", "right_arm"}:
+            x = person_bbox.x if kind == "left_arm" else person_bbox.x + person_bbox.w * 0.5
+            box = BBox(x, person_bbox.y + person_bbox.h * 0.2, person_bbox.w * 0.5, person_bbox.h * 0.32)
+        elif kind == "pelvis":
+            box = BBox(person_bbox.x + person_bbox.w * 0.3, person_bbox.y + person_bbox.h * 0.5, person_bbox.w * 0.4, person_bbox.h * 0.2)
+        elif kind == "legs":
+            box = BBox(person_bbox.x + person_bbox.w * 0.18, person_bbox.y + person_bbox.h * 0.58, person_bbox.w * 0.64, person_bbox.h * 0.4)
+        else:
+            box = BBox(person_bbox.x + person_bbox.w * 0.1, person_bbox.y + person_bbox.h * 0.2, person_bbox.w * 0.8, person_bbox.h * 0.55)
+        return RegionRef(region_id=make_region_id(person_id, kind), bbox=box, reason=reason)
 
-        if "stand_up" in labels:
-            delta.pose_deltas.update({"left_knee": -6.0 * pose_scale, "right_knee": -6.0 * pose_scale, "torso_pitch": -4.0 * pose_scale})
-            delta.interaction_deltas["chair_contact"] = max(0.0, 0.5 - interact_scale)
-
-        if "remove_garment" in labels:
-            delta.garment_deltas.update(
-                {
-                    "coat_attachment_torso": -0.3 * garment_scale,
-                    "coat_state": "half_removed" if garment_scale < 0.8 else "removed",
-                }
-            )
-            delta.visibility_deltas["shirt"] = "partially_visible" if vis_scale > 0.2 else "hidden"
-            delta.newly_revealed_regions.append(RegionRef("shirt_reveal", BBox(0.38, 0.3, 0.24, 0.28), "garment_opening"))
-
-        if "smile" in labels:
-            delta.expression_deltas.update({"smile_intensity": 0.2 * expr_scale, "mouth_state": "smile"})
-            delta.newly_revealed_regions.append(RegionRef("face_expression", BBox(0.43, 0.14, 0.14, 0.11), "facial_change"))
-
-        if "raise_arm" in labels:
-            delta.pose_deltas.update({"left_shoulder": 10.0 * pose_scale})
-            delta.newly_revealed_regions.append(RegionRef("arm_motion", BBox(0.2, 0.25, 0.2, 0.2), "arm_raise"))
-
-        if "turn_head" in labels:
-            delta.pose_deltas.update({"head_yaw": 12.0 * pose_scale})
-
-        if "walk_step" in labels or "shift_weight" in labels:
-            delta.pose_deltas.update({"pelvis_shift": 3.0 * pose_scale, "torso_pitch": 1.5 * pose_scale})
-            delta.newly_revealed_regions.append(RegionRef("lower_body", BBox(0.38, 0.45, 0.24, 0.3), "weight_shift"))
-
-    def predict(
-        self,
-        scene_graph: SceneGraph,
-        target_state: PlannedState,
-        planner_context: dict[str, float] | None = None,
-        memory: VideoMemory | None = None,
-    ) -> tuple[GraphDelta, DynamicsMetrics]:
+    def predict(self, scene_graph: SceneGraph, target_state: PlannedState, planner_context: dict[str, float] | None = None, memory: VideoMemory | None = None) -> tuple[GraphDelta, DynamicsMetrics]:
         labels = set(target_state.labels)
         delta = GraphDelta()
         context = planner_context or {}
+        person = scene_graph.persons[0] if scene_graph.persons else None
 
         model_out = self.model.forward(
             DynamicsInputs(
@@ -89,18 +54,51 @@ class GraphDeltaPredictor:
             )
         )
 
-        self._apply_action_rules(
-            labels=labels,
-            delta=delta,
-            pose_scale=model_out["pose"],
-            garment_scale=model_out["garment"],
-            expr_scale=model_out["expression"],
-            interact_scale=model_out["interaction"],
-            vis_scale=model_out["visibility"],
-        )
+        if person:
+            delta.affected_entities.append(person.person_id)
 
-        if not delta.newly_revealed_regions:
-            delta.newly_revealed_regions.append(RegionRef("micro_adjust", BBox(0.45, 0.22, 0.1, 0.1), "stabilization"))
+        if "sit_down" in labels:
+            delta.semantic_reasons.append("sit_down")
+            delta.pose_deltas.update({"left_knee": self._clamp_pose(25.0 * model_out["pose"]), "right_knee": self._clamp_pose(25.0 * model_out["pose"]), "torso_pitch": self._clamp_pose(8.0 * model_out["pose"])})
+            delta.interaction_deltas["chair_contact"] = min(1.0, 0.2 + model_out["interaction"])
+            delta.affected_regions.extend(["pelvis", "legs"])
+            delta.predicted_visibility_changes.update({"legs": "partially_visible", "torso": "partially_visible"})
+            if person:
+                delta.newly_revealed_regions.append(self._region_from_person(person.person_id, person.bbox, "pelvis", "sit_down"))
+
+        if "remove_garment" in labels:
+            delta.semantic_reasons.append("garment_change")
+            delta.garment_deltas.update({"coat_attachment_torso": -0.3 * model_out["garment"], "coat_state": "half_removed" if model_out["garment"] < 0.8 else "removed"})
+            delta.visibility_deltas["shirt"] = "partially_visible" if model_out["visibility"] > 0.2 else "hidden"
+            delta.affected_regions.append("garments")
+            delta.predicted_visibility_changes.update({"garments": "partially_visible", "torso": "visible"})
+            if person:
+                delta.newly_revealed_regions.append(self._region_from_person(person.person_id, person.bbox, "garments", "garment_opening"))
+
+        if "smile" in labels:
+            delta.semantic_reasons.append("expression_change")
+            delta.expression_deltas.update({"smile_intensity": 0.2 * model_out["expression"], "mouth_state": "smile"})
+            delta.affected_regions.append("face")
+            delta.predicted_visibility_changes["face"] = "visible"
+            if person:
+                delta.newly_revealed_regions.append(self._region_from_person(person.person_id, person.bbox, "face", "facial_change"))
+
+        if "raise_arm" in labels:
+            delta.semantic_reasons.append("raise_arm")
+            delta.pose_deltas.update({"left_shoulder": 10.0 * model_out["pose"], "left_elbow": 8.0 * model_out["pose"]})
+            delta.affected_regions.extend(["left_arm", "sleeves"])
+            delta.predicted_visibility_changes["left_arm"] = "visible"
+            if person:
+                delta.newly_revealed_regions.append(self._region_from_person(person.person_id, person.bbox, "left_arm", "arm_raise"))
+
+        if "turn_head" in labels:
+            delta.semantic_reasons.append("turn_head")
+            delta.pose_deltas.update({"head_yaw": 12.0 * model_out["pose"]})
+            delta.affected_regions.append("face")
+
+        if not delta.newly_revealed_regions and person:
+            delta.newly_revealed_regions.append(self._region_from_person(person.person_id, person.bbox, "torso", "stabilization"))
+            delta.semantic_reasons.append("micro_adjust")
 
         magnitude = sum(abs(v) for v in delta.pose_deltas.values()) + sum(abs(v) for v in delta.interaction_deltas.values())
         metrics = DynamicsMetrics(
