@@ -158,7 +158,12 @@ class ActionStep:
     priority: int
     target_entity: str | None = None
     target_object: str | None = None
+    body_part: str | None = None
     intensity: float | None = None
+    duration_sec: float | None = None
+    start_after: list[int] = field(default_factory=list)
+    can_run_parallel: bool = False
+    constraints: list[str] = field(default_factory=list)
     modifiers: dict[str, Any] = field(default_factory=dict)
 
 
@@ -167,6 +172,7 @@ class ActionPlan:
     actions: list[ActionStep] = field(default_factory=list)
     temporal_ordering: list[int] = field(default_factory=list)
     constraints: list[str] = field(default_factory=list)
+    parallel_groups: list[list[int]] = field(default_factory=list)
     global_style: str | None = None
 
 
@@ -198,9 +204,51 @@ class MemoryEntry:
 
 
 @dataclass(slots=True)
+class TexturePatchMemory:
+    patch_id: str
+    region_type: str
+    entity_id: str
+    source_frame: int
+    patch_ref: str
+    confidence: float
+
+
+@dataclass(slots=True)
+class RegionDescriptor:
+    region_id: str
+    entity_id: str
+    region_type: str
+    bbox: BBox
+    visibility: VisibilityState
+    confidence: float
+    last_update_frame: int
+
+
+@dataclass(slots=True)
+class HiddenRegionSlot:
+    slot_id: str
+    region_type: str
+    owner_entity: str
+    candidate_patch_ids: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+    stale_frames: int = 0
+
+
+@dataclass(slots=True)
+class PlannerDiagnostics:
+    skipped_actions: list[str] = field(default_factory=list)
+    inserted_objects: list[str] = field(default_factory=list)
+    policy_decisions: list[str] = field(default_factory=list)
+    constraint_warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class VideoMemory:
     identity_memory: dict[str, MemoryEntry] = field(default_factory=dict)
     garment_memory: dict[str, MemoryEntry] = field(default_factory=dict)
     temporal_history: list[SceneGraph] = field(default_factory=list)
     patch_cache: dict[str, Any] = field(default_factory=dict)
     hidden_region_memory: dict[str, MemoryEntry] = field(default_factory=dict)
+    texture_patches: dict[str, TexturePatchMemory] = field(default_factory=dict)
+    region_descriptors: dict[str, RegionDescriptor] = field(default_factory=dict)
+    hidden_region_slots: dict[str, HiddenRegionSlot] = field(default_factory=dict)
