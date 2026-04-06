@@ -51,7 +51,7 @@ class GennadyEngine:
     ) -> InferenceArtifacts:
         profile = self._resolve_profile(quality_profile)
         request = self.input_layer.build_request(images=images, text=text, fps=fps, duration=duration)
-        source_image = request.images[0] if request.images else "generated://blank"
+        source_image = request.images[0] if request.images else (request.reference_set[0] if request.reference_set else "generated://blank")
 
         perception_output = self.perception.analyze(source_image)
         scene_graph = self.graph_builder.build(perception_output, frame_index=0)
@@ -118,6 +118,14 @@ class GennadyEngine:
                     "backend": profile.backend,
                 },
                 "video_export": video_uri,
+                "input_metadata": {
+                    "input_type": request.input_type,
+                    "orig_size": request.orig_size,
+                    "normalized_size": request.normalized_size,
+                    "frame_count": request.frame_count,
+                    "timestamps_preview": request.timestamps[: min(10, len(request.timestamps))],
+                    "reference_set": request.reference_set,
+                },
             },
         )
 
