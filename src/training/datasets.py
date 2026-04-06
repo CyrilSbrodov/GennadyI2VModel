@@ -12,6 +12,8 @@ class TrainingSample(TypedDict, total=False):
     actions: list[ActionStep]
     deltas: list[GraphDelta]
     roi_pairs: list[tuple[str, str]]
+    targets: list[GraphDelta]
+    sanity_metrics: dict[str, float]
 
 
 @dataclass(slots=True)
