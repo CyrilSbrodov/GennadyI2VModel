@@ -45,7 +45,7 @@ class SceneGraphBuilder:
             persons.append(
                 PersonNode(
                     person_id=person_id,
-                    track_id=person_id,
+                    track_id=p.track_id or person_id,
                     bbox=p.bbox,
                     mask_ref=p.mask_ref,
                     pose_state=p.pose,
@@ -53,7 +53,7 @@ class SceneGraphBuilder:
                     orientation=p.orientation,
                     body_parts=body_parts,
                     garments=garments,
-                    confidence=0.9,
+                    confidence=p.bbox_confidence,
                 )
             )
 
