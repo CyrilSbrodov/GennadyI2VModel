@@ -5,6 +5,19 @@ from typing import Any, Literal
 
 
 VisibilityState = Literal["visible", "partially_visible", "hidden", "unknown"]
+RelationType = Literal[
+    "part_of",
+    "attached_to",
+    "covers",
+    "occludes",
+    "supports",
+    "interacts_with",
+    "touches",
+    "near",
+    "inside",
+    "in_front_of",
+    "behind",
+]
 
 
 @dataclass(slots=True)
@@ -56,6 +69,10 @@ class BodyPartNode:
     depth_order: float = 0.0
     canonical_slot: str = ""
     confidence: float = 0.0
+    source: str = "unknown"
+    frame_index: int = 0
+    timestamp: float | None = None
+    alternatives: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -69,6 +86,10 @@ class GarmentNode:
     visibility: VisibilityState = "unknown"
     appearance_ref: str | None = None
     confidence: float = 0.0
+    source: str = "unknown"
+    frame_index: int = 0
+    timestamp: float | None = None
+    alternatives: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -83,6 +104,10 @@ class PersonNode:
     body_parts: list[BodyPartNode] = field(default_factory=list)
     garments: list[GarmentNode] = field(default_factory=list)
     confidence: float = 0.0
+    source: str = "unknown"
+    frame_index: int = 0
+    timestamp: float | None = None
+    alternatives: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -92,14 +117,22 @@ class SceneObjectNode:
     bbox: BBox
     mask_ref: str | None = None
     confidence: float = 0.0
+    source: str = "unknown"
+    frame_index: int = 0
+    timestamp: float | None = None
+    alternatives: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
 class RelationEdge:
     source: str
-    relation: str
+    relation: RelationType
     target: str
     confidence: float = 0.0
+    provenance: str = "unknown"
+    frame_index: int = 0
+    timestamp: float | None = None
+    alternatives: list[RelationType] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -116,6 +149,7 @@ class SceneGraph:
     objects: list[SceneObjectNode] = field(default_factory=list)
     relations: list[RelationEdge] = field(default_factory=list)
     global_context: GlobalSceneContext = field(default_factory=GlobalSceneContext)
+    timestamp: float | None = None
 
 
 @dataclass(slots=True)
