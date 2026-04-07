@@ -31,6 +31,9 @@ class DynamicsTransitionRequest:
     graph_state: SceneGraph
     memory_summary: dict[str, object]
     text_action_summary: TextEncodingOutput
+    memory_channels: dict[str, object] = field(default_factory=dict)
+    graph_encoding: GraphEncodingOutput | None = None
+    identity_embeddings: dict[str, list[float]] = field(default_factory=dict)
     step_context: dict[str, object] = field(default_factory=dict)
 
 
@@ -38,6 +41,7 @@ class DynamicsTransitionRequest:
 class DynamicsTransitionOutput:
     delta: GraphDelta
     confidence: float = 0.0
+    diagnostics: dict[str, float] = field(default_factory=dict)
     metadata: dict[str, object] = field(default_factory=dict)
 
 
@@ -49,12 +53,23 @@ class PatchSynthesisRequest:
     transition_context: dict[str, object]
     retrieval_summary: dict[str, object]
     current_frame: list
+    memory_channels: dict[str, object] = field(default_factory=dict)
+    graph_encoding: GraphEncodingOutput | None = None
+    identity_embedding: list[float] = field(default_factory=list)
 
 
 @dataclass(slots=True)
 class PatchSynthesisOutput:
+    region: RegionRef
     rgb_patch: list[list[list[float]]]
+    alpha_mask: list[list[float]]
+    height: int
+    width: int
+    channels: int
     confidence: float
+    z_index: int = 1
+    debug_trace: list[str] = field(default_factory=list)
+    execution_trace: dict[str, object] = field(default_factory=dict)
     uncertainty_map: list[list[float]] | None = None
     metadata: dict[str, object] = field(default_factory=dict)
 
@@ -66,6 +81,7 @@ class TemporalRefinementRequest:
     changed_regions: list[RegionRef]
     scene_state: SceneGraph
     memory_state: VideoMemory
+    memory_channels: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

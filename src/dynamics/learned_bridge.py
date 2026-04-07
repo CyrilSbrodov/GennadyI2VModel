@@ -33,6 +33,11 @@ class BaselineDynamicsTransitionModel(DynamicsTransitionModel):
         return DynamicsTransitionOutput(
             delta=delta,
             confidence=max(0.0, min(1.0, 1.0 - 0.1 * metrics.constraint_violations)),
+            diagnostics={
+                "delta_magnitude": metrics.delta_magnitude,
+                "temporal_smoothness_proxy": metrics.temporal_smoothness_proxy,
+                "constraint_violations": float(metrics.constraint_violations),
+            },
             metadata={
                 "backend": "deterministic_graph_delta_predictor",
                 "delta_magnitude": metrics.delta_magnitude,

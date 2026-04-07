@@ -4,12 +4,12 @@ import math
 
 from learned.interfaces import GraphEncoder, GraphEncodingOutput, IdentityAppearanceEncoder
 from memory.summaries import AppearanceMemorySummarizer
-from training.datasets import _serialize_graph
+from core.schema import SceneGraph
 
 
 class BaselineGraphEncoder(GraphEncoder):
     def encode(self, scene_graph) -> GraphEncodingOutput:
-        serialized = _serialize_graph(scene_graph)
+        serialized = _serialize_graph_for_bridge(scene_graph)
         counts = [float(len(scene_graph.persons)), float(len(scene_graph.objects)), float(len(scene_graph.relations)), float(scene_graph.frame_index)]
         n = math.sqrt(sum(v * v for v in counts)) or 1.0
         emb = [v / n for v in counts]
@@ -26,3 +26,12 @@ class BaselineIdentityAppearanceEncoder(IdentityAppearanceEncoder):
 
 def summarize_memory(memory) -> dict[str, object]:
     return AppearanceMemorySummarizer().summarize(memory).as_dict()
+
+
+def _serialize_graph_for_bridge(graph: SceneGraph) -> dict[str, object]:
+    return {
+        "frame_index": graph.frame_index,
+        "persons": [{"person_id": p.person_id, "track_id": p.track_id} for p in graph.persons],
+        "objects": [{"object_id": o.object_id, "object_type": o.object_type} for o in graph.objects],
+        "relation_count": len(graph.relations),
+    }
