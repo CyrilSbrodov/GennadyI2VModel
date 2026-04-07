@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from typing import Any, Callable, TypeVar
 
 from core.input_layer import AssetFrame
 from core.schema import BBox, ExpressionState, OrientationState, PoseState
@@ -14,6 +15,8 @@ from perception.pose import PoseEstimator, PosePrediction, VitPoseAdapter
 from perception.profiling import StageTimer
 from perception.tracker import ByteTrackAdapter, PersonTracker, TrackPrediction
 from utils_tensor import shape
+
+T = TypeVar("T")
 
 
 @dataclass(slots=True)
@@ -80,6 +83,7 @@ class PerceptionOutput:
     module_latency_ms: dict[str, float] = field(default_factory=dict)
     module_fallbacks: dict[str, str] = field(default_factory=dict)
     depth_score: float | None = None
+    input_mode: str = "unknown"
 
 
 class PerceptionPipeline:
@@ -104,32 +108,83 @@ class PerceptionPipeline:
         self.objects = objects or YoloObjectDetectorAdapter(cfg.objects)
         self.tracker = tracker or ByteTrackAdapter()
         self.depth = depth or MonoDepthEstimator()
+        self._builtin_detector_fallback: Detector | None = None
+        self._builtin_pose_fallback: PoseEstimator | None = None
+        self._builtin_parser_fallback: HumanParser | None = None
+        self._builtin_face_fallback: FaceAnalyzer | None = None
+        self._builtin_tracker_fallback: PersonTracker | None = None
+        self._builtin_objects_fallback: ObjectDetector | None = None
+        self._builtin_depth_fallback: MonoDepthEstimator | None = None
 
-    def _safe_module_call(self, fn, fallback_fn, warnings: list[str], module_name: str, out: PerceptionOutput,
-                          success_mode: str = "native"):
+    def _safe_module_call(
+        self,
+        fn: Callable[[], T],
+        *,
+        fallback_fn: Callable[[], T] | None,
+        default_value: T,
+        warnings: list[str],
+        module_name: str,
+        out: PerceptionOutput,
+        success_mode: str = "native",
+    ) -> T:
         start = time.perf_counter()
-        print(f"[MOD] {module_name}: start")
         try:
             value = fn()
             out.module_fallbacks[module_name] = success_mode
-            print(f"[MOD] {module_name}: success ({success_mode}) in {(time.perf_counter() - start):.3f}s")
             return value
         except Exception as exc:
             warnings.append(f"{module_name}_unavailable:{exc}")
-            print(f"[MOD] {module_name}: failed in {(time.perf_counter() - start):.3f}s -> {exc}")
+            if fallback_fn is None:
+                warnings.append(f"{module_name}_no_fallback")
+                out.module_fallbacks[module_name] = "error:no-fallback"
+                return default_value
             try:
-                fb_start = time.perf_counter()
                 value = fallback_fn()
                 out.module_fallbacks[module_name] = "fallback"
-                print(f"[MOD] {module_name}: fallback success in {(time.perf_counter() - fb_start):.3f}s")
                 return value
             except Exception as fb_exc:
                 warnings.append(f"{module_name}_fallback_failed:{fb_exc}")
-                out.module_fallbacks[module_name] = "real_backend_error"
-                print(f"[MOD] {module_name}: fallback failed -> {fb_exc}")
-                raise
+                out.module_fallbacks[module_name] = "error:fallback-failed"
+                return default_value
             finally:
                 out.module_latency_ms[module_name] = round((time.perf_counter() - start) * 1000.0, 3)
+        finally:
+            out.module_latency_ms.setdefault(module_name, round((time.perf_counter() - start) * 1000.0, 3))
+
+    def _get_builtin_detector_fallback(self) -> Detector:
+        if self._builtin_detector_fallback is None:
+            self._builtin_detector_fallback = YoloPersonDetectorAdapter(BackendConfig(backend="builtin"))
+        return self._builtin_detector_fallback
+
+    def _get_builtin_pose_fallback(self) -> PoseEstimator:
+        if self._builtin_pose_fallback is None:
+            self._builtin_pose_fallback = VitPoseAdapter(BackendConfig(backend="builtin"))
+        return self._builtin_pose_fallback
+
+    def _get_builtin_parser_fallback(self) -> HumanParser:
+        if self._builtin_parser_fallback is None:
+            self._builtin_parser_fallback = SegFormerHumanParserAdapter(BackendConfig(backend="builtin"))
+        return self._builtin_parser_fallback
+
+    def _get_builtin_face_fallback(self) -> FaceAnalyzer:
+        if self._builtin_face_fallback is None:
+            self._builtin_face_fallback = EmoNetFaceAnalyzerAdapter(BackendConfig(backend="builtin"))
+        return self._builtin_face_fallback
+
+    def _get_builtin_tracker_fallback(self) -> PersonTracker:
+        if self._builtin_tracker_fallback is None:
+            self._builtin_tracker_fallback = ByteTrackAdapter(BackendConfig(backend="builtin"))
+        return self._builtin_tracker_fallback
+
+    def _get_builtin_objects_fallback(self) -> ObjectDetector:
+        if self._builtin_objects_fallback is None:
+            self._builtin_objects_fallback = YoloObjectDetectorAdapter(BackendConfig(backend="builtin"))
+        return self._builtin_objects_fallback
+
+    def _get_builtin_depth_fallback(self) -> MonoDepthEstimator:
+        if self._builtin_depth_fallback is None:
+            self._builtin_depth_fallback = MonoDepthEstimator(BackendConfig(backend="builtin"))
+        return self._builtin_depth_fallback
 
     @staticmethod
     def _backend_fallback_enabled(module: object) -> bool:
@@ -152,12 +207,10 @@ class PerceptionPipeline:
         out = PerceptionOutput()
         warnings = out.warnings
 
-        default_detector = YoloPersonDetectorAdapter(BackendConfig(backend="builtin"))
         detection_out = self._safe_module_call(
             lambda: self.detector.detect(frame_ctx),
-            fallback_fn=(lambda: default_detector.detect(frame))
-            if self._backend_fallback_enabled(self.detector)
-            else (lambda: DetectorOutput()),
+            fallback_fn=(lambda: self._get_builtin_detector_fallback().detect(frame_ctx)) if self._backend_fallback_enabled(self.detector) else None,
+            default_value=DetectorOutput(),
             warnings=warnings,
             module_name="detector",
             out=out,
@@ -166,9 +219,8 @@ class PerceptionPipeline:
 
         pose_predictions: dict[str, PosePrediction] = self._safe_module_call(
             lambda: self.pose.estimate(frame_ctx, detection_out.persons),
-            fallback_fn=(lambda: VitPoseAdapter(BackendConfig(backend="builtin")).estimate(frame, detection_out.persons))
-            if self._backend_fallback_enabled(self.pose)
-            else (lambda: {}),
+            fallback_fn=(lambda: self._get_builtin_pose_fallback().estimate(frame_ctx, detection_out.persons)) if self._backend_fallback_enabled(self.pose) else None,
+            default_value={},
             warnings=warnings,
             module_name="pose",
             out=out,
@@ -176,9 +228,8 @@ class PerceptionPipeline:
         )
         parsing_predictions: dict[str, ParsingPrediction] = self._safe_module_call(
             lambda: self.parser.parse(frame_ctx, detection_out.persons),
-            fallback_fn=(lambda: SegFormerHumanParserAdapter(BackendConfig(backend="builtin")).parse(frame, detection_out.persons))
-            if self._backend_fallback_enabled(self.parser)
-            else (lambda: {}),
+            fallback_fn=(lambda: self._get_builtin_parser_fallback().parse(frame_ctx, detection_out.persons)) if self._backend_fallback_enabled(self.parser) else None,
+            default_value={},
             warnings=warnings,
             module_name="parser",
             out=out,
@@ -186,9 +237,8 @@ class PerceptionPipeline:
         )
         face_predictions: dict[str, FacePrediction] = self._safe_module_call(
             lambda: self.face.analyze(frame_ctx, detection_out.persons),
-            fallback_fn=(lambda: EmoNetFaceAnalyzerAdapter(BackendConfig(backend="builtin")).analyze(frame, detection_out.persons))
-            if self._backend_fallback_enabled(self.face)
-            else (lambda: {}),
+            fallback_fn=(lambda: self._get_builtin_face_fallback().analyze(frame_ctx, detection_out.persons)) if self._backend_fallback_enabled(self.face) else None,
+            default_value={},
             warnings=warnings,
             module_name="face",
             out=out,
@@ -196,9 +246,8 @@ class PerceptionPipeline:
         )
         track_predictions: dict[str, TrackPrediction] = self._safe_module_call(
             lambda: self.tracker.assign(frame_ctx, detection_out.persons),
-            fallback_fn=(lambda: ByteTrackAdapter(BackendConfig(backend="builtin")).assign(frame, detection_out.persons))
-            if self._backend_fallback_enabled(self.tracker)
-            else (lambda: {}),
+            fallback_fn=(lambda: self._get_builtin_tracker_fallback().assign(frame_ctx, detection_out.persons)) if self._backend_fallback_enabled(self.tracker) else None,
+            default_value={},
             warnings=warnings,
             module_name="tracker",
             out=out,
@@ -206,9 +255,8 @@ class PerceptionPipeline:
         )
         object_predictions: list[ObjectPrediction] = self._safe_module_call(
             lambda: self.objects.detect(frame_ctx),
-            fallback_fn=(lambda: YoloObjectDetectorAdapter(BackendConfig(backend="builtin")).detect(frame))
-            if self._backend_fallback_enabled(self.objects)
-            else (lambda: []),
+            fallback_fn=(lambda: self._get_builtin_objects_fallback().detect(frame_ctx)) if self._backend_fallback_enabled(self.objects) else None,
+            default_value=[],
             warnings=warnings,
             module_name="objects",
             out=out,
@@ -216,9 +264,8 @@ class PerceptionPipeline:
         )
         out.depth_score = self._safe_module_call(
             lambda: self.depth.estimate(frame_ctx),
-            fallback_fn=(lambda: MonoDepthEstimator(BackendConfig(backend="builtin")).estimate(frame))
-            if self._backend_fallback_enabled(self.depth)
-            else (lambda: None),
+            fallback_fn=(lambda: self._get_builtin_depth_fallback().estimate(frame_ctx)) if self._backend_fallback_enabled(self.depth) else None,
+            default_value=None,
             warnings=warnings,
             module_name="depth",
             out=out,
@@ -301,12 +348,13 @@ class PerceptionPipeline:
         raw_frame = unwrap_frame(frame_ctx)
         if isinstance(raw_frame, str):
             out.frame_size = detection_out.frame_size
-            out.module_fallbacks["input_mode"] = "string_ref_fallback"
+            out.input_mode = "string_ref_fallback"
         else:
             tensor = raw_frame.tensor if isinstance(raw_frame, AssetFrame) else raw_frame
             h, w, _ = shape(tensor)
             out.frame_size = (w, h)
-            out.module_fallbacks["input_mode"] = "frame_tensor"
+            out.input_mode = "frame_tensor"
+        out.module_fallbacks["input_mode"] = out.input_mode
 
         out.module_confidence = {
             "detector": max([p.bbox_confidence for p in out.persons], default=0.0),
@@ -332,6 +380,53 @@ class ParserOnlyPipeline:
         cfg = backends or PerceptionBackendsConfig()
         self.detector = detector or YoloPersonDetectorAdapter(cfg.detector)
         self.parser = parser or SegFormerHumanParserAdapter(cfg.parser)
+        self._builtin_detector_fallback: Detector | None = None
+        self._builtin_parser_fallback: HumanParser | None = None
+
+    def _safe_module_call(
+        self,
+        fn: Callable[[], T],
+        *,
+        fallback_fn: Callable[[], T] | None,
+        default_value: T,
+        warnings: list[str],
+        module_name: str,
+        out: PerceptionOutput,
+        success_mode: str,
+    ) -> T:
+        start = time.perf_counter()
+        try:
+            value = fn()
+            out.module_fallbacks[module_name] = success_mode
+            return value
+        except Exception as exc:
+            warnings.append(f"{module_name}_unavailable:{exc}")
+            if fallback_fn is None:
+                warnings.append(f"{module_name}_no_fallback")
+                out.module_fallbacks[module_name] = "error:no-fallback"
+                return default_value
+            try:
+                value = fallback_fn()
+                out.module_fallbacks[module_name] = "fallback"
+                return value
+            except Exception as fb_exc:
+                warnings.append(f"{module_name}_fallback_failed:{fb_exc}")
+                out.module_fallbacks[module_name] = "error:fallback-failed"
+                return default_value
+            finally:
+                out.module_latency_ms[module_name] = round((time.perf_counter() - start) * 1000.0, 3)
+        finally:
+            out.module_latency_ms.setdefault(module_name, round((time.perf_counter() - start) * 1000.0, 3))
+
+    def _get_builtin_detector_fallback(self) -> Detector:
+        if self._builtin_detector_fallback is None:
+            self._builtin_detector_fallback = YoloPersonDetectorAdapter(BackendConfig(backend="builtin"))
+        return self._builtin_detector_fallback
+
+    def _get_builtin_parser_fallback(self) -> HumanParser:
+        if self._builtin_parser_fallback is None:
+            self._builtin_parser_fallback = SegFormerHumanParserAdapter(BackendConfig(backend="builtin"))
+        return self._builtin_parser_fallback
 
     def analyze(self, frame: FrameLike, profiler: StageTimer | None = None) -> PerceptionOutput:
         out = PerceptionOutput()
@@ -340,9 +435,29 @@ class ParserOnlyPipeline:
         frame_ctx.put("profiler", timer)
 
         with timer.track("detector"):
-            detection_out = self.detector.detect(frame_ctx)
+            detection_out = self._safe_module_call(
+                lambda: self.detector.detect(frame_ctx),
+                fallback_fn=(lambda: self._get_builtin_detector_fallback().detect(frame_ctx))
+                if PerceptionPipeline._backend_fallback_enabled(self.detector)
+                else None,
+                default_value=DetectorOutput(),
+                warnings=out.warnings,
+                module_name="detector",
+                out=out,
+                success_mode=PerceptionPipeline._module_success_mode(self.detector),
+            )
         with timer.track("parser_total"):
-            parsing_predictions = self.parser.parse(frame_ctx, detection_out.persons)
+            parsing_predictions = self._safe_module_call(
+                lambda: self.parser.parse(frame_ctx, detection_out.persons),
+                fallback_fn=(lambda: self._get_builtin_parser_fallback().parse(frame_ctx, detection_out.persons))
+                if PerceptionPipeline._backend_fallback_enabled(self.parser)
+                else None,
+                default_value={},
+                warnings=out.warnings,
+                module_name="parser",
+                out=out,
+                success_mode=PerceptionPipeline._module_success_mode(self.parser),
+            )
 
         persons: list[PersonFacts] = []
         for person in detection_out.persons:
@@ -387,8 +502,8 @@ class ParserOnlyPipeline:
         out.objects = []
         out.depth_score = None
         out.module_fallbacks = {
-            "detector": "builtin" if getattr(self.detector, "config", BackendConfig()).backend == "builtin" else "native",
-            "parser": "builtin" if getattr(self.parser, "is_builtin_backend", lambda: False)() else "native",
+            "detector": out.module_fallbacks.get("detector", "unknown"),
+            "parser": out.module_fallbacks.get("parser", "unknown"),
             "pose": "disabled:parser-only",
             "face": "disabled:parser-only",
             "tracker": "disabled:parser-only",
@@ -398,16 +513,26 @@ class ParserOnlyPipeline:
         out.module_confidence = {
             "detector": max([p.bbox_confidence for p in out.persons], default=0.0),
             "pose": 0.0,
+            "parser": max([p.mask_confidence for p in out.persons], default=0.0),
             "face": 0.0,
             "tracker": 0.0,
             "objects": 0.0,
+            "depth": 0.0,
         }
+        out.module_latency_ms.setdefault("pose", 0.0)
+        out.module_latency_ms.setdefault("face", 0.0)
+        out.module_latency_ms.setdefault("tracker", 0.0)
+        out.module_latency_ms.setdefault("objects", 0.0)
+        out.module_latency_ms.setdefault("depth", 0.0)
 
         raw_frame = unwrap_frame(frame_ctx)
         if isinstance(raw_frame, str):
             out.frame_size = detection_out.frame_size
+            out.input_mode = "string_ref_fallback"
         else:
             tensor = raw_frame.tensor if isinstance(raw_frame, AssetFrame) else raw_frame
             h, w, _ = shape(tensor)
             out.frame_size = (w, h)
+            out.input_mode = "frame_tensor"
+        out.module_fallbacks["input_mode"] = out.input_mode
         return out

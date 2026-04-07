@@ -254,8 +254,7 @@ def main() -> None:
             report["fail_reasons"].extend(semantic_fails)
 
         report["timings_ms"] = {k: round(v["total_ms"], 3) for k, v in timer.summary().items()}
-        for stage, stats in timer.summary().items():
-            run_profiler.add(stage, stats["total_ms"] / 1000.0)
+        run_profiler.merge(timer)
         report["fail_reasons"] = sorted(set(report["fail_reasons"]))
         report["passed"] = not report["fail_reasons"]
         per_image_reports.append(report)

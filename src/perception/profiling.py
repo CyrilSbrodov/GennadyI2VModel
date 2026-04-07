@@ -26,6 +26,16 @@ class StageTimer:
         if self.enabled:
             self.entries[stage].append(float(duration_sec))
 
+    def merge(self, other: "StageTimer") -> None:
+        self.merge_entries(other.entries)
+
+    def merge_entries(self, entries: dict[str, list[float]]) -> None:
+        if not self.enabled:
+            return
+        for stage, durations in entries.items():
+            if durations:
+                self.entries[stage].extend(float(v) for v in durations)
+
     def summary(self) -> dict[str, dict[str, float]]:
         out: dict[str, dict[str, float]] = {}
         for stage, values in self.entries.items():
