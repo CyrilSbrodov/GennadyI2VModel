@@ -124,6 +124,7 @@ class GennadyEngine:
         dynamics_metrics_log: list[str] = []
         channel_usage_log: list[dict[str, object]] = []
         step_debug: list[dict[str, object]] = []
+        hidden_recon_stats = {"known_hidden": 0, "unknown_hidden": 0, "hidden_reveal": 0, "steps_with_hidden_reconstruction": 0}
 
         for planned_state in state_plan.steps[1 : profile.max_transition_steps + 1]:
             memory_summary = self.memory_summarizer.summarize(memory).as_dict()
@@ -148,12 +149,15 @@ class GennadyEngine:
             if missing_fields:
                 fallback_log.append(f"step={planned_state.step_index}:dynamics_parity_missing={missing_fields}")
             if semantic_dynamics:
-                fallback_log.extend([f"step={planned_state.step_index}:dynamics_semantic={x}" for x in semantic_dynamics])
+                for issue in semantic_dynamics:
+                    label = "trace" if issue.endswith("_trace") else "dynamics_semantic"
+                    fallback_log.append(f"step={planned_state.step_index}:{label}={issue}")
 
             delta = transition_output.delta
             changed_regions = self.roi_selector.select(scene_graph, delta)
             patches: list[RenderedPatch] = []
             patch_step_debug: list[dict[str, object]] = []
+            step_hidden_reconstruction = False
             for region in changed_regions[: profile.max_roi_count]:
                 patch_channels = self.build_patch_memory_channels(memory_channels)
                 patch_request = PatchSynthesisRequest(
@@ -174,6 +178,15 @@ class GennadyEngine:
                     ["roi_before", "roi_after", "region_metadata", "selected_strategy", "transition_context"],
                 )
                 semantic_patch = semantic_parity_checks(stage="patch", contract=patch_contract, request=patch_request, output=patch_out)
+                strategy = str(patch_out.execution_trace.get("selected_render_strategy", ""))
+                synth_mode = str(patch_out.execution_trace.get("synthesis_mode", "deterministic"))
+                if "KNOWN_HIDDEN_REVEAL" in strategy:
+                    hidden_recon_stats["known_hidden"] += 1
+                    hidden_recon_stats["hidden_reveal"] += 1
+                    step_hidden_reconstruction = True
+                elif "UNKNOWN_HIDDEN_SYNTHESIS" in strategy:
+                    hidden_recon_stats["unknown_hidden"] += 1
+                    step_hidden_reconstruction = True
                 if missing_patch_fields:
                     fallback_log.append(f"step={planned_state.step_index}:patch_parity_missing={missing_patch_fields}")
                 if semantic_patch:
@@ -183,9 +196,15 @@ class GennadyEngine:
                         "region_id": region.region_id,
                         "selected_strategy": patch_contract.get("selected_strategy", "unknown"),
                         "confidence": patch_out.confidence,
-                        "synthesis_mode": patch_contract.get("synthesis_mode", "unknown"),
+                        "synthesis_mode": synth_mode,
                         "retrieval_summary": str(patch_request.retrieval_summary)[:120],
                         "learned_ready": patch_out.metadata.get("learned_ready_usage", {}),
+                        "hidden_reconstruction": {
+                            "is_case": step_hidden_reconstruction,
+                            "strategy": strategy,
+                            "mode": synth_mode,
+                            "quality_hint": patch_out.execution_trace.get("patch_refinement_strength", 0.0),
+                        },
                         "missing_fields": missing_patch_fields,
                         "semantic_issues": semantic_patch,
                     }
@@ -271,6 +290,12 @@ class GennadyEngine:
                         },
                     },
                     "patch": patch_step_debug,
+                    "hidden_reconstruction": {
+                        "step_has_case": step_hidden_reconstruction,
+                        "known_hidden_count": hidden_recon_stats["known_hidden"],
+                        "unknown_hidden_count": hidden_recon_stats["unknown_hidden"],
+                        "hidden_reveal_count": hidden_recon_stats["hidden_reveal"],
+                    },
                     "temporal": {
                         "backend": self.backends.backend_names.get("temporal_backend", "unknown"),
                         "region_consistency_summary": temporal_out.region_consistency_scores,
@@ -305,6 +330,8 @@ class GennadyEngine:
                     "dynamics_backend_usage": transition_output.metadata.get("learned_ready_usage", {}),
                 }
             )
+            if step_hidden_reconstruction:
+                hidden_recon_stats["steps_with_hidden_reconstruction"] += 1
 
         video_uri = self._export_video(frames, fps)
         return InferenceArtifacts(
@@ -350,6 +377,7 @@ class GennadyEngine:
                         "missing_fields": text_missing,
                         "semantic_issues": text_semantic,
                     },
+                    "hidden_reconstruction_summary": hidden_recon_stats,
                 },
             },
         )

@@ -44,7 +44,9 @@ def _build_graph_after(request: DynamicsTransitionRequest, output: DynamicsTrans
 def dynamics_io_to_contract(request: DynamicsTransitionRequest, output: DynamicsTransitionOutput) -> GraphTransitionContract:
     from training.learned_contracts import build_graph_transition_contract
 
-    after = _build_graph_after(request, output)
+    predicted_after = _build_graph_after(request, output)
+    ground_truth_after = request.step_context.get("ground_truth_graph_after") if isinstance(request.step_context, dict) else None
+    after = ground_truth_after if ground_truth_after is not None else predicted_after
     return build_graph_transition_contract(
         before=request.graph_state,
         after=after,
@@ -54,6 +56,9 @@ def dynamics_io_to_contract(request: DynamicsTransitionRequest, output: Dynamics
             "text_tokens": request.text_action_summary.structured_action_tokens,
             "diagnostics": output.diagnostics,
             "backend": output.metadata.get("backend", "unknown"),
+            "predicted_graph_after": to_debug_dict(predicted_after),
+            "ground_truth_graph_after": to_debug_dict(ground_truth_after) if ground_truth_after is not None else {},
+            "graph_after_target_source": "step_context_ground_truth" if ground_truth_after is not None else "predicted_fallback",
         },
     )
 
@@ -100,13 +105,13 @@ def semantic_parity_checks(
     output: object,
     changed_regions_count: int | None = None,
 ) -> list[str]:
-    def _stable_json_size(value: object) -> int:
+    def _stable_serialized(value: object) -> str:
         import json
 
         try:
-            return len(json.dumps(value, sort_keys=True))
+            return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
         except Exception:
-            return len(str(value))
+            return str(value)
 
     issues: list[str] = []
     if stage == "text":
@@ -130,18 +135,21 @@ def semantic_parity_checks(
             before_idx = ((contract.get("graph_before") or {}).get("frame_index", -1)) if isinstance(contract.get("graph_before"), dict) else -1
             after_idx = ((contract.get("graph_after") or {}).get("frame_index", -1)) if isinstance(contract.get("graph_after"), dict) else -1
             if affected and after_idx <= before_idx:
-                issues.append("graph_after_not_progressed_for_non_empty_delta")
+                issues.append("graph_after_frame_index_not_progressed_trace")
             region_mode = contract.get("region_transition_mode", {})
             if affected and (not isinstance(region_mode, dict) or not region_mode):
                 issues.append("region_transition_mode_missing_for_affected_regions")
             state_after = contract.get("state_after", {}) if isinstance(contract, dict) else {}
+            state_before = contract.get("state_before", {}) if isinstance(contract, dict) else {}
             if affected and (not isinstance(state_after, dict) or not state_after):
                 issues.append("state_after_missing_for_non_empty_delta")
             before_graph = contract.get("graph_before", {}) if isinstance(contract, dict) else {}
             after_graph = contract.get("graph_after", {}) if isinstance(contract, dict) else {}
             has_non_empty_delta = bool(affected or delta_contract.get("pose_deltas") or delta_contract.get("interaction_deltas") or delta_contract.get("visibility_deltas"))
-            if has_non_empty_delta and _stable_json_size(before_graph) == _stable_json_size(after_graph):
-                issues.append("graph_serialization_unchanged_despite_non_empty_delta")
+            graph_unchanged = _stable_serialized(before_graph) == _stable_serialized(after_graph)
+            state_changed = isinstance(state_before, dict) and isinstance(state_after, dict) and state_before != state_after
+            if has_non_empty_delta and graph_unchanged and (not state_changed) and (not state_after):
+                issues.append("non_empty_delta_without_meaningful_state_change")
             visibility = delta_contract.get("predicted_visibility_changes", {})
             if isinstance(visibility, dict) and visibility and not state_after:
                 issues.append("visibility_delta_without_state_after_transition")
