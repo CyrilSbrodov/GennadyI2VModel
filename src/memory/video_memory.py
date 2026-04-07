@@ -4,6 +4,7 @@ from dataclasses import asdict
 import math
 import random
 
+from core.semantic_roi import SemanticROIHelper
 from core.region_ids import make_region_id, parse_region_id
 from core.schema import (
     BBox,
@@ -19,6 +20,9 @@ from utils_tensor import crop, mean_color, shape
 
 class MemoryManager:
     _SEMANTIC_REGIONS = ("face", "torso", "sleeves", "garments", "left_arm", "right_arm", "pelvis", "legs")
+
+    def __init__(self) -> None:
+        self.roi = SemanticROIHelper()
 
     def _encode_visual(self, token: str, dim: int = 8) -> list[float]:
         seed = abs(hash(token)) % (2**32)
@@ -131,15 +135,11 @@ class MemoryManager:
 
     def update_from_frame(self, memory: VideoMemory, frame: list, scene_graph: SceneGraph) -> VideoMemory:
         for person in scene_graph.persons:
-            semantic_boxes: dict[str, BBox] = {
-                "face": BBox(person.bbox.x + person.bbox.w * 0.3, person.bbox.y, person.bbox.w * 0.4, person.bbox.h * 0.22),
-                "torso": BBox(person.bbox.x + person.bbox.w * 0.15, person.bbox.y + person.bbox.h * 0.2, person.bbox.w * 0.7, person.bbox.h * 0.35),
-                "sleeves": BBox(person.bbox.x + person.bbox.w * 0.05, person.bbox.y + person.bbox.h * 0.22, person.bbox.w * 0.9, person.bbox.h * 0.26),
-                "garments": BBox(person.bbox.x + person.bbox.w * 0.1, person.bbox.y + person.bbox.h * 0.2, person.bbox.w * 0.8, person.bbox.h * 0.55),
-                "pelvis": BBox(person.bbox.x + person.bbox.w * 0.3, person.bbox.y + person.bbox.h * 0.5, person.bbox.w * 0.4, person.bbox.h * 0.2),
-                "legs": BBox(person.bbox.x + person.bbox.w * 0.2, person.bbox.y + person.bbox.h * 0.58, person.bbox.w * 0.6, person.bbox.h * 0.38),
-            }
-            for region_type, bbox in semantic_boxes.items():
+            for region_type in self._semantic_region_types(person):
+                region_ref = self.roi.resolve_region(scene_graph, person.person_id, region_type)
+                if region_ref is None:
+                    continue
+                bbox = region_ref.bbox
                 x0, y0, x1, y1 = self._bbox_to_pixels(bbox, frame)
                 patch = crop(frame, x0, y0, x1, y1)
                 desc = self._patch_descriptor(patch)
@@ -165,10 +165,12 @@ class MemoryManager:
                         garment_entry.embedding = [garment_entry.embedding[i] * 0.75 + emb[i] * 0.25 for i in range(min(len(garment_entry.embedding), len(emb)))]
 
                 if region_type in {"sleeves", "garments", "legs"}:
-                    slot = memory.hidden_region_slots.setdefault(rid, HiddenRegionSlot(slot_id=rid, region_type=region_type, owner_entity=person.person_id, candidate_patch_ids=[]))
+                    slot = memory.hidden_region_slots.setdefault(rid, HiddenRegionSlot(slot_id=rid, region_type=region_type, owner_entity=person.person_id, candidate_patch_ids=[], hidden_type="known_hidden"))
                     slot.candidate_patch_ids = [patch_id] + [cid for cid in slot.candidate_patch_ids if cid != patch_id][:4]
                     slot.confidence = min(1.0, 0.5 + evidence * 0.4)
                     slot.stale_frames = 0
+                    slot.hidden_type = "known_hidden"
+                    slot.evidence_score = max(slot.evidence_score, min(1.0, evidence))
         return memory
 
     def mark_region_revealed(self, memory: VideoMemory, region_id: str, owner_entity: str) -> None:
@@ -176,13 +178,38 @@ class MemoryManager:
 
     def query_hidden_region(self, memory: VideoMemory, region_id: str) -> HiddenRegionSlot | None:
         entity, region_type = parse_region_id(region_id)
-        return memory.hidden_region_slots.get(make_region_id(entity, region_type))
+        return self.retrieve_hidden_region(memory, make_region_id(entity, region_type))
 
     def retrieve_for_region(self, memory: VideoMemory, region_type: str, owner_entity: str | None = None, query_descriptor: dict[str, float | list[float]] | None = None) -> list[TexturePatchMemory]:
         patches = [p for p in memory.texture_patches.values() if p.region_type == region_type]
         if owner_entity is not None:
             patches = [p for p in patches if p.entity_id == owner_entity]
-        return sorted(patches, key=lambda p: (p.confidence + 0.2 * self._descriptor_similarity(query_descriptor, p.descriptor), p.evidence_score, p.source_frame), reverse=True)
+        most_recent = max((p.source_frame for p in patches), default=0)
+        return sorted(
+            patches,
+            key=lambda p: (
+                p.confidence + 0.2 * self._descriptor_similarity(query_descriptor, p.descriptor),
+                p.evidence_score,
+                1.0 / (1.0 + max(0, most_recent - p.source_frame)),
+            ),
+            reverse=True,
+        )
+
+    def retrieve_hidden_region(self, memory: VideoMemory, region_id: str, hidden_type: str | None = None) -> HiddenRegionSlot | None:
+        slot = memory.hidden_region_slots.get(region_id)
+        if slot is None:
+            return None
+        if hidden_type is not None and slot.hidden_type != hidden_type:
+            return None
+        return slot
+
+    def retrieve_by_entity(self, memory: VideoMemory, entity_id: str, query_descriptor: dict[str, float | list[float]] | None = None, top_k: int = 5) -> list[TexturePatchMemory]:
+        patches = [p for p in memory.texture_patches.values() if p.entity_id == entity_id]
+        return sorted(
+            patches,
+            key=lambda p: (p.confidence, p.evidence_score, self._descriptor_similarity(query_descriptor, p.descriptor), p.source_frame),
+            reverse=True,
+        )[:top_k]
 
     def apply_visibility_event(self, memory: VideoMemory, delta: dict[str, str], masks: dict[str, object], visibility: str) -> None:
         _ = masks
@@ -191,14 +218,18 @@ class MemoryManager:
         owner = delta.get("entity", entity_id)
         slot = memory.hidden_region_slots.get(region_id)
         if slot is None:
-            slot = HiddenRegionSlot(slot_id=region_id, region_type=region_type, owner_entity=owner, candidate_patch_ids=[], confidence=0.55)
+            slot = HiddenRegionSlot(slot_id=region_id, region_type=region_type, owner_entity=owner, candidate_patch_ids=[], confidence=0.55, hidden_type="unknown_hidden")
             memory.hidden_region_slots[region_id] = slot
         if visibility == "revealed":
             slot.confidence = min(1.0, slot.confidence + 0.15)
             slot.stale_frames = 0
+            if slot.candidate_patch_ids:
+                slot.hidden_type = "known_hidden"
         elif visibility == "hidden":
             slot.confidence = max(0.1, slot.confidence - 0.12)
             slot.stale_frames += 1
+            if not slot.candidate_patch_ids:
+                slot.hidden_type = "unknown_hidden"
 
     def retrieve(self, memory: VideoMemory, query_embedding: list[float], bank: str = "texture", top_k: int = 3) -> list[dict[str, object]]:
         qn = math.sqrt(sum(v * v for v in query_embedding)) or 1.0
@@ -263,3 +294,17 @@ class MemoryManager:
             memory.region_descriptors[region_id] = RegionDescriptor(region_id=region_id, entity_id=person_id, region_type=region_type, bbox=BBox(bbox.x, bbox.y + 0.01 * offset, bbox.w, bbox.h), visibility="visible" if region_type in ("face", "torso") else "partially_visible", confidence=0.75, last_update_frame=frame_index)
             patch_id = f"patch::{region_id}"
             memory.texture_patches[patch_id] = TexturePatchMemory(patch_id=patch_id, region_type=region_type, entity_id=person_id, source_frame=frame_index, patch_ref=f"seed://{region_id}", confidence=0.5, descriptor={}, evidence_score=0.2)
+            memory.hidden_region_slots[region_id] = HiddenRegionSlot(slot_id=region_id, region_type=region_type, owner_entity=person_id, candidate_patch_ids=[patch_id], confidence=0.45, hidden_type="known_hidden" if region_type in {"sleeves", "garments", "legs"} else "unknown_hidden", evidence_score=0.2)
+
+    def _semantic_region_types(self, person: object) -> list[str]:
+        region_types = {"face", "torso", "garments", "sleeves", "pelvis", "legs"}
+        body_parts = getattr(person, "body_parts", [])
+        garments = getattr(person, "garments", [])
+        for part in body_parts:
+            if part.part_type in {"left_upper_arm", "left_lower_arm", "left_hand"}:
+                region_types.add("left_arm")
+            if part.part_type in {"right_upper_arm", "right_lower_arm", "right_hand"}:
+                region_types.add("right_arm")
+        if garments:
+            region_types.add("garments")
+        return sorted(region_types)

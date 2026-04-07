@@ -197,6 +197,9 @@ class GraphDelta:
     affected_regions: list[str] = field(default_factory=list)
     semantic_reasons: list[str] = field(default_factory=list)
     predicted_visibility_changes: dict[str, VisibilityState] = field(default_factory=dict)
+    state_before: dict[str, str] = field(default_factory=dict)
+    state_after: dict[str, str] = field(default_factory=dict)
+    transition_phase: str = "single"
 
 
 @dataclass(slots=True)
@@ -239,6 +242,8 @@ class HiddenRegionSlot:
     candidate_patch_ids: list[str] = field(default_factory=list)
     confidence: float = 0.0
     stale_frames: int = 0
+    hidden_type: str = "known_hidden"
+    evidence_score: float = 0.0
 
 
 @dataclass(slots=True)
