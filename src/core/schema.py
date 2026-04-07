@@ -221,6 +221,7 @@ class GraphDelta:
     state_after: dict[str, str] = field(default_factory=dict)
     transition_phase: str = "single"
     region_transition_mode: dict[str, str] = field(default_factory=dict)
+    transition_diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
