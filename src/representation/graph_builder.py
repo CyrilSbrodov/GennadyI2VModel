@@ -129,17 +129,22 @@ class SceneGraphBuilder:
             garments: list[GarmentNode] = []
             for g_idx, garment in enumerate(p.garments, start=1):
                 garment_id = f"{garment['type']}_{idx}_{g_idx}"
-                layering = "outerwear" if garment["type"] in {"coat", "jacket", "hoodie"} else "innerwear"
-                coverage = [f"{person_id}_torso"]
-                if garment["type"] in {"coat", "jacket", "shirt", "hoodie"}:
+                garment_type = str(garment["type"])
+                layering = str(garment.get("layer_hint", "outerwear" if garment["type"] in {"coat", "jacket", "hoodie"} else "innerwear"))
+                coverage_raw = garment.get("coverage_targets", [])
+                coverage = [f"{person_id}_{c}" for c in coverage_raw] if coverage_raw else [f"{person_id}_torso"]
+                if garment["type"] in {"coat", "jacket", "shirt", "hoodie", "top"} and not coverage_raw:
                     coverage.extend([f"{person_id}_left_upper_arm", f"{person_id}_right_upper_arm"])
+                attachment_raw = garment.get("attachment_targets", [])
+                attachments = [f"{person_id}_{a}" for a in attachment_raw] if attachment_raw else [f"{person_id}_torso"]
                 garments.append(
                     GarmentNode(
                         garment_id=garment_id,
-                        garment_type=garment["type"],
+                        garment_type=garment_type,
+                        mask_ref=garment.get("mask_ref"),
                         garment_state=garment.get("state", "worn"),
                         coverage_targets=coverage,
-                        attachment_targets=[f"{person_id}_torso"],
+                        attachment_targets=attachments,
                         confidence=self._calibrate_confidence(
                             float(garment.get("confidence", 0.5)),
                             garment.get("source", "unknown"),
@@ -147,7 +152,12 @@ class SceneGraphBuilder:
                         visibility="visible",
                         source=garment.get("source", "unknown"),
                         frame_index=frame_index,
-                        alternatives=[layering, "sleeve_linked"],
+                        alternatives=[
+                            layering,
+                            "sleeve_linked",
+                            f"coverage:{','.join(coverage_raw)}" if coverage_raw else "coverage:heuristic",
+                            f"provenance:{p.provenance_by_region.get(f'garment:{garment_type}', garment.get('source', 'unknown'))}",
+                        ],
                     )
                 )
 
