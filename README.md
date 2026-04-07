@@ -78,52 +78,34 @@
 
 > Важно: часть текущих датасетов остаётся pseudo-labeled baseline для smoke/debug. Контракты и структуры данных уже пригодны как learned-ready входы.
 
-## Perception parser foundation (production-oriented stack)
+## Perception parser runtime stack (real backend pass)
 
-`PerceptionPipeline` использует **явный multi-parser stack** в `SegFormerHumanParserAdapter`:
+`SegFormerHumanParserAdapter` теперь использует реальные runtime-paths, а не только adapter shells:
 
-1. **Primary human+garment parser:** `fashn-ai/fashn-human-parser` (`backend="fashn"`).
-2. **Structural body refinement:** `SCHP Pascal-Person-Part` (`backend="schp_pascal"`).
-3. **Optional garment/body refinement:** `SCHP ATR` (`backend="schp_atr"`).
-4. **Face parser:** `FacePerceiver/facer` (`backend="facer"`, variant `farl/lapa/448` или `farl/celebm/448`).
+1. **FASHN (`backend="fashn"`)**: real HF image-segmentation inference (`fashn-ai/fashn-human-parser` по умолчанию), с runtime format detection (`label_map` или list-of-segments) и postprocess в binary masks.
+2. **SCHP Pascal (`backend="schp_pascal"`)**: зарезервирован под SCHP-specific runtime path (не generic HF).
+3. **SCHP ATR (`backend="schp_atr"`)**: зарезервирован под SCHP-specific runtime path (не generic HF).
+4. **Generic HF fallback backends**: `generic_hf_structural` / `generic_hf_garment` для тех случаев, когда используется обычный HF image-segmentation runtime.
+5. **FACER (`backend="facer"`)**: real FACER runtime path (face detector + face parser) с face-region extraction.
 
-Это не generic “любой HF model_id”. Для каждого backend есть отдельный adapter и явный label mapping.
+### Запуск parser smoke/debug
 
-Пример builtin режима:
-
-```python
-from perception.pipeline import PerceptionPipeline, PerceptionBackendsConfig
-
-pipe = PerceptionPipeline(backends=PerceptionBackendsConfig())
-out = pipe.analyze(frame_tensor)
-# module_fallbacks['parser'] == 'builtin'
+```bash
+python scripts/parser_stack_smoke.py   --image ./assets/example.png   --out-dir artifacts/parser_smoke   --fashn-backend fashn   --fashn-model fashn-ai/fashn-human-parser   --schp-pascal-backend generic_hf_structural --schp-pascal-model <hf_model_id_or_checkpoint>   --schp-atr-backend generic_hf_garment --schp-atr-model <hf_model_id_or_checkpoint>   --facer-backend facer --facer-model farl/lapa/448
 ```
 
-Пример real parser stack:
+Скрипт сохраняет:
+- `primary_fashn_masks/`
+- `schp_pascal_masks/`
+- `schp_atr_masks/`
+- `facer_masks/`
+- `fused_masks_overlay.png`
+- `fused_summary.json`
 
-```python
-from perception.pipeline import PerceptionBackendsConfig, PerceptionPipeline
-from perception.parser import ParserBackendConfig, ParserStackConfig
+### Optional/runtime dependencies
 
-parser_cfg = ParserStackConfig(
-    primary_human_parser=ParserBackendConfig(backend="fashn", variant="fashn-ai/fashn-human-parser"),
-    structural_body_parser=ParserBackendConfig(backend="schp_pascal", variant="<schp_pascal_checkpoint>"),
-    garment_refinement_parser=ParserBackendConfig(backend="schp_atr", variant="<schp_atr_checkpoint>"),
-    face_parser=ParserBackendConfig(backend="facer", variant="farl/lapa/448"),
-)
+Для real parser runtime нужны optional пакеты:
+- `transformers`, `torch`, `numpy`, `pillow` (FASHN + SCHP paths)
+- `facer` (FACER path)
 
-pipe = PerceptionPipeline(backends=PerceptionBackendsConfig(parser=parser_cfg))
-out = pipe.analyze(frame_tensor)
-```
-
-Что реально умеет parser stack сейчас:
-- `FASHN` даёт primary human/garment masks (`face/hair/top/dress/skirt/pants/belt/bag/hat/scarf/glasses/arms/hands/legs/feet/torso/jewelry`);
-- `SCHP Pascal` уточняет body topology (`head/torso/upper_arm/lower_arm/upper_leg/lower_leg`) без выдумывания side-классов;
-- `SCHP ATR` добавляет garment/body fallback (`upper_clothes/pants/skirt/dress/belt/bag/scarf/arm_region/leg_region`);
-- `FACER` даёт face regions (`face_skin`, `hairline_or_hair_face_boundary`, `eyes`, `brows`, `nose`, `mouth`, `upper_lip`, `lower_lip`);
-- fusion-приоритеты: `FACER > FASHN` для face, `FASHN > ATR` для garments, `SCHP Pascal > FASHN` для body topology;
-- enriched payload в parser output: `person_mask_ref`, `body_part_masks`, `garment_masks`, `face_region_masks`, `accessory_masks`, `coverage_hints`, `visibility_hints`, `provenance_by_region`.
-
-Что пока ограничено:
-- для SCHP/FACER в репозитории нет встроенных весов, нужен внешний runtime integration;
-- fallback path остаётся builtin-safe, если конкретный backend недоступен.
+Если backend/веса недоступны, `PerceptionPipeline` остаётся fail-safe: warning + fallback на builtin parser path.
