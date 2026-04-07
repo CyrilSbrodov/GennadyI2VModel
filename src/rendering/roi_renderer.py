@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 
+from core.semantic_roi import SemanticROIHelper
 from core.region_ids import make_region_id, parse_region_id
 from core.schema import BBox, GraphDelta, RegionRef, SceneGraph, VideoMemory
+from representation.scene_graph_queries import SceneGraphQueries
 from utils_tensor import alpha_radial, crop, mean_color, shape, zeros
 
 
@@ -22,16 +25,8 @@ class RenderedPatch:
 
 
 class ROISelector:
-    def _person_fallback_bbox(self, person_bbox: BBox, region_type: str) -> BBox:
-        if region_type == "head" or "face" in region_type:
-            return BBox(person_bbox.x + person_bbox.w * 0.3, person_bbox.y, person_bbox.w * 0.4, person_bbox.h * 0.22)
-        if "upper_arm" in region_type or "lower_arm" in region_type or "hand" in region_type or "arm" in region_type:
-            return BBox(person_bbox.x, person_bbox.y + person_bbox.h * 0.2, person_bbox.w, person_bbox.h * 0.3)
-        if "pelvis" in region_type:
-            return BBox(person_bbox.x + person_bbox.w * 0.3, person_bbox.y + person_bbox.h * 0.5, person_bbox.w * 0.4, person_bbox.h * 0.2)
-        if "leg" in region_type or "foot" in region_type:
-            return BBox(person_bbox.x + person_bbox.w * 0.15, person_bbox.y + person_bbox.h * 0.55, person_bbox.w * 0.7, person_bbox.h * 0.42)
-        return BBox(person_bbox.x + person_bbox.w * 0.1, person_bbox.y + person_bbox.h * 0.18, person_bbox.w * 0.8, person_bbox.h * 0.62)
+    def __init__(self) -> None:
+        self.roi = SemanticROIHelper()
 
     def _bbox_from_keypoints(self, keypoints: list, margin: float = 0.03) -> BBox | None:
         pts = [(k.x, k.y) for k in keypoints if getattr(k, "confidence", 0.0) > 0.2]
@@ -46,51 +41,16 @@ class ROISelector:
         return BBox(x0, y0, max(0.05, x1 - x0), max(0.05, y1 - y0))
 
     def semantic_roi_from_graph(self, scene_graph: SceneGraph, entity_id: str, region_type: str) -> RegionRef | None:
-        person = next((p for p in scene_graph.persons if p.person_id == entity_id), None)
-        if person is None:
-            return None
-
-        if region_type in {"face", "head"}:
-            part = next((bp for bp in person.body_parts if bp.part_type == "head"), None)
-            if part and part.keypoints:
-                bbox = self._bbox_from_keypoints(part.keypoints)
-                if bbox:
-                    return RegionRef(make_region_id(entity_id, region_type), bbox, "graph_semantic:body_part_keypoints")
-
-        if region_type in {"left_arm", "right_arm", "left_upper_arm", "right_upper_arm", "sleeves"}:
-            arm_keys = {"left_arm": {"left_upper_arm", "left_lower_arm", "left_hand"}, "right_arm": {"right_upper_arm", "right_lower_arm", "right_hand"}}
-            wanted = arm_keys.get(region_type, {region_type})
-            kp = [k for bp in person.body_parts if bp.part_type in wanted for k in bp.keypoints]
-            if kp:
-                bbox = self._bbox_from_keypoints(kp)
-                if bbox:
-                    return RegionRef(make_region_id(entity_id, region_type), bbox, "graph_semantic:arm_keypoints")
-
-        if region_type in {"pelvis", "legs", "left_lower_leg", "right_lower_leg"}:
-            wanted = {"pelvis"} if region_type == "pelvis" else {"left_upper_leg", "left_lower_leg", "right_upper_leg", "right_lower_leg", "left_foot", "right_foot"}
-            kp = [k for bp in person.body_parts if bp.part_type in wanted for k in bp.keypoints]
-            if kp:
-                bbox = self._bbox_from_keypoints(kp)
-                if bbox:
-                    return RegionRef(make_region_id(entity_id, region_type), bbox, "graph_semantic:lower_body_keypoints")
-
-        if region_type in {"garments", "torso"} and person.garments:
-            covered = {t for g in person.garments for t in g.coverage_targets}
-            if covered:
-                torso_related = any("torso" in t or "upper_arm" in t for t in covered)
-                if torso_related:
-                    bbox = BBox(person.bbox.x + person.bbox.w * 0.15, person.bbox.y + person.bbox.h * 0.18, person.bbox.w * 0.7, person.bbox.h * 0.42)
-                    return RegionRef(make_region_id(entity_id, region_type), bbox, "graph_semantic:garment_coverage")
-        return None
+        return self.roi.region_from_graph(scene_graph, entity_id, region_type)
 
     def fallback_roi_from_person_bbox(self, scene_graph: SceneGraph, entity_id: str, region_type: str) -> RegionRef | None:
         person = next((p for p in scene_graph.persons if p.person_id == entity_id), None)
         if person is None:
             return None
-        return RegionRef(make_region_id(entity_id, region_type), self._person_fallback_bbox(person.bbox, region_type), "fallback:person_bbox_template")
+        return RegionRef(make_region_id(entity_id, region_type), self.roi.fallback_person_bbox(person.bbox, region_type), "fallback:person_bbox_template")
 
     def _resolve_region(self, scene_graph: SceneGraph, entity_id: str, region_type: str) -> RegionRef | None:
-        return self.semantic_roi_from_graph(scene_graph, entity_id, region_type) or self.fallback_roi_from_person_bbox(scene_graph, entity_id, region_type)
+        return self.roi.resolve_region(scene_graph, entity_id, region_type)
 
     def select(self, scene_graph: SceneGraph, delta: GraphDelta) -> list[RegionRef]:
         selected = list(delta.newly_revealed_regions)
@@ -127,6 +87,15 @@ class ROISelector:
 
 
 class PatchRenderer:
+    class RenderStrategy(Enum):
+        KNOWN_HIDDEN_REVEAL = "KNOWN_HIDDEN_REVEAL"
+        UNKNOWN_HIDDEN_SYNTHESIS = "UNKNOWN_HIDDEN_SYNTHESIS"
+        IDENTITY_FACE_UPDATE = "IDENTITY_FACE_UPDATE"
+        GARMENT_UPDATE = "GARMENT_UPDATE"
+        POSE_TRANSFORM = "POSE_TRANSFORM"
+        MEMORY_BLEND = "MEMORY_BLEND"
+        FALLBACK = "FALLBACK"
+
     def _bbox_to_pixels(self, bbox: BBox, frame: list) -> tuple[int, int, int, int]:
         h, w, _ = shape(frame)
         x0 = max(0, min(w - 1, int(bbox.x * w)))
@@ -148,14 +117,33 @@ class PatchRenderer:
                     out[y][x][k] = max(0.0, min(1.0, roi[y][x][k] * (1.0 - weight) + mv * weight))
         return out
 
-    def _strategy_memory_candidates(self, memory: VideoMemory, entity: str, region_type: str, semantic_reasons: list[str]) -> tuple[list, str]:
-        if "garment_change" in semantic_reasons or region_type in {"garments", "sleeves"}:
-            return memory.texture_patches.values(), "garment_memory_blend"
-        if "expression_change" in semantic_reasons or region_type in {"face", "head"}:
-            return memory.texture_patches.values(), "face_identity_blend"
-        if "raise_arm" in semantic_reasons or "sit_down" in semantic_reasons:
-            return memory.texture_patches.values(), "entity_region_memory_blend"
-        return memory.texture_patches.values(), "entity_region_memory_blend"
+    def _pick_strategy(self, scene_graph: SceneGraph, delta: GraphDelta, region: RegionRef, memory: VideoMemory) -> "PatchRenderer.RenderStrategy":
+        entity, region_type = parse_region_id(region.region_id)
+        is_revealed = region.region_id in {r.region_id for r in delta.newly_revealed_regions}
+        slot = memory.hidden_region_slots.get(region.region_id)
+        if is_revealed and slot and slot.hidden_type == "known_hidden" and slot.candidate_patch_ids:
+            return self.RenderStrategy.KNOWN_HIDDEN_REVEAL
+        if is_revealed and (slot is None or slot.hidden_type == "unknown_hidden" or not slot.candidate_patch_ids):
+            return self.RenderStrategy.UNKNOWN_HIDDEN_SYNTHESIS
+        if "expression_change" in delta.semantic_reasons or region_type in {"face", "head"}:
+            return self.RenderStrategy.IDENTITY_FACE_UPDATE
+        if "garment_change" in delta.semantic_reasons or region_type in {"garments", "sleeves"}:
+            return self.RenderStrategy.GARMENT_UPDATE
+        if any(reason in delta.semantic_reasons for reason in {"raise_arm", "sit_down"}) or region_type in {"left_arm", "right_arm", "pelvis", "legs"}:
+            return self.RenderStrategy.POSE_TRANSFORM
+        active_relations = SceneGraphQueries.relations_for_entity(scene_graph, entity)
+        if active_relations or memory.texture_patches:
+            return self.RenderStrategy.MEMORY_BLEND
+        return self.RenderStrategy.FALLBACK
+
+    def _strategy_memory_candidates(self, memory: VideoMemory, entity: str, region_type: str, strategy: "PatchRenderer.RenderStrategy") -> tuple[list, str]:
+        if strategy == self.RenderStrategy.GARMENT_UPDATE:
+            return [p for p in memory.texture_patches.values() if p.entity_id == entity and p.region_type in {"garments", "sleeves", "torso"}], "garment_update"
+        if strategy == self.RenderStrategy.IDENTITY_FACE_UPDATE:
+            return [p for p in memory.texture_patches.values() if p.entity_id == entity and p.region_type in {"face", "head"}], "identity_face_update"
+        if strategy == self.RenderStrategy.POSE_TRANSFORM:
+            return [p for p in memory.texture_patches.values() if p.entity_id == entity and p.region_type in {region_type, "left_arm", "right_arm", "pelvis", "legs"}], "pose_transform"
+        return [p for p in memory.texture_patches.values() if p.entity_id == entity and p.region_type == region_type], "memory_blend"
 
     def render(
         self,
@@ -180,8 +168,8 @@ class PatchRenderer:
         rendered = [[px[:] for px in row] for row in roi]
         confidence = 0.5
 
-        is_revealed = region.region_id in {r.region_id for r in delta.newly_revealed_regions}
-        if is_revealed:
+        strategy = self._pick_strategy(scene_graph, delta, region, memory)
+        if strategy == self.RenderStrategy.KNOWN_HIDDEN_REVEAL:
             slot = memory.hidden_region_slots.get(region.region_id)
             if slot and slot.candidate_patch_ids:
                 hidden_id = slot.candidate_patch_ids[0]
@@ -192,17 +180,25 @@ class PatchRenderer:
                     debug_trace.append("strategy=known_hidden_reveal")
                     debug_trace.append(f"hidden_candidate={hidden_id}")
 
+        if len(debug_trace) <= 2 and strategy == self.RenderStrategy.UNKNOWN_HIDDEN_SYNTHESIS:
+            mc = mean_color(roi)
+            for y in range(h):
+                for x in range(w):
+                    for k in range(ch):
+                        rendered[y][x][k] = max(0.0, min(1.0, 0.85 * rendered[y][x][k] + 0.15 * mc[k]))
+            confidence = 0.4
+            debug_trace.append("strategy=unknown_hidden_synthesis")
+
         if len(debug_trace) <= 2:
-            candidates, strategy = self._strategy_memory_candidates(memory, entity, region_type, delta.semantic_reasons)
-            filtered = [p for p in candidates if p.entity_id == entity and (p.region_type == region_type or strategy == "garment_memory_blend" and p.region_type in {"garments", "sleeves"} or strategy == "face_identity_blend" and p.region_type == "face")]
-            if filtered:
-                top = sorted(filtered, key=lambda c: (c.confidence, c.evidence_score), reverse=True)[0]
+            candidates, strategy_name = self._strategy_memory_candidates(memory, entity, region_type, strategy)
+            if candidates:
+                top = sorted(candidates, key=lambda c: (c.confidence, c.evidence_score), reverse=True)[0]
                 mem_patch = memory.patch_cache.get(top.patch_id)
                 if mem_patch:
                     mem_weight = min(0.75, 0.25 + top.confidence * 0.5)
                     rendered = self._blend_memory_patch(rendered, mem_patch, mem_weight)
                     confidence = min(0.98, 0.6 + top.confidence * 0.35)
-                    debug_trace.append(f"strategy={strategy}")
+                    debug_trace.append(f"strategy={strategy_name}")
                     debug_trace.append(f"memory_patch={top.patch_id}")
 
         if len(debug_trace) <= 2:
