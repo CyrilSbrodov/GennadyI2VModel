@@ -184,7 +184,7 @@ def test_hidden_slot_lifecycle_promotes_and_decays() -> None:
     slot.candidate_patch_ids = ["patch_a", "patch_b"]
     mm.apply_visibility_event(mem, {"region_id": rid, "entity": "p1"}, {}, "hidden")
     assert slot.hidden_type == "known_hidden"
-    assert slot.last_transition in {"unknown_to_known", "revealed_to_hidden"}
+    assert slot.last_transition in {"unknown_hidden_to_known_hidden", "stable"}
 
     slot.stale_frames = 7
     slot.confidence = 0.2
@@ -212,3 +212,25 @@ def test_unknown_hidden_synthesis_has_explainable_trace() -> None:
     patch = renderer.render(_solid(64, 64, (0.1, 0.3, 0.4)), graph, delta, mem, region)
     assert "strategy=unknown_hidden_synthesis" in patch.debug_trace
     assert any(msg.startswith("retrieval_debug=") for msg in patch.debug_trace)
+    assert patch.execution_trace["selected_render_strategy"] == "UNKNOWN_HIDDEN_SYNTHESIS"
+
+
+def test_retrieval_explanation_has_contribution_breakdown() -> None:
+    mm = MemoryManager()
+    graph = SceneGraph(frame_index=0, persons=[PersonNode(person_id="p1", track_id="t1", bbox=BBox(0.1, 0.1, 0.8, 0.8), mask_ref=None)], objects=[])
+    mem = mm.initialize(graph)
+    mem = mm.update_from_frame(mem, _solid(64, 64, (0.4, 0.3, 0.2)), graph)
+    route = mm.route_region_retrieval(
+        mem,
+        make_region_id("p1", "torso"),
+        "torso",
+        "p1",
+        query_descriptor={"mean": [0.4, 0.3, 0.2], "std": [0.05, 0.04, 0.03], "edge_density": 0.1, "energy": 0.2},
+        transition_context={"transition_phase": "lower_pelvis", "visibility_phase": "revealing", "region_transition_mode": "pose_exposure"},
+    )
+    explanation = route["explanation"]
+    assert "top_candidate_why" in explanation
+    assert "similarity_contribution" in explanation
+    assert "recency_contribution" in explanation
+    assert "hidden_slot_contribution" in explanation
+    assert "transition_bias_contribution" in explanation
