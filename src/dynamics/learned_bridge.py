@@ -33,6 +33,23 @@ class BaselineDynamicsTransitionModel(DynamicsTransitionModel):
         graph_dim = len(request.graph_encoding.graph_embedding) if request.graph_encoding else 0
         identity_dim = sum(len(v) for v in request.identity_embeddings.values())
         memory_signal = float(sum(1 for v in request.memory_channels.values() if v))
+        phase_bias = "settle" if memory_signal > 1 else ("motion" if graph_dim > 0 else delta.transition_phase)
+        if request.graph_encoding and request.graph_encoding.graph_embedding:
+            relation_signal = request.graph_encoding.graph_embedding[2] if len(request.graph_encoding.graph_embedding) > 2 else 0.0
+            if relation_signal > 0.35:
+                delta.region_transition_mode = {
+                    region: ("deform_relation_aware" if "arm" in region or "torso" in region else mode)
+                    for region, mode in delta.region_transition_mode.items()
+                }
+        if identity_dim:
+            smooth = max(0.85, 1.0 - min(0.15, identity_dim * 0.002))
+            delta.pose_deltas = {k: float(v) * smooth for k, v in delta.pose_deltas.items()}
+        if memory_signal and delta.affected_regions:
+            delta.state_after = dict(delta.state_after)
+            delta.state_after.setdefault("transition_bias", "memory_smoothed")
+            emphasis = delta.affected_regions[0]
+            delta.state_after.setdefault("region_emphasis", emphasis)
+        delta.transition_phase = phase_bias
         confidence_boost = min(0.15, 0.01 * graph_dim + 0.005 * identity_dim + 0.03 * memory_signal)
         used_channels = [name for name, payload in request.memory_channels.items() if payload]
         return DynamicsTransitionOutput(
@@ -55,6 +72,11 @@ class BaselineDynamicsTransitionModel(DynamicsTransitionModel):
                     "identity_embeddings_used": bool(request.identity_embeddings),
                     "memory_channels_used": used_channels,
                     "ignored_fields": [name for name, payload in request.memory_channels.items() if not payload],
+                },
+                "delta_postprocess": {
+                    "phase_bias": phase_bias,
+                    "identity_smoothing_applied": bool(identity_dim),
+                    "region_emphasis": delta.state_after.get("region_emphasis"),
                 },
             },
         )

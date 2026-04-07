@@ -4,7 +4,20 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from core.schema import ActionStep, BBox, GraphDelta, PersonNode, RegionRef, SceneGraph
+from core.schema import (
+    ActionStep,
+    BBox,
+    BodyPartNode,
+    GarmentNode,
+    GlobalSceneContext,
+    GraphDelta,
+    Keypoint,
+    PersonNode,
+    RegionRef,
+    RelationEdge,
+    SceneGraph,
+    SceneObjectNode,
+)
 from dynamics.state_update import apply_delta
 from evaluation.contracts import (
     build_graph_eval_payload,
@@ -20,6 +33,7 @@ from evaluation.contracts import (
 )
 from learned.factory import BackendBundle, BackendConfig, LearnedBackendFactory
 from learned.interfaces import DynamicsTransitionRequest, PatchSynthesisRequest, TemporalRefinementRequest
+from training.datasets import _serialize_graph
 from memory.video_memory import MemoryManager
 from training.learned_contracts import (
     build_graph_transition_contract,
@@ -102,8 +116,103 @@ class LearnedStageDatasetRouter:
                 if not isinstance(p, dict):
                     continue
                 pid = str(p.get("person_id", f"p{track}_{idx}"))
-                persons.append(PersonNode(person_id=pid, track_id=str(p.get("track_id", f"t{track}_{idx}")), bbox=LearnedStageDatasetRouter._coerce_bbox(p.get("bbox")), mask_ref=p.get("mask_ref")))
-            graph = SceneGraph(frame_index=int(raw.get("frame_index", frame_index)), persons=persons)
+                body_parts: list = []
+                for bp_idx, bp in enumerate(p.get("body_parts", []) if isinstance(p.get("body_parts"), list) else []):
+                    if not isinstance(bp, dict):
+                        continue
+                    keypoints = [
+                        Keypoint(name=str(kp.get("name", f"kp_{bp_idx}_{k_idx}")), x=float(kp.get("x", 0.0)), y=float(kp.get("y", 0.0)), confidence=float(kp.get("confidence", 0.0)))
+                        for k_idx, kp in enumerate(bp.get("keypoints", []) if isinstance(bp.get("keypoints"), list) else [])
+                        if isinstance(kp, dict)
+                    ]
+                    body_parts.append(
+                        BodyPartNode(
+                            part_id=str(bp.get("part_id", f"{pid}_part_{bp_idx}")),
+                            part_type=str(bp.get("part_type", "unknown")),
+                            keypoints=keypoints,
+                            mask_ref=bp.get("mask_ref"),
+                            visibility=str(bp.get("visibility", "unknown")),
+                            occluded_by=[str(v) for v in bp.get("occluded_by", []) if isinstance(v, str)],
+                            depth_order=float(bp.get("depth_order", 0.0)),
+                            canonical_slot=str(bp.get("canonical_slot", "")),
+                            confidence=float(bp.get("confidence", 0.0)),
+                            source=str(bp.get("source", "dataset")),
+                            frame_index=int(bp.get("frame_index", raw.get("frame_index", frame_index))),
+                            timestamp=float(bp["timestamp"]) if isinstance(bp.get("timestamp"), (int, float)) else None,
+                        )
+                    )
+                garments = [
+                    GarmentNode(
+                        garment_id=str(g.get("garment_id", f"{pid}_garment_{g_idx}")),
+                        garment_type=str(g.get("garment_type", g.get("type", "unknown"))),
+                        mask_ref=g.get("mask_ref"),
+                        attachment_targets=[str(v) for v in g.get("attachment_targets", []) if isinstance(v, str)],
+                        coverage_targets=[str(v) for v in g.get("coverage_targets", []) if isinstance(v, str)],
+                        garment_state=str(g.get("garment_state", g.get("state", "worn"))),
+                        visibility=str(g.get("visibility", "unknown")),
+                        appearance_ref=g.get("appearance_ref"),
+                        confidence=float(g.get("confidence", 0.0)),
+                        source=str(g.get("source", "dataset")),
+                        frame_index=int(g.get("frame_index", raw.get("frame_index", frame_index))),
+                        timestamp=float(g["timestamp"]) if isinstance(g.get("timestamp"), (int, float)) else None,
+                    )
+                    for g_idx, g in enumerate(p.get("garments", []) if isinstance(p.get("garments"), list) else [])
+                    if isinstance(g, dict)
+                ]
+                persons.append(
+                    PersonNode(
+                        person_id=pid,
+                        track_id=str(p.get("track_id", f"t{track}_{idx}")),
+                        bbox=LearnedStageDatasetRouter._coerce_bbox(p.get("bbox")),
+                        mask_ref=p.get("mask_ref"),
+                        body_parts=body_parts,
+                        garments=garments,
+                        confidence=float(p.get("confidence", 0.0)),
+                        source=str(p.get("source", "dataset")),
+                        frame_index=int(p.get("frame_index", raw.get("frame_index", frame_index))),
+                        timestamp=float(p["timestamp"]) if isinstance(p.get("timestamp"), (int, float)) else None,
+                    )
+                )
+            objects = [
+                SceneObjectNode(
+                    object_id=str(o.get("object_id", f"obj_{track}_{idx}")),
+                    object_type=str(o.get("object_type", "unknown")),
+                    bbox=LearnedStageDatasetRouter._coerce_bbox(o.get("bbox")),
+                    mask_ref=o.get("mask_ref"),
+                    confidence=float(o.get("confidence", 0.0)),
+                    source=str(o.get("source", "dataset")),
+                    frame_index=int(o.get("frame_index", raw.get("frame_index", frame_index))),
+                    timestamp=float(o["timestamp"]) if isinstance(o.get("timestamp"), (int, float)) else None,
+                )
+                for idx, o in enumerate(raw.get("objects", []) if isinstance(raw.get("objects"), list) else [])
+                if isinstance(o, dict)
+            ]
+            relations = [
+                RelationEdge(
+                    source=str(r.get("source", "")),
+                    relation=str(r.get("relation", "near")),
+                    target=str(r.get("target", "")),
+                    confidence=float(r.get("confidence", 0.0)),
+                    provenance=str(r.get("provenance", "dataset")),
+                    frame_index=int(r.get("frame_index", raw.get("frame_index", frame_index))),
+                    timestamp=float(r["timestamp"]) if isinstance(r.get("timestamp"), (int, float)) else None,
+                )
+                for r in raw.get("relations", []) if isinstance(r, dict)
+            ]
+            gc_raw = raw.get("global_context", {}) if isinstance(raw.get("global_context"), dict) else {}
+            context = GlobalSceneContext(
+                frame_size=tuple(gc_raw.get("frame_size", [0, 0])) if isinstance(gc_raw.get("frame_size"), list) else (0, 0),
+                fps=int(gc_raw.get("fps", 16)),
+                source_type=str(gc_raw.get("source_type", "dataset")),
+            )
+            graph = SceneGraph(
+                frame_index=int(raw.get("frame_index", frame_index)),
+                persons=persons,
+                objects=objects,
+                relations=relations,
+                global_context=context,
+                timestamp=float(raw["timestamp"]) if isinstance(raw.get("timestamp"), (int, float)) else None,
+            )
             return graph
         return LearnedStageDatasetRouter._base_graph(frame_index, track)
 
@@ -149,21 +258,15 @@ class LearnedStageDatasetRouter:
     @staticmethod
     def _synthetic_text(index: int) -> dict[str, object]:
         actions = [
-            "sit down",
-            "wave hand then turn left",
-            "stand up while holding balance constraint",
-            "turn left and raise right hand in parallel",
-            "micro adjust torso with stability constraint",
+            ("sit down on chair_1", [ActionStep(type="sit_down", priority=1, target_entity="person_1", target_object="chair_1")]),
+            ("wave right hand then turn left", [ActionStep(type="wave", priority=1, body_part="right_hand", target_entity="person_1"), ActionStep(type="turn_left", priority=2, start_after=[1])]),
+            ("raise left arm and nod head in parallel", [ActionStep(type="raise_arm", priority=1, body_part="left_arm", can_run_parallel=True), ActionStep(type="nod_head", priority=1, body_part="head", can_run_parallel=True)]),
+            ("slowly step back then sit while keeping balance and avoiding table", [ActionStep(type="step_back", priority=1), ActionStep(type="sit_down", priority=2, constraints=["keep_balance", "avoid_contact:table_1"], start_after=[1])]),
+            ("adjust pose near object", [ActionStep(type="micro_adjust", priority=1, constraints=["underspecified_prompt"]), ActionStep(type="stabilize", priority=2, target_object="nearby_object", start_after=[1])]),
+            ("person_2 should place cup_1 on table_1 then wave", [ActionStep(type="place_object", priority=1, target_entity="person_2", target_object="cup_1", constraints=["destination:table_1"]), ActionStep(type="wave", priority=2, target_entity="person_2", body_part="right_hand", start_after=[1])]),
         ]
-        steps = [
-            ActionStep(type="sit_down", priority=1),
-            ActionStep(type="wave", priority=1, body_part="right_hand", target_entity="person_1", start_after=[], can_run_parallel=False),
-            ActionStep(type="stand_up", priority=1, constraints=["keep_balance"]),
-            ActionStep(type="turn", priority=1, start_after=[], can_run_parallel=True, target_object="left_side"),
-            ActionStep(type="micro_adjust", priority=1, constraints=["preserve_identity"], body_part="torso"),
-        ]
-        idx = index % len(actions)
-        return {"text": actions[idx], "actions": [steps[idx]]}
+        text, steps = actions[index % len(actions)]
+        return {"text": text, "actions": steps}
 
     @staticmethod
     def _synthetic_dynamics(index: int) -> dict[str, object]:
@@ -250,9 +353,12 @@ class LearnedStageDatasetRouter:
             return {"text": text, "actions": actions, "metadata": record.get("metadata", {})}
         if stage_name == "dynamics_transition":
             before = LearnedStageDatasetRouter._coerce_graph(record, "graph_before", frame_index=index, track=f"dataset_{index}")
+            graph_after = None
+            if isinstance(record.get("graph_after"), dict):
+                graph_after = LearnedStageDatasetRouter._coerce_graph(record, "graph_after", frame_index=index + 1, track=f"dataset_{index}_after")
             text_tokens = [a.type for a in LearnedStageDatasetRouter._coerce_action_steps(record.get("actions"), fallback_token="micro_adjust")]
             delta = LearnedStageDatasetRouter._coerce_delta(record, before=before, action_tokens=text_tokens, phase=str(record.get("transition_phase", "motion")))
-            return {"graph_before": before, "text_tokens": text_tokens, "delta": delta, "metadata": record.get("metadata", {})}
+            return {"graph_before": before, "ground_truth_graph_after": graph_after, "text_tokens": text_tokens, "delta": delta, "metadata": record.get("metadata", {})}
         if stage_name == "patch_synthesis":
             graph = LearnedStageDatasetRouter._coerce_graph(record, "graph", frame_index=index, track=f"dataset_{index}")
             region_data = record.get("region", {})
@@ -353,10 +459,11 @@ class TextEncoderStageRunner(_BaseStageRunner):
             config,
             {
                 "stage_name": "text_encoder",
-                "backend": self.backends.backend_names.get("text_encoder", self.backend),
-                "backend_config": self.backends.backend_names,
+                "backend_name": self.backends.backend_names.get("text_encoder", self.backend),
+                "resolved_backend_config": self.backends.backend_names,
                 "schema_version": "learned_ready.v2",
                 "contract_version": "text_action_state.v1",
+                "dataset_source": config.dataset_path or "synthetic_router",
                 "train_metrics": {"progress": 1.0, "score_mean": (sum(scores) / len(scores)) if scores else 0.0},
                 "val_metrics": {"alignment_score_mean": (sum(scores) / len(scores)) if scores else 0.0},
                 "samples_processed": len(samples),
@@ -364,6 +471,8 @@ class TextEncoderStageRunner(_BaseStageRunner):
                 "expected_outputs": ["action_embedding", "structured_action_tokens", "alignment"],
                 "contract_payload_shape": {"keys": sorted(last_contract.keys())},
                 "eval_summary": {"text_alignment_score": (sum(scores) / len(scores)) if scores else 0.0, "text_parity": text_parity_log[-1] if text_parity_log else {}},
+                "parity_summary": text_parity_log[-1] if text_parity_log else {},
+                "warnings_or_fallbacks": [],
             },
         )
         mean = sum(scores) / len(scores)
@@ -385,6 +494,8 @@ class DynamicsTransitionStageRunner(_BaseStageRunner):
         mm = MemoryManager()
         scores: list[float] = []
         last_contract: dict[str, object] = {}
+        parity_log: list[dict[str, object]] = []
+        warnings_or_fallbacks: list[str] = []
         for idx, sample in enumerate(samples):
             before = sample["graph_before"]
             memory = mm.initialize(before)
@@ -405,25 +516,47 @@ class DynamicsTransitionStageRunner(_BaseStageRunner):
             if not predicted_after:
                 from copy import deepcopy
                 predicted_after = apply_delta(deepcopy(before), out.delta)
-            contract = build_graph_transition_contract(before, predicted_after, out.delta, {"step_index": idx, "diagnostics": out.diagnostics})
+                warnings_or_fallbacks.append(f"sample_{idx}:graph_after_fallback_to_apply_delta")
+            ground_truth_after = sample.get("ground_truth_graph_after") if isinstance(sample.get("ground_truth_graph_after"), SceneGraph) else predicted_after
+            contract = build_graph_transition_contract(
+                before,
+                ground_truth_after,
+                out.delta,
+                {
+                    "step_index": idx,
+                    "diagnostics": out.diagnostics,
+                    "predicted_graph_after": _serialize_graph(predicted_after),
+                    "ground_truth_graph_after": _serialize_graph(ground_truth_after),
+                    "ground_truth_source": "dataset_manifest" if isinstance(sample.get("ground_truth_graph_after"), SceneGraph) else "apply_delta_fallback",
+                },
+            )
             last_contract = contract
             eval_payload = build_graph_eval_payload(contract)
             scores.append(graph_transition_eval(eval_payload).metrics["transition_correctness"])
+            missing = _validate_contract_fields(contract, ["graph_before", "graph_after", "delta_contract", "transition_context"])
+            from learned.parity import semantic_parity_checks
+
+            semantic = semantic_parity_checks(stage="dynamics", contract=contract, request=request, output=out)
+            parity_log.append({"missing_fields": missing, "semantic_issues": semantic})
+            warnings_or_fallbacks.extend([f"sample_{idx}:{'trace' if issue.endswith('_trace') else 'warning'}:{issue}" for issue in semantic])
         ckpt = self._write_checkpoint(
             config,
             {
                 "stage_name": "dynamics_transition",
-                "backend": self.backends.backend_names.get("dynamics_backend", self.backend),
-                "backend_config": self.backends.backend_names,
+                "backend_name": self.backends.backend_names.get("dynamics_backend", self.backend),
+                "resolved_backend_config": self.backends.backend_names,
                 "schema_version": "learned_ready.v2",
                 "contract_version": "graph_transition.v2",
+                "dataset_source": config.dataset_path or "synthetic_router",
                 "train_metrics": {"progress": 1.0, "score_mean": (sum(scores) / len(scores)) if scores else 0.0},
                 "val_metrics": {"transition_correctness_mean": (sum(scores) / len(scores)) if scores else 0.0},
                 "samples_processed": len(samples),
                 "expected_inputs": ["graph_state", "memory_summary", "text_action_summary", "step_context"],
                 "expected_outputs": ["graph_delta", "confidence", "transition_metadata"],
                 "contract_payload_shape": {"keys": sorted(last_contract.keys())},
-                "eval_summary": {"transition_correctness": (sum(scores) / len(scores)) if scores else 0.0},
+                "eval_summary": {"transition_correctness": (sum(scores) / len(scores)) if scores else 0.0, "graph_after_target": "ground_truth_graph_after"},
+                "parity_summary": parity_log[-1] if parity_log else {},
+                "warnings_or_fallbacks": warnings_or_fallbacks,
             },
         )
         mean = sum(scores) / len(scores)
@@ -470,10 +603,11 @@ class PatchSynthesisStageRunner(_BaseStageRunner):
             config,
             {
                 "stage_name": "patch_synthesis",
-                "backend": self.backends.backend_names.get("patch_backend", self.backend),
-                "backend_config": self.backends.backend_names,
+                "backend_name": self.backends.backend_names.get("patch_backend", self.backend),
+                "resolved_backend_config": self.backends.backend_names,
                 "schema_version": "learned_ready.v2",
                 "contract_version": "patch_synthesis.v2",
+                "dataset_source": config.dataset_path or "synthetic_router",
                 "train_metrics": {"progress": 1.0, "score_mean": (sum(scores) / len(scores)) if scores else 0.0},
                 "val_metrics": {"patch_quality_mean": (sum(scores) / len(scores)) if scores else 0.0},
                 "samples_processed": len(samples),
@@ -481,6 +615,8 @@ class PatchSynthesisStageRunner(_BaseStageRunner):
                 "expected_outputs": ["rgb_patch", "confidence", "uncertainty_map"],
                 "contract_payload_shape": {"keys": sorted(last_contract.keys())},
                 "eval_summary": {"composite_patch_hidden_score": (sum(scores) / len(scores)) if scores else 0.0},
+                "parity_summary": {},
+                "warnings_or_fallbacks": [],
             },
         )
         mean = sum(scores) / len(scores)
@@ -529,10 +665,11 @@ class TemporalRefinementStageRunner(_BaseStageRunner):
             config,
             {
                 "stage_name": "temporal_refinement",
-                "backend": self.backends.backend_names.get("temporal_backend", self.backend),
-                "backend_config": self.backends.backend_names,
+                "backend_name": self.backends.backend_names.get("temporal_backend", self.backend),
+                "resolved_backend_config": self.backends.backend_names,
                 "schema_version": "learned_ready.v2",
                 "contract_version": "temporal_consistency.v2",
+                "dataset_source": config.dataset_path or "synthetic_router",
                 "train_metrics": {"progress": 1.0, "score_mean": (sum(scores) / len(scores)) if scores else 0.0},
                 "val_metrics": {"temporal_consistency_mean": (sum(scores) / len(scores)) if scores else 0.0},
                 "samples_processed": len(samples),
@@ -540,6 +677,8 @@ class TemporalRefinementStageRunner(_BaseStageRunner):
                 "expected_outputs": ["refined_frame", "region_consistency_scores"],
                 "contract_payload_shape": {"keys": sorted(last_contract.keys())},
                 "eval_summary": {"temporal_consistency": (sum(scores) / len(scores)) if scores else 0.0},
+                "parity_summary": {},
+                "warnings_or_fallbacks": [],
             },
         )
         mean = sum(scores) / len(scores)

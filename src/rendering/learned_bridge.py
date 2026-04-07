@@ -26,9 +26,25 @@ class BaselinePatchSynthesisModel(PatchSynthesisModel):
         )
         graph_signal = len(request.graph_encoding.graph_embedding) if request.graph_encoding else 0
         identity_signal = len(request.identity_embedding)
+        hidden_signal = request.memory_channels.get("hidden_regions", {})
+        retrieval_profile = str(request.retrieval_summary.get("profile", "")) if isinstance(request.retrieval_summary, dict) else ""
+        blend_weight = min(0.3, 0.04 * graph_signal + 0.015 * identity_signal)
+        if isinstance(hidden_signal, dict) and hidden_signal:
+            blend_weight = min(0.45, blend_weight + 0.12)
+        if retrieval_profile == "rich":
+            blend_weight = min(0.5, blend_weight + 0.08)
+        if blend_weight > 0.0 and rendered.rgb_patch:
+            for y, row in enumerate(rendered.rgb_patch):
+                for x, px in enumerate(row):
+                    id_mod = (request.identity_embedding[(x + y) % max(1, len(request.identity_embedding))] + 1.0) * 0.5 if request.identity_embedding else 0.5
+                    px[0] = max(0.0, min(1.0, px[0] * (1.0 - blend_weight) + id_mod * blend_weight))
+                    px[1] = max(0.0, min(1.0, px[1] * (1.0 - blend_weight * 0.6) + id_mod * blend_weight * 0.3))
         used_channels = [name for name, payload in request.memory_channels.items() if payload]
         confidence = max(0.0, min(1.0, rendered.confidence + min(0.2, 0.01 * graph_signal + 0.01 * identity_signal)))
         exec_trace = dict(rendered.execution_trace)
+        selected_mode = "identity_graph_refine" if blend_weight >= 0.2 else "deterministic"
+        if retrieval_profile == "rich" and selected_mode != "identity_graph_refine":
+            selected_mode = "retrieval_pref"
         exec_trace.update(
             {
                 "learned_ready_usage": {
@@ -38,6 +54,10 @@ class BaselinePatchSynthesisModel(PatchSynthesisModel):
                     "ignored_fields": [name for name, payload in request.memory_channels.items() if not payload],
                 },
                 "selected_render_strategy": exec_trace.get("selected_render_strategy", "graph_identity_guided"),
+                "blend_weight": blend_weight,
+                "retrieval_preference": retrieval_profile or "default",
+                "patch_refinement_strength": round(blend_weight * (1.2 if hidden_signal else 1.0), 3),
+                "synthesis_mode": selected_mode,
             }
         )
         return PatchSynthesisOutput(
