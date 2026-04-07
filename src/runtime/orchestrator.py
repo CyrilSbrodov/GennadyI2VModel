@@ -7,15 +7,21 @@ from pathlib import Path
 from core.input_layer import InputAssetLayer
 from core.schema import SceneGraph
 from dynamics.graph_delta_predictor import GraphDeltaPredictor
+from dynamics.learned_bridge import BaselineDynamicsTransitionModel
+from learned.interfaces import DynamicsTransitionRequest, PatchSynthesisRequest, TemporalRefinementRequest
 from dynamics.state_update import apply_delta
 from memory.video_memory import MemoryManager
+from memory.summaries import AppearanceMemorySummarizer
 from perception.pipeline import PerceptionPipeline
 from planning.transition_engine import StatePlan, TransitionPlanner
 from rendering.compositor import Compositor, TemporalStabilizer
+from rendering.learned_bridge import BaselinePatchSynthesisModel
 from rendering.roi_renderer import PatchRenderer, ROISelector
+from rendering.temporal_bridge import BaselineTemporalConsistencyModel
 from representation.graph_builder import SceneGraphBuilder
 from runtime.profiles import PROFILES, RuntimeProfile
 from text.intent_parser import IntentParser
+from text.learned_bridge import BaselineTextEncoderAdapter
 from utils_tensor import shape, zeros
 
 
@@ -40,6 +46,11 @@ class GennadyEngine:
         self.patch_renderer = PatchRenderer()
         self.compositor = Compositor()
         self.stabilizer = TemporalStabilizer()
+        self.text_encoder = BaselineTextEncoderAdapter()
+        self.memory_summarizer = AppearanceMemorySummarizer()
+        self.dynamics_backend = BaselineDynamicsTransitionModel()
+        self.patch_backend = BaselinePatchSynthesisModel(self.patch_renderer)
+        self.temporal_backend = BaselineTemporalConsistencyModel(self.stabilizer)
 
     def run(
         self,
@@ -71,6 +82,7 @@ class GennadyEngine:
         memory = self.memory_manager.initialize_from_scene(scene_graph)
 
         action_plan = self.intent_parser.parse(request.text, scene_graph=scene_graph)
+        text_encoding = self.text_encoder.encode(request.text, scene_graph=scene_graph, action_plan=action_plan)
         state_plan = self.planner.expand(
             scene_graph,
             action_plan,
@@ -88,27 +100,52 @@ class GennadyEngine:
         dynamics_metrics_log: list[str] = []
 
         for planned_state in state_plan.steps[1 : profile.max_transition_steps + 1]:
-            delta, dyn_metrics = self.dynamics.predict(
+            memory_summary = self.memory_summarizer.summarize(memory).as_dict()
+            transition_output = self.dynamics_backend.predict_transition(
+                DynamicsTransitionRequest(
+                    graph_state=scene_graph,
+                    memory_summary=memory_summary,
+                    text_action_summary=text_encoding,
+                    step_context={"step_index": planned_state.step_index, "memory": memory},
+                )
+            )
+            delta = transition_output.delta
+            _, dyn_metrics = self.dynamics.predict(
                 scene_graph=scene_graph,
                 target_state=planned_state,
                 planner_context={"step_index": planned_state.step_index},
                 memory=memory,
             )
             changed_regions = self.roi_selector.select(scene_graph, delta)
-            patches = [
-                self.patch_renderer.render(current_frame, scene_graph, delta, memory, region)
-                for region in changed_regions[: profile.max_roi_count]
-            ]
+            patches = []
+            for region in changed_regions[: profile.max_roi_count]:
+                patch_out = self.patch_backend.synthesize_patch(
+                    PatchSynthesisRequest(
+                        region=region,
+                        scene_state=scene_graph,
+                        memory_summary=memory_summary,
+                        transition_context={"graph_delta": delta, "video_memory": memory},
+                        retrieval_summary={"backend": "deterministic"},
+                        current_frame=current_frame,
+                    )
+                )
+                rendered = self.patch_renderer.render(current_frame, scene_graph, delta, memory, region)
+                rendered.rgb_patch = patch_out.rgb_patch
+                rendered.confidence = patch_out.confidence
+                rendered.uncertainty_map = patch_out.uncertainty_map
+                rendered.execution_trace.update({"patch_backend": "deterministic_interface"})
+                patches.append(rendered)
             composed = self.compositor.compose(current_frame, patches, delta)
-            avg_patch_conf = (sum(p.confidence for p in patches) / len(patches)) if patches else 0.5
-            stable_frame = self.stabilizer.refine(
-                frames[-1],
-                composed,
-                memory,
-                enabled=profile.temporal_refinement,
-                updated_regions=[p.region for p in patches],
-                region_confidence=avg_patch_conf,
+            temporal_out = self.temporal_backend.refine_temporal(
+                TemporalRefinementRequest(
+                    previous_frame=frames[-1],
+                    current_composed_frame=composed,
+                    changed_regions=[p.region for p in patches],
+                    scene_state=scene_graph,
+                    memory_state=memory,
+                )
             )
+            stable_frame = temporal_out.refined_frame if profile.temporal_refinement else composed
 
             scene_graph = apply_delta(scene_graph, delta)
             memory = self.memory_manager.update_from_graph(memory, scene_graph)
@@ -140,7 +177,7 @@ class GennadyEngine:
             debug={
                 "overlay_log": overlay_log,
                 "dynamics_metrics": dynamics_metrics_log,
-                "profile": {
+                    "profile": {
                     "name": profile.name,
                     "internal_resolution": profile.internal_resolution,
                     "max_transition_steps": profile.max_transition_steps,
@@ -156,6 +193,12 @@ class GennadyEngine:
                     "timestamps_preview": request.timestamps[: min(10, len(request.timestamps))],
                     "reference_set": request.reference_set,
                     "source_mode": "image_grounded" if first_frame else "debug_fallback",
+                },
+                "learned_ready": {
+                    "text_encoder_backend": "baseline_text_adapter",
+                    "dynamics_backend": "deterministic_graph_delta_predictor",
+                    "patch_backend": "deterministic_patch_renderer",
+                    "temporal_backend": "deterministic_temporal_stabilizer",
                 },
             },
         )

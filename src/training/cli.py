@@ -9,7 +9,21 @@ from training.types import TrainingConfig
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train modular Gennady stages")
-    parser.add_argument("--stage", default="all", choices=["all", "perception", "representation", "dynamics", "renderer"])
+    parser.add_argument(
+        "--stage",
+        default="all",
+        choices=[
+            "all",
+            "perception",
+            "representation",
+            "dynamics",
+            "renderer",
+            "text_encoder",
+            "dynamics_transition",
+            "patch_synthesis",
+            "temporal_refinement",
+        ],
+    )
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--train-size", type=int, default=8)
     parser.add_argument("--val-size", type=int, default=4)

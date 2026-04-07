@@ -42,6 +42,10 @@ class TrainingSample(TypedDict, total=False):
     source: str
     sanity_metrics: dict[str, float]
     delta_contract: dict[str, object]
+    text_action_contract: dict[str, object]
+    graph_transition_contract: dict[str, object]
+    patch_synthesis_contract: dict[str, object]
+    temporal_consistency_contract: dict[str, object]
 
 
 @dataclass(slots=True)
@@ -173,10 +177,27 @@ class DynamicsDataset(BaseStageDataset):
 
     @classmethod
     def from_graph_sequence(cls, graphs: list[SceneGraph], actions: list[ActionStep]) -> "DynamicsDataset":
+        from training.learned_contracts import build_graph_transition_contract
+
         samples: list[TrainingSample] = []
         for idx in range(max(0, len(graphs) - 1)):
             delta = GraphDelta(pose_deltas={"frame_delta": float(graphs[idx + 1].frame_index - graphs[idx].frame_index)})
-            samples.append({"graphs": [graphs[idx], graphs[idx + 1]], "actions": actions, "deltas": [delta], "source": "graph_sequence", "delta_contract": _serialize_delta_contract(delta)})
+            graph_contract = build_graph_transition_contract(
+                before=graphs[idx],
+                after=graphs[idx + 1],
+                delta=delta,
+                transition_context={"source": "graph_sequence", "step_index": idx},
+            )
+            samples.append(
+                {
+                    "graphs": [graphs[idx], graphs[idx + 1]],
+                    "actions": actions,
+                    "deltas": [delta],
+                    "source": "graph_sequence",
+                    "delta_contract": _serialize_delta_contract(delta),
+                    "graph_transition_contract": graph_contract,
+                }
+            )
         return cls(samples=samples)
 
     @classmethod
@@ -213,6 +234,8 @@ class RendererDataset(BaseStageDataset):
 
     @classmethod
     def from_video_manifest(cls, manifest_path: str, quality_profile: str = "debug") -> "RendererDataset":
+        from training.learned_contracts import build_patch_synthesis_contract, build_temporal_consistency_contract
+
         layer = InputAssetLayer()
         selector = ROISelector()
         records = json.loads(Path(manifest_path).read_text()).get("records", [])
@@ -227,7 +250,37 @@ class RendererDataset(BaseStageDataset):
             delta = GraphDelta(affected_entities=[person.person_id], semantic_reasons=rec.get("reasons", []), affected_regions=rec.get("affected_regions", []))
             rois = selector.select(graph, delta)
             roi_pairs = [(frames[0], frames[1]) for _ in rois] or [(frames[0], frames[1])]
-            out.append({"frames": [frames[0], frames[1]], "roi_pairs": roi_pairs, "source": rec.get("source", "video_manifest")})
+            patch_contract = None
+            temporal_contract = None
+            if rois:
+                patch_contract = build_patch_synthesis_contract(
+                    roi_before=frames[0],
+                    roi_after=frames[1],
+                    region=rois[0],
+                    retrieval_summary=rec.get("retrieval_summary", "manifest"),
+                    selected_strategy=rec.get("selected_strategy", "fallback"),
+                    hidden_state=rec.get("hidden_lifecycle_state", {}),
+                    synthesis_mode=rec.get("synthesis_mode", "deterministic"),
+                    transition_context=rec.get("transition_context", {}),
+                )
+                temporal_contract = build_temporal_consistency_contract(
+                    previous_frame=frames[0],
+                    composed_frame=frames[1],
+                    target_frame=frames[1],
+                    changed_regions=rois,
+                    region_consistency_metadata=rec.get("region_consistency_metadata", {}),
+                    scene_transition_context=rec.get("scene_transition_context", {}),
+                    memory_transition_context=rec.get("memory_transition_context", {}),
+                )
+            out.append(
+                {
+                    "frames": [frames[0], frames[1]],
+                    "roi_pairs": roi_pairs,
+                    "patch_synthesis_contract": patch_contract,
+                    "temporal_consistency_contract": temporal_contract,
+                    "source": rec.get("source", "video_manifest"),
+                }
+            )
         return cls(samples=out)
 
 
@@ -245,11 +298,25 @@ class TextActionDataset(BaseStageDataset):
 
     @classmethod
     def from_annotation_manifest(cls, manifest_path: str) -> "TextActionDataset":
+        from text.learned_bridge import BaselineTextEncoderAdapter
+        from training.learned_contracts import build_text_action_state_contract
+
         manifest = json.loads(Path(manifest_path).read_text())
+        encoder = BaselineTextEncoderAdapter()
         samples: list[TrainingSample] = []
         for rec in manifest.get("records", []):
             actions = [ActionStep(type=a.get("type", "unknown"), priority=i + 1, target_entity=a.get("target_entity"), target_object=a.get("target_object")) for i, a in enumerate(rec.get("actions", []))]
-            samples.append({"text": rec.get("text", ""), "actions": actions, "text_alignment": rec, "source": rec.get("source", "annotation_manifest")})
+            encoding = encoder.encode(rec.get("text", ""))
+            contract = build_text_action_state_contract(rec.get("text", ""), actions, vars(encoding))
+            samples.append(
+                {
+                    "text": rec.get("text", ""),
+                    "actions": actions,
+                    "text_alignment": rec,
+                    "text_action_contract": contract,
+                    "source": rec.get("source", "annotation_manifest"),
+                }
+            )
         return cls(samples=samples)
 
 
