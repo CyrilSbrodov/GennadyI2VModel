@@ -77,3 +77,52 @@
 - builder строит graph из cached facts напрямую; если `persons` отсутствует и `strict=True`, выбрасывается ошибка.
 
 > Важно: часть текущих датасетов остаётся pseudo-labeled baseline для smoke/debug. Контракты и структуры данных уже пригодны как learned-ready входы.
+
+## Perception backends (builtin vs real)
+
+`PerceptionPipeline` поддерживает backend-конфиг для perception модулей. Для parser теперь используется **human-centric stack** (`SegFormerHumanParserAdapter`) из 4 подпарсеров + fusion:
+
+- person segmentation (`mediapipe` SelfieSegmentation или `builtin`),
+- body part parser (`hf` human parsing model или `builtin`),
+- garment parser (`hf` clothing/human parsing model или `builtin`),
+- face region parser (`mediapipe` FaceMesh или `builtin`).
+
+Важно: parser backend `hf` ожидает **модель human/clothing parsing**, а не generic scene segmentation.
+
+Пример builtin режима:
+
+```python
+from perception.pipeline import PerceptionPipeline, PerceptionBackendsConfig
+
+pipe = PerceptionPipeline(backends=PerceptionBackendsConfig())
+out = pipe.analyze(frame_tensor)
+# module_fallbacks['parser'] == 'builtin'
+```
+
+Пример real parser stack:
+
+```python
+from perception.pipeline import PerceptionBackendsConfig, PerceptionPipeline
+from perception.parser import ParserBackendConfig, ParserStackConfig
+
+parser_cfg = ParserStackConfig(
+    person_segmentation=ParserBackendConfig(backend="mediapipe"),
+    body_parts=ParserBackendConfig(backend="hf", model_id="<human-parsing-model>"),
+    garments=ParserBackendConfig(backend="hf", model_id="<clothing-parsing-model>"),
+    face_regions=ParserBackendConfig(backend="mediapipe"),
+)
+
+pipe = PerceptionPipeline(backends=PerceptionBackendsConfig(parser=parser_cfg))
+out = pipe.analyze(frame_tensor)
+```
+
+Что реально умеет parser stack сейчас:
+- person mask и mask_ref с payload в in-memory mask store,
+- body-part masks (только для меток, которые реально есть в выходе выбранной модели),
+- garment predictions (только для реально распознанных garment labels, без scene-label hacks),
+- face-region hints (face/eyes/mouth),
+- occlusion hints из масок (torso/arms/lower body, fragmented/uncertain).
+
+Что пока ограничено:
+- качество и детализация body/garment классов зависят от конкретной выбранной модели на HF,
+- нет встроенной поставки весов в репозиторий, нужны внешние model_id/веса.

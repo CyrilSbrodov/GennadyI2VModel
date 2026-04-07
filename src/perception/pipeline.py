@@ -5,13 +5,22 @@ from dataclasses import dataclass, field
 
 from core.input_layer import AssetFrame
 from core.schema import BBox, ExpressionState, OrientationState, PoseState
-from perception.detector import Detector, DetectorOutput, YoloPersonDetectorAdapter
+from perception.detector import BackendConfig, Detector, DetectorOutput, YoloPersonDetectorAdapter
 from perception.face import EmoNetFaceAnalyzerAdapter, FaceAnalyzer, FacePrediction
 from perception.objects import MonoDepthEstimator, ObjectDetector, ObjectPrediction, YoloObjectDetectorAdapter
-from perception.parser import HumanParser, ParsingPrediction, SegFormerHumanParserAdapter
+from perception.parser import HumanParser, ParserStackConfig, ParsingPrediction, SegFormerHumanParserAdapter
 from perception.pose import PoseEstimator, PosePrediction, VitPoseAdapter
 from perception.tracker import ByteTrackAdapter, PersonTracker, TrackPrediction
 from utils_tensor import shape
+
+
+@dataclass(slots=True)
+class PerceptionBackendsConfig:
+    detector: BackendConfig = field(default_factory=lambda: BackendConfig(backend="builtin", checkpoint="yolov8n.pt"))
+    pose: BackendConfig = field(default_factory=lambda: BackendConfig(backend="builtin", checkpoint=""))
+    parser: ParserStackConfig | BackendConfig = field(default_factory=ParserStackConfig)
+    objects: BackendConfig = field(default_factory=lambda: BackendConfig(backend="builtin", checkpoint="yolov8n.pt"))
+    face: BackendConfig = field(default_factory=lambda: BackendConfig(backend="builtin", checkpoint=""))
 
 
 @dataclass(slots=True)
@@ -39,6 +48,8 @@ class PersonFacts:
     face_landmarks: list[tuple[float, float]] = field(default_factory=list)
     depth_order: float = 0.0
     occlusion_hints: list[str] = field(default_factory=list)
+    body_parts: list[dict] = field(default_factory=list)
+    face_regions: list[dict] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -74,80 +85,127 @@ class PerceptionPipeline:
         objects: ObjectDetector | None = None,
         tracker: PersonTracker | None = None,
         depth: MonoDepthEstimator | None = None,
+        backends: PerceptionBackendsConfig | None = None,
     ) -> None:
-        self.detector = detector or YoloPersonDetectorAdapter()
-        self.pose = pose or VitPoseAdapter()
-        self.parser = parser or SegFormerHumanParserAdapter()
-        self.face = face or EmoNetFaceAnalyzerAdapter()
-        self.objects = objects or YoloObjectDetectorAdapter()
+        cfg = backends or PerceptionBackendsConfig()
+        self.detector = detector or YoloPersonDetectorAdapter(cfg.detector)
+        self.pose = pose or VitPoseAdapter(cfg.pose)
+        self.parser = parser or SegFormerHumanParserAdapter(cfg.parser)
+        self.face = face or EmoNetFaceAnalyzerAdapter(cfg.face)
+        self.objects = objects or YoloObjectDetectorAdapter(cfg.objects)
         self.tracker = tracker or ByteTrackAdapter()
         self.depth = depth or MonoDepthEstimator()
 
-    def _safe_module_call(self, fn, default, warnings: list[str], module_name: str, out: PerceptionOutput):
+    def _safe_module_call(self, fn, fallback_fn, warnings: list[str], module_name: str, out: PerceptionOutput, success_mode: str = "native"):
         start = time.perf_counter()
         try:
             value = fn()
-            out.module_fallbacks[module_name] = "native"
+            out.module_fallbacks[module_name] = success_mode
             return value
-        except Exception as exc:  # fallback behavior for partially unavailable modules
+        except Exception as exc:
             warnings.append(f"{module_name}_unavailable:{exc}")
-            out.module_fallbacks[module_name] = "fallback"
-            return default
+            try:
+                value = fallback_fn()
+                out.module_fallbacks[module_name] = "fallback"
+                return value
+            except Exception as fb_exc:
+                warnings.append(f"{module_name}_fallback_failed:{fb_exc}")
+                out.module_fallbacks[module_name] = "real_backend_error"
+                raise
         finally:
             out.module_latency_ms[module_name] = round((time.perf_counter() - start) * 1000.0, 3)
+
+    @staticmethod
+    def _backend_fallback_enabled(module: object) -> bool:
+        if hasattr(module, "is_builtin_backend") and callable(getattr(module, "is_builtin_backend")):
+            return not bool(module.is_builtin_backend())
+        config = getattr(module, "config", None)
+        backend = getattr(config, "backend", None)
+        return isinstance(backend, str) and backend not in {"", "builtin"}
+
+    @staticmethod
+    def _module_success_mode(module: object) -> str:
+        if hasattr(module, "is_builtin_backend") and callable(getattr(module, "is_builtin_backend")):
+            return "builtin" if bool(module.is_builtin_backend()) else "native"
+        config = getattr(module, "config", None)
+        backend = getattr(config, "backend", None)
+        return "builtin" if backend in {"", "builtin"} else "native"
 
     def analyze(self, frame: AssetFrame | list[list[list[float]]] | str) -> PerceptionOutput:
         out = PerceptionOutput()
         warnings = out.warnings
+
+        default_detector = YoloPersonDetectorAdapter(BackendConfig(backend="builtin"))
         detection_out = self._safe_module_call(
             lambda: self.detector.detect(frame),
-            default=DetectorOutput(),
+            fallback_fn=(lambda: default_detector.detect(frame))
+            if self._backend_fallback_enabled(self.detector)
+            else (lambda: DetectorOutput()),
             warnings=warnings,
             module_name="detector",
             out=out,
+            success_mode=self._module_success_mode(self.detector),
         )
 
         pose_predictions: dict[str, PosePrediction] = self._safe_module_call(
             lambda: self.pose.estimate(frame, detection_out.persons),
-            default={},
+            fallback_fn=(lambda: VitPoseAdapter(BackendConfig(backend="builtin")).estimate(frame, detection_out.persons))
+            if self._backend_fallback_enabled(self.pose)
+            else (lambda: {}),
             warnings=warnings,
             module_name="pose",
             out=out,
+            success_mode=self._module_success_mode(self.pose),
         )
         parsing_predictions: dict[str, ParsingPrediction] = self._safe_module_call(
             lambda: self.parser.parse(frame, detection_out.persons),
-            default={},
+            fallback_fn=(lambda: SegFormerHumanParserAdapter(BackendConfig(backend="builtin")).parse(frame, detection_out.persons))
+            if self._backend_fallback_enabled(self.parser)
+            else (lambda: {}),
             warnings=warnings,
             module_name="parser",
             out=out,
+            success_mode=self._module_success_mode(self.parser),
         )
         face_predictions: dict[str, FacePrediction] = self._safe_module_call(
             lambda: self.face.analyze(frame, detection_out.persons),
-            default={},
+            fallback_fn=(lambda: EmoNetFaceAnalyzerAdapter(BackendConfig(backend="builtin")).analyze(frame, detection_out.persons))
+            if self._backend_fallback_enabled(self.face)
+            else (lambda: {}),
             warnings=warnings,
             module_name="face",
             out=out,
+            success_mode=self._module_success_mode(self.face),
         )
         track_predictions: dict[str, TrackPrediction] = self._safe_module_call(
             lambda: self.tracker.assign(frame, detection_out.persons),
-            default={},
+            fallback_fn=(lambda: ByteTrackAdapter(BackendConfig(backend="builtin")).assign(frame, detection_out.persons))
+            if self._backend_fallback_enabled(self.tracker)
+            else (lambda: {}),
             warnings=warnings,
             module_name="tracker",
             out=out,
+            success_mode=self._module_success_mode(self.tracker),
         )
         object_predictions: list[ObjectPrediction] = self._safe_module_call(
             lambda: self.objects.detect(frame),
-            default=[],
+            fallback_fn=(lambda: YoloObjectDetectorAdapter(BackendConfig(backend="builtin")).detect(frame))
+            if self._backend_fallback_enabled(self.objects)
+            else (lambda: []),
             warnings=warnings,
             module_name="objects",
             out=out,
+            success_mode=self._module_success_mode(self.objects),
         )
         out.depth_score = self._safe_module_call(
             lambda: self.depth.estimate(frame),
-            default=None,
+            fallback_fn=(lambda: MonoDepthEstimator(BackendConfig(backend="builtin")).estimate(frame))
+            if self._backend_fallback_enabled(self.depth)
+            else (lambda: None),
             warnings=warnings,
             module_name="depth",
             out=out,
+            success_mode=self._module_success_mode(self.depth),
         )
 
         persons: list[PersonFacts] = []
@@ -156,17 +214,18 @@ class PerceptionPipeline:
             parsed = parsing_predictions.get(person.detection_id)
             face = face_predictions.get(person.detection_id)
             tracked = track_predictions.get(person.detection_id)
-
             garments = []
+            body_parts = []
+            face_regions = []
             if parsed:
-                garments = [
-                    {
-                        "type": garment.garment_type,
-                        "state": garment.state,
-                        "confidence": garment.confidence,
-                        "source": garment.source,
-                    }
-                    for garment in parsed.garments
+                garments = [{"type": g.garment_type, "state": g.state, "confidence": g.confidence, "source": g.source} for g in parsed.garments]
+                body_parts = [
+                    {"part_type": b.part_type, "mask_ref": b.mask_ref, "confidence": b.confidence, "visibility": b.visibility, "source": b.source}
+                    for b in parsed.body_parts
+                ]
+                face_regions = [
+                    {"region_type": r.region_type, "mask_ref": r.mask_ref, "confidence": r.confidence, "source": r.source}
+                    for r in parsed.face_regions
                 ]
 
             person_depth = 1.0 - (person.bbox.y + person.bbox.h)
@@ -195,20 +254,14 @@ class PerceptionPipeline:
                     face_landmarks=face.face_landmarks if face else [],
                     depth_order=person_depth,
                     occlusion_hints=(parsed.occlusion_hints if parsed else []),
+                    body_parts=body_parts,
+                    face_regions=face_regions,
                 )
             )
 
         out.persons = persons
-        out.objects = [
-            ObjectFacts(
-                object_type=obj.object_type,
-                bbox=obj.bbox,
-                confidence=obj.confidence,
-                source=obj.source,
-                depth_order=obj.depth_order,
-            )
-            for obj in object_predictions
-        ]
+        out.objects = [ObjectFacts(o.object_type, o.bbox, o.confidence, o.source, o.depth_order) for o in object_predictions]
+
         if isinstance(frame, str):
             out.frame_size = detection_out.frame_size
             out.module_fallbacks["input_mode"] = "string_ref_fallback"
@@ -217,6 +270,7 @@ class PerceptionPipeline:
             h, w, _ = shape(tensor)
             out.frame_size = (w, h)
             out.module_fallbacks["input_mode"] = "frame_tensor"
+
         out.module_confidence = {
             "detector": max([p.bbox_confidence for p in out.persons], default=0.0),
             "pose": max([p.pose_confidence for p in out.persons], default=0.0),
@@ -228,11 +282,7 @@ class PerceptionPipeline:
 
     def analyze_video(self, frames: list[AssetFrame | list[list[list[float]]] | str], batch_size: int = 4) -> list[PerceptionOutput]:
         outputs: list[PerceptionOutput] = []
-        if not frames:
-            return outputs
-
         for start in range(0, len(frames), max(1, batch_size)):
-            chunk = frames[start : start + max(1, batch_size)]
-            for frame in chunk:
+            for frame in frames[start : start + max(1, batch_size)]:
                 outputs.append(self.analyze(frame))
         return outputs
