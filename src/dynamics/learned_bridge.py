@@ -30,18 +30,32 @@ class BaselineDynamicsTransitionModel(DynamicsTransitionModel):
             planner_context={"step_index": float(step_index)},
             memory=request.step_context.get("memory") if isinstance(request.step_context.get("memory"), VideoMemory) else None,
         )
+        graph_dim = len(request.graph_encoding.graph_embedding) if request.graph_encoding else 0
+        identity_dim = sum(len(v) for v in request.identity_embeddings.values())
+        memory_signal = float(sum(1 for v in request.memory_channels.values() if v))
+        confidence_boost = min(0.15, 0.01 * graph_dim + 0.005 * identity_dim + 0.03 * memory_signal)
+        used_channels = [name for name, payload in request.memory_channels.items() if payload]
         return DynamicsTransitionOutput(
             delta=delta,
-            confidence=max(0.0, min(1.0, 1.0 - 0.1 * metrics.constraint_violations)),
+            confidence=max(0.0, min(1.0, 1.0 - 0.1 * metrics.constraint_violations + confidence_boost)),
             diagnostics={
                 "delta_magnitude": metrics.delta_magnitude,
                 "temporal_smoothness_proxy": metrics.temporal_smoothness_proxy,
                 "constraint_violations": float(metrics.constraint_violations),
+                "graph_encoding_signal": float(graph_dim),
+                "identity_signal": float(identity_dim),
+                "memory_channel_signal": memory_signal,
             },
             metadata={
                 "backend": "deterministic_graph_delta_predictor",
                 "delta_magnitude": metrics.delta_magnitude,
                 "smoothness": metrics.temporal_smoothness_proxy,
+                "learned_ready_usage": {
+                    "graph_encoding_used": bool(request.graph_encoding and request.graph_encoding.graph_embedding),
+                    "identity_embeddings_used": bool(request.identity_embeddings),
+                    "memory_channels_used": used_channels,
+                    "ignored_fields": [name for name, payload in request.memory_channels.items() if not payload],
+                },
             },
         )
 

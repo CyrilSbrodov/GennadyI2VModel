@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from evaluation.contracts import (
     build_graph_eval_payload,
+    build_hidden_reconstruction_payload,
     build_patch_eval_payload,
     build_temporal_eval_payload,
     build_text_eval_payload,
     graph_transition_eval,
+    hidden_region_reconstruction_eval,
     patch_synthesis_eval,
     temporal_consistency_eval,
     text_action_alignment_eval,
@@ -46,6 +48,7 @@ def evaluate_stage(result: StageResult) -> dict[str, float]:
         eval_payloads.append(graph_transition_eval(build_graph_eval_payload(contract_payload)))
     if isinstance(contract_payload, dict) and stage == "patch_synthesis":
         eval_payloads.append(patch_synthesis_eval(build_patch_eval_payload(contract_payload)))
+        eval_payloads.append(hidden_region_reconstruction_eval(build_hidden_reconstruction_payload(contract_payload)))
     if isinstance(contract_payload, dict) and stage == "temporal_refinement":
         eval_payloads.append(temporal_consistency_eval(build_temporal_eval_payload(contract_payload)))
     if not eval_payloads:

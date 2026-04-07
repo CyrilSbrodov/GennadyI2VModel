@@ -100,7 +100,29 @@ def semantic_parity_checks(
     output: object,
     changed_regions_count: int | None = None,
 ) -> list[str]:
+    def _stable_json_size(value: object) -> int:
+        import json
+
+        try:
+            return len(json.dumps(value, sort_keys=True))
+        except Exception:
+            return len(str(value))
+
     issues: list[str] = []
+    if stage == "text":
+        parsed = contract.get("parsed_actions", []) if isinstance(contract, dict) else []
+        embedding = contract.get("action_embedding", []) if isinstance(contract, dict) else []
+        if isinstance(parsed, list) and not parsed:
+            issues.append("structured_action_tokens_empty")
+        if parsed and not embedding:
+            issues.append("embedding_empty_for_non_empty_actions")
+        if isinstance(parsed, list) and len(parsed) > 1 and not contract.get("temporal_decomposition"):
+            issues.append("decomposition_hints_missing_for_multi_action_input")
+        target_refs = [a for a in parsed if isinstance(a, dict) and (a.get("target_entity") or a.get("target_object"))]
+        target_entities = contract.get("target_entities", []) if isinstance(contract, dict) else []
+        target_objects = contract.get("target_objects", []) if isinstance(contract, dict) else []
+        if target_refs and not (target_entities or target_objects):
+            issues.append("target_hints_missing_despite_action_targets")
     if stage == "dynamics":
         delta_contract = contract.get("delta_contract", {}) if isinstance(contract, dict) else {}
         if isinstance(delta_contract, dict):
@@ -112,6 +134,21 @@ def semantic_parity_checks(
             region_mode = contract.get("region_transition_mode", {})
             if affected and (not isinstance(region_mode, dict) or not region_mode):
                 issues.append("region_transition_mode_missing_for_affected_regions")
+            state_after = contract.get("state_after", {}) if isinstance(contract, dict) else {}
+            if affected and (not isinstance(state_after, dict) or not state_after):
+                issues.append("state_after_missing_for_non_empty_delta")
+            before_graph = contract.get("graph_before", {}) if isinstance(contract, dict) else {}
+            after_graph = contract.get("graph_after", {}) if isinstance(contract, dict) else {}
+            has_non_empty_delta = bool(affected or delta_contract.get("pose_deltas") or delta_contract.get("interaction_deltas") or delta_contract.get("visibility_deltas"))
+            if has_non_empty_delta and _stable_json_size(before_graph) == _stable_json_size(after_graph):
+                issues.append("graph_serialization_unchanged_despite_non_empty_delta")
+            visibility = delta_contract.get("predicted_visibility_changes", {})
+            if isinstance(visibility, dict) and visibility and not state_after:
+                issues.append("visibility_delta_without_state_after_transition")
+            if isinstance(region_mode, dict):
+                missing_modes = [r for r in affected if r not in region_mode]
+                if missing_modes:
+                    issues.append("region_transition_mode_missing_specific_regions")
     if stage == "patch":
         selected = str(contract.get("selected_strategy", "")) if isinstance(contract, dict) else ""
         patch_obj = getattr(output, "rgb_patch", None)
