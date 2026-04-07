@@ -25,8 +25,16 @@ class BaselinePatchSynthesisModel(PatchSynthesisModel):
             region=request.region,
         )
         return PatchSynthesisOutput(
+            region=request.region,
             rgb_patch=rendered.rgb_patch,
+            alpha_mask=rendered.alpha_mask,
+            height=rendered.height,
+            width=rendered.width,
+            channels=rendered.channels,
             confidence=rendered.confidence,
+            z_index=rendered.z_index,
+            debug_trace=rendered.debug_trace,
+            execution_trace=rendered.execution_trace,
             uncertainty_map=rendered.uncertainty_map,
             metadata={
                 "debug_trace": rendered.debug_trace,

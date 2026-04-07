@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from evaluation.contracts import (
+    build_graph_eval_payload,
+    build_patch_eval_payload,
+    build_temporal_eval_payload,
+    build_text_eval_payload,
     graph_transition_eval,
     patch_synthesis_eval,
     temporal_consistency_eval,
@@ -33,12 +37,24 @@ def evaluate_stage(result: StageResult) -> dict[str, float]:
         "temporal_consistency": result.train_metrics.get("progress", 0.0),
         "identity_preservation": 1.0 - result.train_metrics.get("loss", 1.0),
     }
-    eval_payloads = [
-        text_action_alignment_eval({"alignment_score": result.val_metrics.get("score", 0.0)}),
-        graph_transition_eval({"delta_match": result.val_metrics.get("score", 0.0)}),
-        patch_synthesis_eval({"patch_quality": result.val_metrics.get("score", 0.0), "identity_consistency": base["identity_preservation"]}),
-        temporal_consistency_eval({"temporal_drift": 1.0 - base["temporal_consistency"]}),
-    ]
+    contract_payload = result.val_metrics.get("contract_payload")
+    stage = result.stage_name
+    eval_payloads = []
+    if isinstance(contract_payload, dict) and stage == "text_encoder":
+        eval_payloads.append(text_action_alignment_eval(build_text_eval_payload(contract_payload)))
+    if isinstance(contract_payload, dict) and stage == "dynamics_transition":
+        eval_payloads.append(graph_transition_eval(build_graph_eval_payload(contract_payload)))
+    if isinstance(contract_payload, dict) and stage == "patch_synthesis":
+        eval_payloads.append(patch_synthesis_eval(build_patch_eval_payload(contract_payload)))
+    if isinstance(contract_payload, dict) and stage == "temporal_refinement":
+        eval_payloads.append(temporal_consistency_eval(build_temporal_eval_payload(contract_payload)))
+    if not eval_payloads:
+        eval_payloads = [
+            text_action_alignment_eval({"alignment_score": result.val_metrics.get("score", 0.0)}),
+            graph_transition_eval({"delta_match": result.val_metrics.get("score", 0.0)}),
+            patch_synthesis_eval({"patch_quality": result.val_metrics.get("score", 0.0), "identity_consistency": base["identity_preservation"]}),
+            temporal_consistency_eval({"temporal_drift": 1.0 - base["temporal_consistency"]}),
+        ]
     for payload in eval_payloads:
         base.update(payload.metrics)
     return base
@@ -67,8 +83,8 @@ def train_learned_stage(stage_name: str, config: TrainingConfig, backend: str = 
     result = runner.run(scaffold)
     return StageResult(
         stage_name=result.stage_name,
-        train_metrics={"progress": 0.5, "loss": 0.5},
-        val_metrics={"score": 0.5},
+        train_metrics=result.train_metrics or {"progress": 0.5, "loss": 0.5},
+        val_metrics=result.val_metrics or {"score": 0.5},
         checkpoint_path=result.checkpoint_path,
     )
 
