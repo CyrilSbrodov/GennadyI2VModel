@@ -247,6 +247,7 @@ class HiddenRegionSlot:
     evidence_score: float = 0.0
     retrieval_priority: float = 0.0
     last_transition: str = "stable"
+    last_transition_reason: str = "none"
 
 
 @dataclass(slots=True)
@@ -267,3 +268,4 @@ class VideoMemory:
     texture_patches: dict[str, TexturePatchMemory] = field(default_factory=dict)
     region_descriptors: dict[str, RegionDescriptor] = field(default_factory=dict)
     hidden_region_slots: dict[str, HiddenRegionSlot] = field(default_factory=dict)
+    last_transition_context: dict[str, str] = field(default_factory=dict)

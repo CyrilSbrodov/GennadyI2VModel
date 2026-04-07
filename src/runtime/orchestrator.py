@@ -112,7 +112,17 @@ class GennadyEngine:
 
             scene_graph = apply_delta(scene_graph, delta)
             memory = self.memory_manager.update_from_graph(memory, scene_graph)
-            memory = self.memory_manager.update_from_frame(memory, stable_frame, scene_graph)
+            transition_context = {
+                "transition_phase": delta.transition_phase,
+                "visibility_phase": delta.state_after.get("visibility_phase", "stable"),
+                "garment_phase": delta.state_after.get("garment_phase", "worn"),
+                "pose_phase": delta.state_after.get("pose_phase", "stable"),
+            }
+            if delta.affected_regions:
+                primary_region = delta.affected_regions[0]
+                transition_context["region_transition_mode"] = delta.region_transition_mode.get(primary_region, "stable")
+            memory.last_transition_context = transition_context
+            memory = self.memory_manager.update_from_frame(memory, stable_frame, scene_graph, transition_context=transition_context)
 
             frames.append(stable_frame)
             current_frame = stable_frame
