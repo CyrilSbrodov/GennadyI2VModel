@@ -66,40 +66,54 @@ class StageScaffoldResult:
     train_metrics: dict[str, float] = field(default_factory=dict)
     val_metrics: dict[str, float] = field(default_factory=dict)
     samples_processed: int = 0
-    ingestion_warnings: list[str] = field(default_factory=list)
+    ingestion_warnings: list[dict[str, object]] = field(default_factory=list)
 
 
 class LearnedStageDatasetRouter:
     @staticmethod
-    def _warn(warnings: list[str], issue: str) -> None:
-        warnings.append(issue)
+    def _warn(
+        warnings: list[dict[str, object]],
+        issue: str,
+        *,
+        source: str = "dataset_router",
+        severity: str = "warning",
+        field_path: str | None = None,
+    ) -> None:
+        warnings.append(
+            {
+                "source": source,
+                "issue": issue,
+                "severity": severity,
+                "field_path": field_path,
+            }
+        )
 
     @staticmethod
     def _clamp(value: float, low: float, high: float) -> float:
         return max(low, min(high, value))
 
     @staticmethod
-    def _as_float(value: object, fallback: float, *, warnings: list[str], issue: str) -> float:
+    def _as_float(value: object, fallback: float, *, warnings: list[dict[str, object]], issue: str, field_path: str) -> float:
         if isinstance(value, (int, float)):
             return float(value)
-        LearnedStageDatasetRouter._warn(warnings, issue)
+        LearnedStageDatasetRouter._warn(warnings, issue, field_path=field_path)
         return fallback
 
     @staticmethod
-    def _sanitize_label(value: object, fallback: str, *, warnings: list[str], issue: str) -> str:
+    def _sanitize_label(value: object, fallback: str, *, warnings: list[dict[str, object]], issue: str, field_path: str) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip().lower().replace(" ", "_")
-        LearnedStageDatasetRouter._warn(warnings, issue)
+        LearnedStageDatasetRouter._warn(warnings, issue, field_path=field_path)
         return fallback
 
     @staticmethod
-    def _coerce_bbox(data: object, fallback: BBox | None = None, *, warnings: list[str] | None = None, scope: str = "bbox") -> BBox:
+    def _coerce_bbox(data: object, fallback: BBox | None = None, *, warnings: list[dict[str, object]] | None = None, scope: str = "bbox") -> BBox:
         local_warnings = warnings if warnings is not None else []
         if isinstance(data, dict):
-            x = LearnedStageDatasetRouter._as_float(data.get("x", 0.1), 0.1, warnings=local_warnings, issue=f"{scope}.x_invalid_fallback")
-            y = LearnedStageDatasetRouter._as_float(data.get("y", 0.1), 0.1, warnings=local_warnings, issue=f"{scope}.y_invalid_fallback")
-            w = LearnedStageDatasetRouter._as_float(data.get("w", 0.6), 0.6, warnings=local_warnings, issue=f"{scope}.w_invalid_fallback")
-            h = LearnedStageDatasetRouter._as_float(data.get("h", 0.8), 0.8, warnings=local_warnings, issue=f"{scope}.h_invalid_fallback")
+            x = LearnedStageDatasetRouter._as_float(data.get("x", 0.1), 0.1, warnings=local_warnings, issue=f"{scope}.x_invalid_fallback", field_path=f"{scope}.x")
+            y = LearnedStageDatasetRouter._as_float(data.get("y", 0.1), 0.1, warnings=local_warnings, issue=f"{scope}.y_invalid_fallback", field_path=f"{scope}.y")
+            w = LearnedStageDatasetRouter._as_float(data.get("w", 0.6), 0.6, warnings=local_warnings, issue=f"{scope}.w_invalid_fallback", field_path=f"{scope}.w")
+            h = LearnedStageDatasetRouter._as_float(data.get("h", 0.8), 0.8, warnings=local_warnings, issue=f"{scope}.h_invalid_fallback", field_path=f"{scope}.h")
             clamped = BBox(
                 LearnedStageDatasetRouter._clamp(x, 0.0, 1.0),
                 LearnedStageDatasetRouter._clamp(y, 0.0, 1.0),
@@ -107,18 +121,18 @@ class LearnedStageDatasetRouter:
                 LearnedStageDatasetRouter._clamp(h, 0.0, 1.0),
             )
             if (x, y, w, h) != (clamped.x, clamped.y, clamped.w, clamped.h):
-                LearnedStageDatasetRouter._warn(local_warnings, f"{scope}.clamped")
+                LearnedStageDatasetRouter._warn(local_warnings, f"{scope}.clamped", field_path=scope)
             return clamped
-        LearnedStageDatasetRouter._warn(local_warnings, f"{scope}.missing_fallback")
+        LearnedStageDatasetRouter._warn(local_warnings, f"{scope}.missing_fallback", field_path=scope)
         return fallback or BBox(0.1, 0.1, 0.6, 0.8)
 
     @staticmethod
-    def _coerce_region(region_id: str, payload: object, reason: str = "motion", *, warnings: list[str] | None = None, scope: str = "region") -> RegionRef:
+    def _coerce_region(region_id: str, payload: object, reason: str = "motion", *, warnings: list[dict[str, object]] | None = None, scope: str = "region") -> RegionRef:
         local_warnings = warnings if warnings is not None else []
         bbox = LearnedStageDatasetRouter._coerce_bbox(payload if isinstance(payload, dict) else {}, warnings=local_warnings, scope=f"{scope}.bbox")
         resolved_reason = reason
         if isinstance(payload, dict):
-            resolved_reason = LearnedStageDatasetRouter._sanitize_label(payload.get("reason", reason), reason, warnings=local_warnings, issue=f"{scope}.reason_sanitized")
+            resolved_reason = LearnedStageDatasetRouter._sanitize_label(payload.get("reason", reason), reason, warnings=local_warnings, issue=f"{scope}.reason_sanitized", field_path=f"{scope}.reason")
             region_id = str(payload.get("region_id", region_id))
         return RegionRef(region_id=region_id, bbox=bbox, reason=resolved_reason)
 
@@ -166,9 +180,35 @@ class LearnedStageDatasetRouter:
                         if not isinstance(kp, dict):
                             LearnedStageDatasetRouter._warn(local_warnings, f"{key}.{pid}.keypoint_{bp_idx}_{k_idx}_invalid_skipped")
                             continue
-                        kx = LearnedStageDatasetRouter._clamp(LearnedStageDatasetRouter._as_float(kp.get("x", 0.0), 0.0, warnings=local_warnings, issue=f"{key}.{pid}.keypoint_{bp_idx}_{k_idx}.x_invalid_fallback"), 0.0, 1.0)
-                        ky = LearnedStageDatasetRouter._clamp(LearnedStageDatasetRouter._as_float(kp.get("y", 0.0), 0.0, warnings=local_warnings, issue=f"{key}.{pid}.keypoint_{bp_idx}_{k_idx}.y_invalid_fallback"), 0.0, 1.0)
-                        conf_raw = LearnedStageDatasetRouter._as_float(kp.get("confidence", 0.0), 0.0, warnings=local_warnings, issue=f"{key}.{pid}.keypoint_{bp_idx}_{k_idx}.confidence_invalid_fallback")
+                        kx = LearnedStageDatasetRouter._clamp(
+                            LearnedStageDatasetRouter._as_float(
+                                kp.get("x", 0.0),
+                                0.0,
+                                warnings=local_warnings,
+                                issue=f"{key}.{pid}.keypoint_{bp_idx}_{k_idx}.x_invalid_fallback",
+                                field_path=f"{key}.{pid}.keypoint_{bp_idx}_{k_idx}.x",
+                            ),
+                            0.0,
+                            1.0,
+                        )
+                        ky = LearnedStageDatasetRouter._clamp(
+                            LearnedStageDatasetRouter._as_float(
+                                kp.get("y", 0.0),
+                                0.0,
+                                warnings=local_warnings,
+                                issue=f"{key}.{pid}.keypoint_{bp_idx}_{k_idx}.y_invalid_fallback",
+                                field_path=f"{key}.{pid}.keypoint_{bp_idx}_{k_idx}.y",
+                            ),
+                            0.0,
+                            1.0,
+                        )
+                        conf_raw = LearnedStageDatasetRouter._as_float(
+                            kp.get("confidence", 0.0),
+                            0.0,
+                            warnings=local_warnings,
+                            issue=f"{key}.{pid}.keypoint_{bp_idx}_{k_idx}.confidence_invalid_fallback",
+                            field_path=f"{key}.{pid}.keypoint_{bp_idx}_{k_idx}.confidence",
+                        )
                         conf = LearnedStageDatasetRouter._clamp(conf_raw, 0.0, 1.0)
                         if conf != conf_raw:
                             LearnedStageDatasetRouter._warn(local_warnings, f"{key}.{pid}.keypoint_{bp_idx}_{k_idx}.confidence_clamped")
@@ -176,14 +216,14 @@ class LearnedStageDatasetRouter:
                     body_parts.append(
                         BodyPartNode(
                             part_id=str(bp.get("part_id", f"{pid}_part_{bp_idx}")),
-                            part_type=LearnedStageDatasetRouter._sanitize_label(bp.get("part_type", "unknown"), "unknown", warnings=local_warnings, issue=f"{key}.{pid}.body_part_{bp_idx}.part_type_sanitized"),
+                            part_type=LearnedStageDatasetRouter._sanitize_label(bp.get("part_type", "unknown"), "unknown", warnings=local_warnings, issue=f"{key}.{pid}.body_part_{bp_idx}.part_type_sanitized", field_path=f"{key}.{pid}.body_part_{bp_idx}.part_type"),
                             keypoints=keypoints,
                             mask_ref=bp.get("mask_ref"),
-                            visibility=LearnedStageDatasetRouter._sanitize_label(bp.get("visibility", "unknown"), "unknown", warnings=local_warnings, issue=f"{key}.{pid}.body_part_{bp_idx}.visibility_sanitized"),
+                            visibility=LearnedStageDatasetRouter._sanitize_label(bp.get("visibility", "unknown"), "unknown", warnings=local_warnings, issue=f"{key}.{pid}.body_part_{bp_idx}.visibility_sanitized", field_path=f"{key}.{pid}.body_part_{bp_idx}.visibility"),
                             occluded_by=[str(v) for v in bp.get("occluded_by", []) if isinstance(v, str)],
-                            depth_order=LearnedStageDatasetRouter._as_float(bp.get("depth_order", 0.0), 0.0, warnings=local_warnings, issue=f"{key}.{pid}.body_part_{bp_idx}.depth_order_invalid_fallback"),
+                            depth_order=LearnedStageDatasetRouter._as_float(bp.get("depth_order", 0.0), 0.0, warnings=local_warnings, issue=f"{key}.{pid}.body_part_{bp_idx}.depth_order_invalid_fallback", field_path=f"{key}.{pid}.body_part_{bp_idx}.depth_order"),
                             canonical_slot=str(bp.get("canonical_slot", "")),
-                            confidence=LearnedStageDatasetRouter._clamp(LearnedStageDatasetRouter._as_float(bp.get("confidence", 0.0), 0.0, warnings=local_warnings, issue=f"{key}.{pid}.body_part_{bp_idx}.confidence_invalid_fallback"), 0.0, 1.0),
+                            confidence=LearnedStageDatasetRouter._clamp(LearnedStageDatasetRouter._as_float(bp.get("confidence", 0.0), 0.0, warnings=local_warnings, issue=f"{key}.{pid}.body_part_{bp_idx}.confidence_invalid_fallback", field_path=f"{key}.{pid}.body_part_{bp_idx}.confidence"), 0.0, 1.0),
                             source=str(bp.get("source", "dataset")),
                             frame_index=int(bp.get("frame_index", raw.get("frame_index", frame_index))),
                             timestamp=float(bp["timestamp"]) if isinstance(bp.get("timestamp"), (int, float)) else None,
@@ -192,14 +232,14 @@ class LearnedStageDatasetRouter:
                 garments = [
                     GarmentNode(
                         garment_id=str(g.get("garment_id", f"{pid}_garment_{g_idx}")),
-                        garment_type=LearnedStageDatasetRouter._sanitize_label(g.get("garment_type", g.get("type", "unknown")), "unknown", warnings=local_warnings, issue=f"{key}.{pid}.garment_{g_idx}.garment_type_sanitized"),
+                        garment_type=LearnedStageDatasetRouter._sanitize_label(g.get("garment_type", g.get("type", "unknown")), "unknown", warnings=local_warnings, issue=f"{key}.{pid}.garment_{g_idx}.garment_type_sanitized", field_path=f"{key}.{pid}.garment_{g_idx}.garment_type"),
                         mask_ref=g.get("mask_ref"),
                         attachment_targets=[str(v) for v in g.get("attachment_targets", []) if isinstance(v, str)],
                         coverage_targets=[str(v) for v in g.get("coverage_targets", []) if isinstance(v, str)],
-                        garment_state=LearnedStageDatasetRouter._sanitize_label(g.get("garment_state", g.get("state", "worn")), "worn", warnings=local_warnings, issue=f"{key}.{pid}.garment_{g_idx}.garment_state_sanitized"),
-                        visibility=LearnedStageDatasetRouter._sanitize_label(g.get("visibility", "unknown"), "unknown", warnings=local_warnings, issue=f"{key}.{pid}.garment_{g_idx}.visibility_sanitized"),
+                        garment_state=LearnedStageDatasetRouter._sanitize_label(g.get("garment_state", g.get("state", "worn")), "worn", warnings=local_warnings, issue=f"{key}.{pid}.garment_{g_idx}.garment_state_sanitized", field_path=f"{key}.{pid}.garment_{g_idx}.garment_state"),
+                        visibility=LearnedStageDatasetRouter._sanitize_label(g.get("visibility", "unknown"), "unknown", warnings=local_warnings, issue=f"{key}.{pid}.garment_{g_idx}.visibility_sanitized", field_path=f"{key}.{pid}.garment_{g_idx}.visibility"),
                         appearance_ref=g.get("appearance_ref"),
-                        confidence=LearnedStageDatasetRouter._clamp(LearnedStageDatasetRouter._as_float(g.get("confidence", 0.0), 0.0, warnings=local_warnings, issue=f"{key}.{pid}.garment_{g_idx}.confidence_invalid_fallback"), 0.0, 1.0),
+                        confidence=LearnedStageDatasetRouter._clamp(LearnedStageDatasetRouter._as_float(g.get("confidence", 0.0), 0.0, warnings=local_warnings, issue=f"{key}.{pid}.garment_{g_idx}.confidence_invalid_fallback", field_path=f"{key}.{pid}.garment_{g_idx}.confidence"), 0.0, 1.0),
                         source=str(g.get("source", "dataset")),
                         frame_index=int(g.get("frame_index", raw.get("frame_index", frame_index))),
                         timestamp=float(g["timestamp"]) if isinstance(g.get("timestamp"), (int, float)) else None,
@@ -215,7 +255,7 @@ class LearnedStageDatasetRouter:
                         mask_ref=p.get("mask_ref"),
                         body_parts=body_parts,
                         garments=garments,
-                        confidence=LearnedStageDatasetRouter._clamp(LearnedStageDatasetRouter._as_float(p.get("confidence", 0.0), 0.0, warnings=local_warnings, issue=f"{key}.{pid}.confidence_invalid_fallback"), 0.0, 1.0),
+                        confidence=LearnedStageDatasetRouter._clamp(LearnedStageDatasetRouter._as_float(p.get("confidence", 0.0), 0.0, warnings=local_warnings, issue=f"{key}.{pid}.confidence_invalid_fallback", field_path=f"{key}.{pid}.confidence"), 0.0, 1.0),
                         source=str(p.get("source", "dataset")),
                         frame_index=int(p.get("frame_index", raw.get("frame_index", frame_index))),
                         timestamp=float(p["timestamp"]) if isinstance(p.get("timestamp"), (int, float)) else None,
@@ -224,10 +264,10 @@ class LearnedStageDatasetRouter:
             objects = [
                 SceneObjectNode(
                     object_id=str(o.get("object_id", f"obj_{track}_{idx}")),
-                    object_type=LearnedStageDatasetRouter._sanitize_label(o.get("object_type", "unknown"), "unknown", warnings=local_warnings, issue=f"{key}.object_{idx}.type_sanitized"),
+                    object_type=LearnedStageDatasetRouter._sanitize_label(o.get("object_type", "unknown"), "unknown", warnings=local_warnings, issue=f"{key}.object_{idx}.type_sanitized", field_path=f"{key}.object_{idx}.object_type"),
                     bbox=LearnedStageDatasetRouter._coerce_bbox(o.get("bbox"), warnings=local_warnings, scope=f"{key}.object_{idx}.bbox"),
                     mask_ref=o.get("mask_ref"),
-                    confidence=LearnedStageDatasetRouter._clamp(LearnedStageDatasetRouter._as_float(o.get("confidence", 0.0), 0.0, warnings=local_warnings, issue=f"{key}.object_{idx}.confidence_invalid_fallback"), 0.0, 1.0),
+                    confidence=LearnedStageDatasetRouter._clamp(LearnedStageDatasetRouter._as_float(o.get("confidence", 0.0), 0.0, warnings=local_warnings, issue=f"{key}.object_{idx}.confidence_invalid_fallback", field_path=f"{key}.object_{idx}.confidence"), 0.0, 1.0),
                     source=str(o.get("source", "dataset")),
                     frame_index=int(o.get("frame_index", raw.get("frame_index", frame_index))),
                     timestamp=float(o["timestamp"]) if isinstance(o.get("timestamp"), (int, float)) else None,
@@ -238,9 +278,9 @@ class LearnedStageDatasetRouter:
             relations = [
                 RelationEdge(
                     source=str(r.get("source", "")),
-                    relation=LearnedStageDatasetRouter._sanitize_label(r.get("relation", "near"), "near", warnings=local_warnings, issue=f"{key}.relation.relation_sanitized"),
+                    relation=LearnedStageDatasetRouter._sanitize_label(r.get("relation", "near"), "near", warnings=local_warnings, issue=f"{key}.relation.relation_sanitized", field_path=f"{key}.relation.relation"),
                     target=str(r.get("target", "")),
-                    confidence=LearnedStageDatasetRouter._clamp(LearnedStageDatasetRouter._as_float(r.get("confidence", 0.0), 0.0, warnings=local_warnings, issue=f"{key}.relation.confidence_invalid_fallback"), 0.0, 1.0),
+                    confidence=LearnedStageDatasetRouter._clamp(LearnedStageDatasetRouter._as_float(r.get("confidence", 0.0), 0.0, warnings=local_warnings, issue=f"{key}.relation.confidence_invalid_fallback", field_path=f"{key}.relation.confidence"), 0.0, 1.0),
                     provenance=str(r.get("provenance", "dataset")),
                     frame_index=int(r.get("frame_index", raw.get("frame_index", frame_index))),
                     timestamp=float(r["timestamp"]) if isinstance(r.get("timestamp"), (int, float)) else None,
@@ -253,11 +293,11 @@ class LearnedStageDatasetRouter:
             if isinstance(frame_size_raw, list) and len(frame_size_raw) >= 2 and all(isinstance(v, (int, float)) for v in frame_size_raw[:2]):
                 frame_size = (max(1, int(frame_size_raw[0])), max(1, int(frame_size_raw[1])))
             else:
-                LearnedStageDatasetRouter._warn(local_warnings, f"{key}.global_context.frame_size_invalid_fallback")
+                LearnedStageDatasetRouter._warn(local_warnings, f"{key}.global_context.frame_size_invalid_fallback", field_path=f"{key}.global_context.frame_size")
             fps_raw = gc_raw.get("fps", 16)
             fps = int(fps_raw) if isinstance(fps_raw, (int, float)) and int(fps_raw) > 0 else 16
             if fps == 16 and fps_raw != 16:
-                LearnedStageDatasetRouter._warn(local_warnings, f"{key}.global_context.fps_invalid_fallback")
+                LearnedStageDatasetRouter._warn(local_warnings, f"{key}.global_context.fps_invalid_fallback", field_path=f"{key}.global_context.fps")
             context = GlobalSceneContext(
                 frame_size=frame_size,
                 fps=fps,
@@ -272,29 +312,57 @@ class LearnedStageDatasetRouter:
                 timestamp=float(raw["timestamp"]) if isinstance(raw.get("timestamp"), (int, float)) else None,
             )
             return graph
-        LearnedStageDatasetRouter._warn(local_warnings, f"{key}.missing_graph_fallback_base_graph")
+        LearnedStageDatasetRouter._warn(local_warnings, f"{key}.missing_graph_fallback_base_graph", field_path=key)
         return LearnedStageDatasetRouter._base_graph(frame_index, track)
 
     @staticmethod
-    def _coerce_delta(record: dict[str, object], before: SceneGraph, action_tokens: list[str], phase: str = "motion") -> GraphDelta:
+    def _coerce_delta(record: dict[str, object], before: SceneGraph, action_tokens: list[str], phase: str = "motion", *, warnings: list[dict[str, object]] | None = None) -> GraphDelta:
+        local_warnings = warnings if warnings is not None else []
         payload = record.get("delta", {})
         if isinstance(payload, dict):
-            revealed = [LearnedStageDatasetRouter._coerce_region(region_id=f"{before.persons[0].person_id}:revealed_{idx}", payload=item, reason="reveal") for idx, item in enumerate(payload.get("newly_revealed_regions", [])) if isinstance(item, dict)] if before.persons else []
-            occluded = [LearnedStageDatasetRouter._coerce_region(region_id=f"{before.persons[0].person_id}:occluded_{idx}", payload=item, reason="occlude") for idx, item in enumerate(payload.get("newly_occluded_regions", [])) if isinstance(item, dict)] if before.persons else []
+            def sanitize_dict(raw: object, scope: str) -> dict[str, float]:
+                if not isinstance(raw, dict):
+                    LearnedStageDatasetRouter._warn(local_warnings, f"{scope}.malformed_fallback_empty", field_path=scope)
+                    return {}
+                out: dict[str, float] = {}
+                for k, v in raw.items():
+                    out[str(k)] = LearnedStageDatasetRouter._as_float(v, 0.0, warnings=local_warnings, issue=f"{scope}.{k}_invalid_fallback", field_path=f"{scope}.{k}")
+                return out
+
+            def sanitize_state_dict(raw: object, scope: str) -> dict[str, str]:
+                if not isinstance(raw, dict):
+                    LearnedStageDatasetRouter._warn(local_warnings, f"{scope}.malformed_fallback_empty", field_path=scope)
+                    return {}
+                out: dict[str, str] = {}
+                for k, v in raw.items():
+                    out[str(k)] = LearnedStageDatasetRouter._sanitize_label(v, "unknown", warnings=local_warnings, issue=f"{scope}.{k}_sanitized", field_path=f"{scope}.{k}")
+                return out
+
+            revealed_raw = payload.get("newly_revealed_regions", [])
+            occluded_raw = payload.get("newly_occluded_regions", [])
+            if not isinstance(revealed_raw, list):
+                LearnedStageDatasetRouter._warn(local_warnings, "delta.newly_revealed_regions_malformed_fallback_empty", field_path="delta.newly_revealed_regions")
+                revealed_raw = []
+            if not isinstance(occluded_raw, list):
+                LearnedStageDatasetRouter._warn(local_warnings, "delta.newly_occluded_regions_malformed_fallback_empty", field_path="delta.newly_occluded_regions")
+                occluded_raw = []
+            revealed = [LearnedStageDatasetRouter._coerce_region(region_id=f"{before.persons[0].person_id}:revealed_{idx}", payload=item, reason="reveal", warnings=local_warnings, scope=f"delta.newly_revealed_regions[{idx}]") for idx, item in enumerate(revealed_raw) if isinstance(item, dict)] if before.persons else []
+            occluded = [LearnedStageDatasetRouter._coerce_region(region_id=f"{before.persons[0].person_id}:occluded_{idx}", payload=item, reason="occlude", warnings=local_warnings, scope=f"delta.newly_occluded_regions[{idx}]") for idx, item in enumerate(occluded_raw) if isinstance(item, dict)] if before.persons else []
             return GraphDelta(
-                pose_deltas={str(k): float(v) for k, v in payload.get("pose_deltas", {}).items()} if isinstance(payload.get("pose_deltas"), dict) else {},
-                interaction_deltas={str(k): float(v) for k, v in payload.get("interaction_deltas", {}).items()} if isinstance(payload.get("interaction_deltas"), dict) else {},
+                pose_deltas=sanitize_dict(payload.get("pose_deltas", {}), "delta.pose_deltas"),
+                interaction_deltas=sanitize_dict(payload.get("interaction_deltas", {}), "delta.interaction_deltas"),
                 semantic_reasons=[str(v) for v in payload.get("semantic_reasons", action_tokens)],
                 affected_entities=[str(v) for v in payload.get("affected_entities", [before.persons[0].person_id] if before.persons else [])],
                 affected_regions=[str(v) for v in payload.get("affected_regions", [])],
-                region_transition_mode={str(k): str(v) for k, v in payload.get("region_transition_mode", {}).items()} if isinstance(payload.get("region_transition_mode"), dict) else {},
-                predicted_visibility_changes={str(k): str(v) for k, v in payload.get("predicted_visibility_changes", {}).items()} if isinstance(payload.get("predicted_visibility_changes"), dict) else {},
-                state_before={str(k): str(v) for k, v in payload.get("state_before", {}).items()} if isinstance(payload.get("state_before"), dict) else {},
-                state_after={str(k): str(v) for k, v in payload.get("state_after", {}).items()} if isinstance(payload.get("state_after"), dict) else {},
-                transition_phase=str(payload.get("transition_phase", phase)),
+                region_transition_mode=sanitize_state_dict(payload.get("region_transition_mode", {}), "delta.region_transition_mode"),
+                predicted_visibility_changes=sanitize_state_dict(payload.get("predicted_visibility_changes", {}), "delta.predicted_visibility_changes"),
+                state_before=sanitize_state_dict(payload.get("state_before", {}), "delta.state_before"),
+                state_after=sanitize_state_dict(payload.get("state_after", {}), "delta.state_after"),
+                transition_phase=LearnedStageDatasetRouter._sanitize_label(payload.get("transition_phase", phase), phase, warnings=local_warnings, issue="delta.transition_phase_sanitized", field_path="delta.transition_phase"),
                 newly_revealed_regions=revealed,
                 newly_occluded_regions=occluded,
             )
+        LearnedStageDatasetRouter._warn(local_warnings, "delta.malformed_fallback_default_delta", field_path="delta")
         return GraphDelta(
             pose_deltas={"torso_pitch": 0.04},
             semantic_reasons=action_tokens or ["micro_adjust"],
@@ -414,12 +482,19 @@ class LearnedStageDatasetRouter:
                 break
         parsed: list[dict[str, object]] = [LearnedStageDatasetRouter._parse_stage_record(stage_name, rec, idx) for idx, rec in enumerate(filtered)]
         if skipped_non_dict and parsed:
-            parsed[0].setdefault("_ingestion_warnings", []).append(f"non_dict_records_skipped={skipped_non_dict}")
+            parsed[0].setdefault("_ingestion_warnings", []).append(
+                {
+                    "source": "dataset_router",
+                    "issue": f"non_dict_records_skipped={skipped_non_dict}",
+                    "severity": "warning",
+                    "field_path": "records",
+                }
+            )
         return parsed
 
     @staticmethod
     def _parse_stage_record(stage_name: str, record: dict[str, object], index: int) -> dict[str, object]:
-        warnings: list[str] = []
+        warnings: list[dict[str, object]] = []
         if stage_name == "text_encoder":
             text = str(record.get("text", record.get("prompt", f"micro adjust #{index}")))
             actions = LearnedStageDatasetRouter._coerce_action_steps(record.get("actions"), fallback_token="micro_adjust")
@@ -430,9 +505,9 @@ class LearnedStageDatasetRouter:
             if isinstance(record.get("graph_after"), dict):
                 graph_after = LearnedStageDatasetRouter._coerce_graph(record, "graph_after", frame_index=index + 1, track=f"dataset_{index}_after", warnings=warnings)
             else:
-                LearnedStageDatasetRouter._warn(warnings, "graph_after_missing_fallback_to_inference_path")
+                LearnedStageDatasetRouter._warn(warnings, "graph_after_missing_fallback_to_inference_path", field_path="graph_after")
             text_tokens = [a.type for a in LearnedStageDatasetRouter._coerce_action_steps(record.get("actions"), fallback_token="micro_adjust")]
-            delta = LearnedStageDatasetRouter._coerce_delta(record, before=before, action_tokens=text_tokens, phase=str(record.get("transition_phase", "motion")))
+            delta = LearnedStageDatasetRouter._coerce_delta(record, before=before, action_tokens=text_tokens, phase=str(record.get("transition_phase", "motion")), warnings=warnings)
             return {"graph_before": before, "ground_truth_graph_after": graph_after, "text_tokens": text_tokens, "delta": delta, "metadata": record.get("metadata", {}), "_ingestion_warnings": warnings}
         if stage_name == "patch_synthesis":
             graph = LearnedStageDatasetRouter._coerce_graph(record, "graph", frame_index=index, track=f"dataset_{index}", warnings=warnings)
@@ -441,7 +516,7 @@ class LearnedStageDatasetRouter:
             region = LearnedStageDatasetRouter._coerce_region(region_id, region_data, reason=str(record.get("reason", "motion")), warnings=warnings, scope="patch.region")
             frame = record.get("frame")
             if not isinstance(frame, list):
-                LearnedStageDatasetRouter._warn(warnings, "patch.frame_invalid_fallback")
+                LearnedStageDatasetRouter._warn(warnings, "patch.frame_invalid_fallback", field_path="frame")
                 base = 0.2 + 0.03 * index
                 frame = [[[base, base, base] for _ in range(32)] for _ in range(32)]
             return {
@@ -466,14 +541,14 @@ class LearnedStageDatasetRouter:
             else:
                 regions = []
             if not regions:
-                LearnedStageDatasetRouter._warn(warnings, "temporal.regions_missing_fallback_default_region")
+                LearnedStageDatasetRouter._warn(warnings, "temporal.regions_missing_fallback_default_region", field_path="regions")
                 regions = [RegionRef(region_id=f"{graph.persons[0].person_id if graph.persons else 'scene'}:region_0", bbox=BBox(0.2, 0.2, 0.2, 0.2), reason="temporal_drift")]
             frame_prev = record.get("frame_prev") if isinstance(record.get("frame_prev"), list) else [[[0.2, 0.2, 0.2] for _ in range(32)] for _ in range(32)]
             frame_cur = record.get("frame_cur") if isinstance(record.get("frame_cur"), list) else [[[0.23, 0.2, 0.2] for _ in range(32)] for _ in range(32)]
             if not isinstance(record.get("frame_prev"), list):
-                LearnedStageDatasetRouter._warn(warnings, "temporal.frame_prev_invalid_fallback")
+                LearnedStageDatasetRouter._warn(warnings, "temporal.frame_prev_invalid_fallback", field_path="frame_prev")
             if not isinstance(record.get("frame_cur"), list):
-                LearnedStageDatasetRouter._warn(warnings, "temporal.frame_cur_invalid_fallback")
+                LearnedStageDatasetRouter._warn(warnings, "temporal.frame_cur_invalid_fallback", field_path="frame_cur")
             return {
                 "graph": graph,
                 "frame_prev": frame_prev,
@@ -522,24 +597,55 @@ def _validate_contract_fields(payload: dict[str, object], required_fields: list[
     return [name for name in required_fields if name not in payload]
 
 
-def _text_semantic_checks(contract: dict[str, object]) -> list[str]:
-    issues: list[str] = []
-    parsed = contract.get("parsed_actions", [])
-    embedding = contract.get("action_embedding", [])
-    if not parsed:
-        issues.append("structured_action_tokens_empty")
-    if parsed and not embedding:
-        issues.append("embedding_empty_for_non_empty_actions")
-    if isinstance(parsed, list) and len(parsed) > 1 and not contract.get("temporal_decomposition"):
-        issues.append("decomposition_hints_missing_for_multi_action_input")
-    has_targets = isinstance(parsed, list) and any(isinstance(a, dict) and (a.get("target_entity") or a.get("target_object")) for a in parsed)
-    if has_targets and not (contract.get("target_entities") or contract.get("target_objects")):
-        issues.append("target_hints_missing_despite_action_targets")
-    return issues
+def _build_parity_result(**kwargs: object) -> dict[str, object]:
+    from learned.parity import build_parity_result
+
+    return build_parity_result(**kwargs)
 
 
-def _empty_parity_result() -> dict[str, list[str]]:
-    return {"errors": [], "warnings": [], "traces": []}
+def _empty_structured_parity() -> dict[str, list[str]]:
+    from learned.parity import empty_structured_parity
+
+    return empty_structured_parity()
+
+
+def _build_checkpoint_payload(
+    *,
+    stage_name: str,
+    backend_name: str,
+    backend_config: dict[str, str],
+    contract_version: str,
+    dataset_source: str,
+    mean_score: float,
+    samples_processed: int,
+    expected_inputs: list[str],
+    expected_outputs: list[str],
+    last_contract: dict[str, object],
+    eval_summary: dict[str, object],
+    parity_summary: dict[str, object],
+    warnings_or_fallbacks: list[dict[str, object]],
+    stage_fields: dict[str, object] | None = None,
+) -> dict[str, object]:
+    payload = {
+        "stage_name": stage_name,
+        "backend_name": backend_name,
+        "resolved_backend_config": backend_config,
+        "schema_version": "learned_ready.v2",
+        "contract_version": contract_version,
+        "dataset_source": dataset_source,
+        "train_metrics": {"progress": 1.0, "score_mean": mean_score},
+        "val_metrics": {f"{stage_name}_mean": mean_score},
+        "samples_processed": samples_processed,
+        "expected_inputs": expected_inputs,
+        "expected_outputs": expected_outputs,
+        "contract_payload_shape": {"keys": sorted(last_contract.keys())},
+        "eval_summary": eval_summary,
+        "parity_summary": parity_summary,
+        "warnings_or_fallbacks": warnings_or_fallbacks,
+    }
+    if stage_fields:
+        payload.update(stage_fields)
+    return payload
 
 
 class TextEncoderStageRunner(_BaseStageRunner):
@@ -548,7 +654,7 @@ class TextEncoderStageRunner(_BaseStageRunner):
         scores: list[float] = []
         last_contract: dict[str, object] = {}
         text_parity_log: list[dict[str, object]] = []
-        ingestion_warnings: list[str] = []
+        ingestion_warnings: list[dict[str, object]] = []
         for sample in samples:
             encoded = self.backends.text_encoder.encode(str(sample["text"]))
             actions = sample.get("actions") or [ActionStep(type="micro_adjust", priority=1)]
@@ -556,34 +662,36 @@ class TextEncoderStageRunner(_BaseStageRunner):
             last_contract = contract
             eval_payload = build_text_eval_payload(contract)
             scores.append(text_action_alignment_eval(eval_payload).metrics["alignment_score"])
-            missing = _validate_contract_fields(contract, ["text", "parsed_actions", "action_embedding", "target_entities", "target_objects", "temporal_decomposition", "constraints"])
-            semantic_text = _text_semantic_checks(contract)
-            parity = _empty_parity_result()
-            parity["errors"].extend([f"missing_field:{m}" for m in missing])
-            parity["warnings"].extend(semantic_text)
+            parity = _build_parity_result(
+                contract=contract,
+                required_fields=["text", "parsed_actions", "action_embedding", "target_entities", "target_objects", "temporal_decomposition", "constraints"],
+                stage="text",
+                request={"text": sample["text"], "actions": actions},
+                output=encoded,
+            )
             text_parity_log.append(parity)
-            ingestion_warnings.extend([str(w) for w in sample.get("_ingestion_warnings", []) if isinstance(w, str)])
+            ingestion_warnings.extend([w for w in sample.get("_ingestion_warnings", []) if isinstance(w, dict)])
+        mean_score = (sum(scores) / len(scores)) if scores else 0.0
         ckpt = self._write_checkpoint(
             config,
-            {
-                "stage_name": "text_encoder",
-                "backend_name": self.backends.backend_names.get("text_encoder", self.backend),
-                "resolved_backend_config": self.backends.backend_names,
-                "schema_version": "learned_ready.v2",
-                "contract_version": "text_action_state.v1",
-                "dataset_source": config.dataset_path or "synthetic_router",
-                "train_metrics": {"progress": 1.0, "score_mean": (sum(scores) / len(scores)) if scores else 0.0},
-                "val_metrics": {"alignment_score_mean": (sum(scores) / len(scores)) if scores else 0.0},
-                "samples_processed": len(samples),
-                "expected_inputs": ["text", "scene_graph(optional)", "action_plan(optional)"],
-                "expected_outputs": ["action_embedding", "structured_action_tokens", "alignment"],
-                "contract_payload_shape": {"keys": sorted(last_contract.keys())},
-                "eval_summary": {"text_alignment_score": (sum(scores) / len(scores)) if scores else 0.0, "text_parity": text_parity_log[-1] if text_parity_log else {}},
-                "parity_summary": text_parity_log[-1] if text_parity_log else _empty_parity_result(),
-                "warnings_or_fallbacks": ingestion_warnings,
-            },
+            _build_checkpoint_payload(
+                stage_name="text_encoder",
+                backend_name=self.backends.backend_names.get("text_encoder", self.backend),
+                backend_config=self.backends.backend_names,
+                contract_version="text_action_state.v1",
+                dataset_source=config.dataset_path or "synthetic_router",
+                mean_score=mean_score,
+                samples_processed=len(samples),
+                expected_inputs=["text", "scene_graph(optional)", "action_plan(optional)"],
+                expected_outputs=["action_embedding", "structured_action_tokens", "alignment"],
+                last_contract=last_contract,
+                eval_summary={"text_alignment_score": mean_score, "text_parity": text_parity_log[-1] if text_parity_log else {}},
+                parity_summary=text_parity_log[-1] if text_parity_log else _empty_structured_parity(),
+                warnings_or_fallbacks=ingestion_warnings,
+                stage_fields={"val_metrics": {"alignment_score_mean": mean_score}},
+            ),
         )
-        mean = sum(scores) / len(scores)
+        mean = mean_score
         return StageScaffoldResult(
             stage_name="text_encoder",
             backend=self.backend,
@@ -604,7 +712,7 @@ class DynamicsTransitionStageRunner(_BaseStageRunner):
         scores: list[float] = []
         last_contract: dict[str, object] = {}
         parity_log: list[dict[str, object]] = []
-        warnings_or_fallbacks: list[str] = []
+        warnings_or_fallbacks: list[dict[str, object]] = []
         for idx, sample in enumerate(samples):
             before = sample["graph_before"]
             memory = mm.initialize(before)
@@ -625,7 +733,7 @@ class DynamicsTransitionStageRunner(_BaseStageRunner):
             if not predicted_after:
                 from copy import deepcopy
                 predicted_after = apply_delta(deepcopy(before), out.delta)
-                warnings_or_fallbacks.append(f"sample_{idx}:graph_after_fallback_to_apply_delta")
+                warnings_or_fallbacks.append({"source": "dynamics_runner", "issue": "graph_after_fallback_to_apply_delta", "severity": "warning", "field_path": f"sample_{idx}.graph_after"})
             ground_truth_after = sample.get("ground_truth_graph_after") if isinstance(sample.get("ground_truth_graph_after"), SceneGraph) else predicted_after
             contract = build_graph_transition_contract(
                 before,
@@ -644,36 +752,35 @@ class DynamicsTransitionStageRunner(_BaseStageRunner):
             last_contract = contract
             eval_payload = build_graph_eval_payload(contract)
             scores.append(graph_transition_eval(eval_payload).metrics["transition_correctness"])
-            missing = _validate_contract_fields(contract, ["graph_before", "graph_after", "delta_contract", "transition_context"])
-            from learned.parity import semantic_parity_checks
-
-            semantic = semantic_parity_checks(stage="dynamics", contract=contract, request=request, output=out)
-            parity_entry = _empty_parity_result()
-            parity_entry["errors"].extend([f"missing_field:{m}" for m in missing])
+            parity_entry = _build_parity_result(
+                contract=contract,
+                required_fields=["graph_before", "graph_after", "delta_contract", "transition_context"],
+                stage="dynamics",
+                request=request,
+                output=out,
+            )
             for severity in ("errors", "warnings", "traces"):
-                parity_entry[severity].extend(semantic.get(severity, []))
-                warnings_or_fallbacks.extend([f"sample_{idx}:{severity}:{issue}" for issue in semantic.get(severity, [])])
+                warnings_or_fallbacks.extend([{"source": "parity", "issue": issue, "severity": severity, "field_path": f"sample_{idx}"} for issue in parity_entry.get(severity, [])])
             parity_log.append(parity_entry)
-            warnings_or_fallbacks.extend([f"sample_{idx}:ingestion:{w}" for w in sample.get("_ingestion_warnings", []) if isinstance(w, str)])
+            warnings_or_fallbacks.extend([dict(w, source=f"sample_{idx}:{w.get('source', 'ingestion')}") for w in sample.get("_ingestion_warnings", []) if isinstance(w, dict)])
         ckpt = self._write_checkpoint(
             config,
-            {
-                "stage_name": "dynamics_transition",
-                "backend_name": self.backends.backend_names.get("dynamics_backend", self.backend),
-                "resolved_backend_config": self.backends.backend_names,
-                "schema_version": "learned_ready.v2",
-                "contract_version": "graph_transition.v2",
-                "dataset_source": config.dataset_path or "synthetic_router",
-                "train_metrics": {"progress": 1.0, "score_mean": (sum(scores) / len(scores)) if scores else 0.0},
-                "val_metrics": {"transition_correctness_mean": (sum(scores) / len(scores)) if scores else 0.0},
-                "samples_processed": len(samples),
-                "expected_inputs": ["graph_state", "memory_summary", "text_action_summary", "step_context"],
-                "expected_outputs": ["graph_delta", "confidence", "transition_metadata"],
-                "contract_payload_shape": {"keys": sorted(last_contract.keys())},
-                "eval_summary": {"transition_correctness": (sum(scores) / len(scores)) if scores else 0.0, "graph_after_target": "ground_truth_graph_after"},
-                "parity_summary": parity_log[-1] if parity_log else _empty_parity_result(),
-                "warnings_or_fallbacks": warnings_or_fallbacks,
-            },
+            _build_checkpoint_payload(
+                stage_name="dynamics_transition",
+                backend_name=self.backends.backend_names.get("dynamics_backend", self.backend),
+                backend_config=self.backends.backend_names,
+                contract_version="graph_transition.v2",
+                dataset_source=config.dataset_path or "synthetic_router",
+                mean_score=(sum(scores) / len(scores)) if scores else 0.0,
+                samples_processed=len(samples),
+                expected_inputs=["graph_state", "memory_summary", "text_action_summary", "step_context"],
+                expected_outputs=["graph_delta", "confidence", "transition_metadata"],
+                last_contract=last_contract,
+                eval_summary={"transition_correctness": (sum(scores) / len(scores)) if scores else 0.0, "graph_after_target": "ground_truth_graph_after"},
+                parity_summary=parity_log[-1] if parity_log else _empty_structured_parity(),
+                warnings_or_fallbacks=warnings_or_fallbacks,
+                stage_fields={"val_metrics": {"transition_correctness_mean": (sum(scores) / len(scores)) if scores else 0.0}},
+            ),
         )
         mean = sum(scores) / len(scores)
         return StageScaffoldResult(
@@ -696,7 +803,8 @@ class PatchSynthesisStageRunner(_BaseStageRunner):
         scores: list[float] = []
         last_contract: dict[str, object] = {}
         parity_log: list[dict[str, list[str]]] = []
-        warnings_or_fallbacks: list[str] = []
+        warnings_or_fallbacks: list[dict[str, object]] = []
+        supervision_mismatches: list[dict[str, object]] = []
         for idx, sample in enumerate(samples):
             memory = mm.initialize(sample["graph"])
             graph_enc = self.backends.graph_encoder.encode(sample["graph"])
@@ -729,36 +837,45 @@ class PatchSynthesisStageRunner(_BaseStageRunner):
             patch_eval = patch_synthesis_eval(eval_payload)
             hidden_eval = hidden_region_reconstruction_eval(build_hidden_reconstruction_payload(contract))
             scores.append((patch_eval.metrics["patch_quality"] + hidden_eval.metrics["reconstruction_quality"]) / 2.0)
-            from learned.parity import semantic_parity_checks
-
-            missing = _validate_contract_fields(contract, ["roi_before", "roi_after", "region_metadata", "selected_strategy", "transition_context"])
-            semantic = semantic_parity_checks(stage="patch", contract=contract, request=req, output=out)
-            parity = _empty_parity_result()
-            parity["errors"].extend([f"missing_field:{m}" for m in missing])
-            for severity in ("errors", "warnings", "traces"):
-                parity[severity].extend(semantic.get(severity, []))
+            actual_strategy = str(out.execution_trace.get("selected_render_strategy", "unknown"))
+            actual_mode = str(out.execution_trace.get("synthesis_mode", "deterministic"))
+            if sample.get("target_selected_strategy") and sample.get("target_selected_strategy") != actual_strategy:
+                supervision_mismatches.append({"field": "expected_selected_strategy", "expected": sample.get("target_selected_strategy"), "actual": actual_strategy, "sample_index": idx})
+            if sample.get("target_synthesis_mode") and sample.get("target_synthesis_mode") != actual_mode:
+                supervision_mismatches.append({"field": "expected_synthesis_mode", "expected": sample.get("target_synthesis_mode"), "actual": actual_mode, "sample_index": idx})
+            if sample.get("target_hidden_lifecycle") and sample.get("target_hidden_lifecycle") != sample.get("hidden_state", {}).get("lifecycle"):
+                supervision_mismatches.append({"field": "hidden_lifecycle_target", "expected": sample.get("target_hidden_lifecycle"), "actual": sample.get("hidden_state", {}).get("lifecycle"), "sample_index": idx})
+            if sample.get("target_retrieval_richness") and sample.get("target_retrieval_richness") != sample.get("hidden_state", {}).get("retrieval_profile"):
+                supervision_mismatches.append({"field": "retrieval_richness_target", "expected": sample.get("target_retrieval_richness"), "actual": sample.get("hidden_state", {}).get("retrieval_profile"), "sample_index": idx})
+            parity = _build_parity_result(
+                contract=contract,
+                required_fields=["roi_before", "roi_after", "region_metadata", "selected_strategy", "transition_context"],
+                stage="patch",
+                request=req,
+                output=out,
+            )
             parity_log.append(parity)
-            warnings_or_fallbacks.extend([f"sample_{idx}:{severity}:{issue}" for severity in ("errors", "warnings", "traces") for issue in semantic.get(severity, [])])
-            warnings_or_fallbacks.extend([f"sample_{idx}:ingestion:{w}" for w in sample.get("_ingestion_warnings", []) if isinstance(w, str)])
+            for severity in ("errors", "warnings", "traces"):
+                warnings_or_fallbacks.extend([{"source": "parity", "issue": issue, "severity": severity, "field_path": f"sample_{idx}"} for issue in parity.get(severity, [])])
+            warnings_or_fallbacks.extend([dict(w, source=f"sample_{idx}:{w.get('source', 'ingestion')}") for w in sample.get("_ingestion_warnings", []) if isinstance(w, dict)])
         ckpt = self._write_checkpoint(
             config,
-            {
-                "stage_name": "patch_synthesis",
-                "backend_name": self.backends.backend_names.get("patch_backend", self.backend),
-                "resolved_backend_config": self.backends.backend_names,
-                "schema_version": "learned_ready.v2",
-                "contract_version": "patch_synthesis.v2",
-                "dataset_source": config.dataset_path or "synthetic_router",
-                "train_metrics": {"progress": 1.0, "score_mean": (sum(scores) / len(scores)) if scores else 0.0},
-                "val_metrics": {"patch_quality_mean": (sum(scores) / len(scores)) if scores else 0.0},
-                "samples_processed": len(samples),
-                "expected_inputs": ["region", "scene_state", "memory_summary", "transition_context", "retrieval_summary"],
-                "expected_outputs": ["rgb_patch", "confidence", "uncertainty_map"],
-                "contract_payload_shape": {"keys": sorted(last_contract.keys())},
-                "eval_summary": {"composite_patch_hidden_score": (sum(scores) / len(scores)) if scores else 0.0},
-                "parity_summary": parity_log[-1] if parity_log else _empty_parity_result(),
-                "warnings_or_fallbacks": warnings_or_fallbacks,
-            },
+            _build_checkpoint_payload(
+                stage_name="patch_synthesis",
+                backend_name=self.backends.backend_names.get("patch_backend", self.backend),
+                backend_config=self.backends.backend_names,
+                contract_version="patch_synthesis.v2",
+                dataset_source=config.dataset_path or "synthetic_router",
+                mean_score=(sum(scores) / len(scores)) if scores else 0.0,
+                samples_processed=len(samples),
+                expected_inputs=["region", "scene_state", "memory_summary", "transition_context", "retrieval_summary"],
+                expected_outputs=["rgb_patch", "confidence", "uncertainty_map"],
+                last_contract=last_contract,
+                eval_summary={"composite_patch_hidden_score": (sum(scores) / len(scores)) if scores else 0.0, "supervision_mismatches": supervision_mismatches},
+                parity_summary=parity_log[-1] if parity_log else _empty_structured_parity(),
+                warnings_or_fallbacks=warnings_or_fallbacks,
+                stage_fields={"val_metrics": {"patch_quality_mean": (sum(scores) / len(scores)) if scores else 0.0}},
+            ),
         )
         mean = sum(scores) / len(scores)
         return StageScaffoldResult(
@@ -781,7 +898,8 @@ class TemporalRefinementStageRunner(_BaseStageRunner):
         scores: list[float] = []
         last_contract: dict[str, object] = {}
         parity_log: list[dict[str, list[str]]] = []
-        warnings_or_fallbacks: list[str] = []
+        warnings_or_fallbacks: list[dict[str, object]] = []
+        supervision_mismatches: list[dict[str, object]] = []
         for idx, sample in enumerate(samples):
             memory = mm.initialize(sample["graph"])
             has_targets = any(sample.get(k) is not None for k in ("target_temporal_profile", "target_drift_regime", "target_region_consistency", "target_multi_roi_sync"))
@@ -815,36 +933,44 @@ class TemporalRefinementStageRunner(_BaseStageRunner):
             last_contract = contract
             eval_payload = build_temporal_eval_payload(contract)
             scores.append(temporal_consistency_eval(eval_payload).metrics["temporal_consistency"])
-            from learned.parity import semantic_parity_checks
-
-            missing = _validate_contract_fields(contract, ["previous_frame", "composed_frame", "target_frame", "changed_regions", "scene_transition_context"])
-            semantic = semantic_parity_checks(stage="temporal", contract=contract, request=req, output=out, changed_regions_count=len(sample["regions"]))
-            parity = _empty_parity_result()
-            parity["errors"].extend([f"missing_field:{m}" for m in missing])
-            for severity in ("errors", "warnings", "traces"):
-                parity[severity].extend(semantic.get(severity, []))
+            actual_profile = sample.get("temporal_profile")
+            actual_drift_regime = "high_drift" if float(sample.get("drift", 0.0)) > 0.08 else "low_drift"
+            if sample.get("target_temporal_profile") and sample.get("target_temporal_profile") != actual_profile:
+                supervision_mismatches.append({"field": "expected_temporal_profile", "expected": sample.get("target_temporal_profile"), "actual": actual_profile, "sample_index": idx})
+            if sample.get("target_drift_regime") and sample.get("target_drift_regime") != actual_drift_regime:
+                supervision_mismatches.append({"field": "expected_drift_regime", "expected": sample.get("target_drift_regime"), "actual": actual_drift_regime, "sample_index": idx})
+            if sample.get("target_region_consistency"):
+                supervision_mismatches.append({"field": "region_consistency_target_scores", "expected": sample.get("target_region_consistency"), "actual": out.region_consistency_scores, "sample_index": idx})
+            parity = _build_parity_result(
+                contract=contract,
+                required_fields=["previous_frame", "composed_frame", "target_frame", "changed_regions", "scene_transition_context"],
+                stage="temporal",
+                request=req,
+                output=out,
+                changed_regions_count=len(sample["regions"]),
+            )
             parity_log.append(parity)
-            warnings_or_fallbacks.extend([f"sample_{idx}:{severity}:{issue}" for severity in ("errors", "warnings", "traces") for issue in semantic.get(severity, [])])
-            warnings_or_fallbacks.extend([f"sample_{idx}:ingestion:{w}" for w in sample.get("_ingestion_warnings", []) if isinstance(w, str)])
+            for severity in ("errors", "warnings", "traces"):
+                warnings_or_fallbacks.extend([{"source": "parity", "issue": issue, "severity": severity, "field_path": f"sample_{idx}"} for issue in parity.get(severity, [])])
+            warnings_or_fallbacks.extend([dict(w, source=f"sample_{idx}:{w.get('source', 'ingestion')}") for w in sample.get("_ingestion_warnings", []) if isinstance(w, dict)])
         ckpt = self._write_checkpoint(
             config,
-            {
-                "stage_name": "temporal_refinement",
-                "backend_name": self.backends.backend_names.get("temporal_backend", self.backend),
-                "resolved_backend_config": self.backends.backend_names,
-                "schema_version": "learned_ready.v2",
-                "contract_version": "temporal_consistency.v2",
-                "dataset_source": config.dataset_path or "synthetic_router",
-                "train_metrics": {"progress": 1.0, "score_mean": (sum(scores) / len(scores)) if scores else 0.0},
-                "val_metrics": {"temporal_consistency_mean": (sum(scores) / len(scores)) if scores else 0.0},
-                "samples_processed": len(samples),
-                "expected_inputs": ["previous_frame", "current_composed_frame", "changed_regions", "scene_state", "memory_state"],
-                "expected_outputs": ["refined_frame", "region_consistency_scores"],
-                "contract_payload_shape": {"keys": sorted(last_contract.keys())},
-                "eval_summary": {"temporal_consistency": (sum(scores) / len(scores)) if scores else 0.0},
-                "parity_summary": parity_log[-1] if parity_log else _empty_parity_result(),
-                "warnings_or_fallbacks": warnings_or_fallbacks,
-            },
+            _build_checkpoint_payload(
+                stage_name="temporal_refinement",
+                backend_name=self.backends.backend_names.get("temporal_backend", self.backend),
+                backend_config=self.backends.backend_names,
+                contract_version="temporal_consistency.v2",
+                dataset_source=config.dataset_path or "synthetic_router",
+                mean_score=(sum(scores) / len(scores)) if scores else 0.0,
+                samples_processed=len(samples),
+                expected_inputs=["previous_frame", "current_composed_frame", "changed_regions", "scene_state", "memory_state"],
+                expected_outputs=["refined_frame", "region_consistency_scores"],
+                last_contract=last_contract,
+                eval_summary={"temporal_consistency": (sum(scores) / len(scores)) if scores else 0.0, "supervision_mismatches": supervision_mismatches},
+                parity_summary=parity_log[-1] if parity_log else _empty_structured_parity(),
+                warnings_or_fallbacks=warnings_or_fallbacks,
+                stage_fields={"val_metrics": {"temporal_consistency_mean": (sum(scores) / len(scores)) if scores else 0.0}},
+            ),
         )
         mean = sum(scores) / len(scores)
         return StageScaffoldResult(
