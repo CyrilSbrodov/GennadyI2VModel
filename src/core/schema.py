@@ -200,6 +200,7 @@ class GraphDelta:
     state_before: dict[str, str] = field(default_factory=dict)
     state_after: dict[str, str] = field(default_factory=dict)
     transition_phase: str = "single"
+    region_transition_mode: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -244,6 +245,8 @@ class HiddenRegionSlot:
     stale_frames: int = 0
     hidden_type: str = "known_hidden"
     evidence_score: float = 0.0
+    retrieval_priority: float = 0.0
+    last_transition: str = "stable"
 
 
 @dataclass(slots=True)
