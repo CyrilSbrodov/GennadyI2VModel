@@ -3,6 +3,10 @@ name = "gennady-i2v"
 version = "0.1.0"
 description = "Modular scene-graph driven image-to-video engine prototype"
 requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.2.6",
+    "pillow>=12.2.0",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
@@ -16,5 +20,5 @@ perception-real = [
   "transformers>=4.40",
   "torch>=2.2",
   "pillow>=10.0",
-  "facer>=0.0.7",
+  #"facer>=0.0.7",
 ]

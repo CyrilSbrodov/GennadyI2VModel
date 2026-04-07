@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
+from PIL import Image
+
 from utils_tensor import zeros
 
 
@@ -20,7 +23,7 @@ class InputOptions:
 @dataclass(slots=True)
 class AssetFrame:
     frame_id: str
-    tensor: list[list[list[float]]]
+    tensor: object
     width: int
     height: int
     timestamp: float = 0.0
@@ -94,81 +97,34 @@ class InputAssetLayer:
             self._enrich_image(req)
         return req
 
-    def _load_image_tensor(self, image_path: str) -> tuple[list[list[list[float]]], tuple[int, int]]:
+    def _load_image_tensor(self, image_path: str) -> tuple[np.ndarray, tuple[int, int]]:
         path = Path(image_path)
         if not path.exists():
             raise FileNotFoundError(f"Image not found: {image_path}")
 
-        try:
-            from PIL import Image  # type: ignore
+        image = Image.open(path).convert("RGB")
+        width, height = image.size
 
-            image = Image.open(path).convert("RGB")
-            width, height = image.size
-            pixels = list(image.getdata())
-            tensor = zeros(height, width, 3)
-            for y in range(height):
-                for x in range(width):
-                    r, g, b = pixels[y * width + x]
-                    tensor[y][x][0] = r / 255.0
-                    tensor[y][x][1] = g / 255.0
-                    tensor[y][x][2] = b / 255.0
-            return tensor, (width, height)
-        except Exception:
-            try:
-                import cv2  # type: ignore
+        arr = np.asarray(image, dtype=np.uint8)
+        arr = arr.astype(np.float32) / 255.0
+        return arr, (width, height)
 
-                image = cv2.imread(str(path), cv2.IMREAD_COLOR)
-                if image is None:
-                    raise ValueError("cv2.imread returned None")
-                height, width = image.shape[:2]
-                tensor = zeros(height, width, 3)
-                for y in range(height):
-                    for x in range(width):
-                        b, g, r = image[y, x]
-                        tensor[y][x][0] = float(r) / 255.0
-                        tensor[y][x][1] = float(g) / 255.0
-                        tensor[y][x][2] = float(b) / 255.0
-                return tensor, (width, height)
-            except Exception:
-                try:
-                    return self._load_ppm(path)
-                except Exception as exc:
-                    raise RuntimeError(f"Unable to decode image {image_path}: {exc}") from exc
-
-    def _load_ppm(self, path: Path) -> tuple[list[list[list[float]]], tuple[int, int]]:
-        raw = path.read_bytes()
-        if raw.startswith(b"P3"):
-            parts = path.read_text().split()
-            if parts[0] != "P3":
-                raise ValueError("not a P3 PPM")
-            width, height, maxv = int(parts[1]), int(parts[2]), int(parts[3])
-            values = list(map(int, parts[4:]))
-            tensor = zeros(height, width, 3)
-            for y in range(height):
-                for x in range(width):
-                    base = (y * width + x) * 3
-                    tensor[y][x] = [values[base] / maxv, values[base + 1] / maxv, values[base + 2] / maxv]
-            return tensor, (width, height)
-        raise ValueError("unsupported raw format")
-
-    def _normalize_tensor(self, tensor: list[list[list[float]]], profile: str) -> tuple[list[list[list[float]]], tuple[int, int]]:
-        h = len(tensor)
-        w = len(tensor[0]) if h else 0
+    def _normalize_tensor(self, tensor: np.ndarray, profile: str) -> tuple[np.ndarray, tuple[int, int]]:
+        h, w = tensor.shape[:2]
         target = self._PROFILE_TARGET.get(profile, self._PROFILE_TARGET["balanced"])
         nw, nh = self._normalize_size(w, h, target=target)
+
         if (nw, nh) == (w, h):
             return self._color_normalize(tensor), (nw, nh)
 
-        resized = zeros(nh, nw, 3)
-        for y in range(nh):
-            oy = min(h - 1, int(round((y / max(1, nh - 1)) * max(0, h - 1)))) if h else 0
-            for x in range(nw):
-                ox = min(w - 1, int(round((x / max(1, nw - 1)) * max(0, w - 1)))) if w else 0
-                resized[y][x] = tensor[oy][ox][:]
-        return self._color_normalize(resized), (nw, nh)
+        # Через PIL это будет на порядки быстрее, чем твои Python-циклы
+        img = Image.fromarray((np.clip(tensor, 0.0, 1.0) * 255.0).astype(np.uint8), mode="RGB")
+        img = img.resize((nw, nh), Image.BILINEAR)
 
-    def _color_normalize(self, tensor: list[list[list[float]]]) -> list[list[list[float]]]:
-        # baseline normalization; future profiles can add imagenet/etc.
+        arr = np.asarray(img, dtype=np.uint8).astype(np.float32) / 255.0
+        return self._color_normalize(arr), (nw, nh)
+
+    def _color_normalize(self, tensor: np.ndarray) -> np.ndarray:
         return tensor
 
     def _enrich_image(self, request: InputRequest) -> None:
@@ -179,12 +135,15 @@ class InputAssetLayer:
         frames: list[AssetFrame] = []
         first_size: tuple[int, int] | None = None
         normalized_size: tuple[int, int] | None = None
+
         for idx, image_path in enumerate(request.images):
             tensor, size = self._load_image_tensor(image_path)
             normalized_tensor, ns = self._normalize_tensor(tensor, request.options.quality_profile)
+
             if first_size is None:
                 first_size = size
             normalized_size = ns
+
             frames.append(
                 AssetFrame(
                     frame_id=f"img_{idx}",
@@ -197,8 +156,7 @@ class InputAssetLayer:
             )
 
         if not frames:
-            # explicit debug fallback, not default runtime path
-            debug_tensor = zeros(256, 256, 3, value=0.5)
+            debug_tensor = np.full((256, 256, 3), 0.5, dtype=np.float32)
             frames = [AssetFrame(frame_id="debug_0", tensor=debug_tensor, width=256, height=256, source="debug://blank")]
             first_size = (256, 256)
             normalized_size = (256, 256)
@@ -219,6 +177,7 @@ class InputAssetLayer:
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
                 raise RuntimeError("unable to open video")
+
             native_fps = cap.get(cv2.CAP_PROP_FPS) or fps
             frame_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
@@ -228,18 +187,17 @@ class InputAssetLayer:
 
             frames: list[AssetFrame] = []
             frame_idx = 0
+
             while len(frames) < max_frames:
                 ok, frame = cap.read()
                 if not ok:
                     break
+
                 if frame_idx % max(1, stride) == 0:
-                    h, w = frame.shape[:2]
-                    tensor = zeros(h, w, 3)
-                    for y in range(h):
-                        for x in range(w):
-                            b, g, r = frame[y, x]
-                            tensor[y][x] = [float(r) / 255.0, float(g) / 255.0, float(b) / 255.0]
-                    nt, ns = self._normalize_tensor(tensor, "balanced")
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frame = frame.astype(np.float32) / 255.0
+                    nt, ns = self._normalize_tensor(frame, "balanced")
+
                     frames.append(
                         AssetFrame(
                             frame_id=f"video_{len(frames)}",
@@ -250,7 +208,9 @@ class InputAssetLayer:
                             source=video_path,
                         )
                     )
+
                 frame_idx += 1
+
             cap.release()
             return frames, {
                 "native_fps": native_fps,
@@ -258,9 +218,18 @@ class InputAssetLayer:
                 "orig_size": (width, height),
             }
         except Exception:
-            # fallback metadata-only mode if cv2 missing
             frame_count = max(1, int(round(duration * fps)))
-            frames = [AssetFrame(frame_id=f"video_{i}", tensor=zeros(256, 256, 3), width=256, height=256, timestamp=i / fps, source=video_path) for i in range(0, frame_count, max(1, stride))]
+            frames = [
+                AssetFrame(
+                    frame_id=f"video_{i}",
+                    tensor=np.zeros((256, 256, 3), dtype=np.float32),
+                    width=256,
+                    height=256,
+                    timestamp=i / fps,
+                    source=video_path,
+                )
+                for i in range(0, frame_count, max(1, stride))
+            ]
             return frames, {"native_fps": fps, "frame_total": frame_count, "orig_size": (1280, 720), "metadata_only": True}
 
     def _enrich_video(self, request: InputRequest) -> None:

@@ -103,24 +103,31 @@ class PerceptionPipeline:
         self.tracker = tracker or ByteTrackAdapter()
         self.depth = depth or MonoDepthEstimator()
 
-    def _safe_module_call(self, fn, fallback_fn, warnings: list[str], module_name: str, out: PerceptionOutput, success_mode: str = "native"):
+    def _safe_module_call(self, fn, fallback_fn, warnings: list[str], module_name: str, out: PerceptionOutput,
+                          success_mode: str = "native"):
         start = time.perf_counter()
+        print(f"[MOD] {module_name}: start")
         try:
             value = fn()
             out.module_fallbacks[module_name] = success_mode
+            print(f"[MOD] {module_name}: success ({success_mode}) in {(time.perf_counter() - start):.3f}s")
             return value
         except Exception as exc:
             warnings.append(f"{module_name}_unavailable:{exc}")
+            print(f"[MOD] {module_name}: failed in {(time.perf_counter() - start):.3f}s -> {exc}")
             try:
+                fb_start = time.perf_counter()
                 value = fallback_fn()
                 out.module_fallbacks[module_name] = "fallback"
+                print(f"[MOD] {module_name}: fallback success in {(time.perf_counter() - fb_start):.3f}s")
                 return value
             except Exception as fb_exc:
                 warnings.append(f"{module_name}_fallback_failed:{fb_exc}")
                 out.module_fallbacks[module_name] = "real_backend_error"
+                print(f"[MOD] {module_name}: fallback failed -> {fb_exc}")
                 raise
-        finally:
-            out.module_latency_ms[module_name] = round((time.perf_counter() - start) * 1000.0, 3)
+            finally:
+                out.module_latency_ms[module_name] = round((time.perf_counter() - start) * 1000.0, 3)
 
     @staticmethod
     def _backend_fallback_enabled(module: object) -> bool:

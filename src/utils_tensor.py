@@ -7,8 +7,24 @@ def zeros(h: int, w: int, c: int = 3, value: float = 0.0) -> list[list[list[floa
     return [[[value for _ in range(c)] for _ in range(w)] for _ in range(h)]
 
 
-def shape(x: list) -> tuple[int, int, int]:
-    return len(x), len(x[0]) if x else 0, len(x[0][0]) if x and x[0] else 0
+def shape(x):
+    if x is None:
+        return 0, 0, 0
+
+    if hasattr(x, "shape"):
+        s = x.shape
+        if len(s) == 0:
+            return 0, 0, 0
+        if len(s) == 1:
+            return int(s[0]), 0, 0
+        if len(s) == 2:
+            return int(s[0]), int(s[1]), 0
+        return int(s[0]), int(s[1]), int(s[2])
+
+    h = len(x)
+    w = len(x[0]) if h > 0 else 0
+    c = len(x[0][0]) if h > 0 and w > 0 else 0
+    return h, w, c
 
 
 def clip01(v: float) -> float:

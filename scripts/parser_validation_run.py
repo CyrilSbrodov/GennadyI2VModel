@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+import time
+
+def mark(msg: str) -> float:
+    t = time.perf_counter()
+    print(f"[T] {msg}")
+    return t
+
+def done(msg: str, t0: float) -> None:
+    dt = time.perf_counter() - t0
+    print(f"[T] {msg}: {dt:.3f}s")
+
+t0 = mark("script start")
 import argparse
 import json
 import sys
@@ -28,6 +40,7 @@ RUNTIME_FAIL_TYPES = {
     "validation_invalid_due_to_fallback",
 }
 
+done("after imports", t0)
 
 def build_parser_config(args: argparse.Namespace) -> ParserStackConfig:
     return ParserStackConfig(
@@ -150,13 +163,20 @@ def main() -> None:
     ap.add_argument("--facer-model", default="farl/lapa/448")
     args = ap.parse_args()
 
+    t = mark("read manifest")
     manifest_path = Path(args.manifest)
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     records = payload.get("records", [])
-
+    done("read manifest", t)
+    t = mark("build_parser_config")
     parser_cfg = build_parser_config(args)
+    done("build_parser_config", t)
+    t = mark("create PerceptionPipeline")
     pipe = PerceptionPipeline(backends=PerceptionBackendsConfig(parser=parser_cfg))
+    done("create PerceptionPipeline", t)
+    t = mark("create InputAssetLayer")
     input_layer = InputAssetLayer()
+    done("create InputAssetLayer", t)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -206,16 +226,22 @@ def main() -> None:
         frame: Any = None
         rgb: list[list[list[int]]] | None = None
 
+        print(f"\n[IMG] start: {image_id} -> {image_path}")
+
+        t = mark(f"{image_id}: build_request")
         try:
             req = input_layer.build_request(images=[str(image_path)], text=f"parser-validation:{image_id}")
             frame = req.unified_asset.frames[0] if req.unified_asset and req.unified_asset.frames else None
             if frame is not None:
                 rgb = [[[int(max(0.0, min(1.0, ch)) * 255.0) for ch in px[:3]] for px in row] for row in frame.tensor]
         except Exception as exc:
+            print(f"[ERR] {image_id}: build_request failed -> {exc!r}")
             report["warnings"].append(f"image_decode_failed:{exc}")
             report["image_decode_failed"] = True
             report["runtime_failure"] = True
             report["fail_reasons"].append("image_decode_failed")
+        finally:
+            done(f"{image_id}: build_request", t)
 
         if frame is None:
             report["frame_tensor_missing"] = True
@@ -229,7 +255,9 @@ def main() -> None:
             _accumulate_report(report)
             continue
 
+        t = mark(f"{image_id}: pipe.analyze")
         out = pipe.analyze(frame)
+        done(f"{image_id}: pipe.analyze", t)
         report["warnings"].extend(out.warnings)
         report["module_fallbacks"] = out.module_fallbacks
 
@@ -252,7 +280,9 @@ def main() -> None:
         report["runtime_formats"] = runtime_formats
 
         image_dir = out_dir / str(image_id)
+        t = mark(f"{image_id}: export_parser_debug_artifacts")
         debug_summary = export_parser_debug_artifacts(rgb or [[[0, 0, 0]]], out, image_dir)
+        done(f"{image_id}: export_parser_debug_artifacts", t)
         report["debug_summary_path"] = str(image_dir / "fused_summary.json")
         report["debug_summary"] = debug_summary
 
@@ -306,10 +336,11 @@ def main() -> None:
         "aggregate_geometry_stats": dict(aggregate_geometry_stats),
         "per_image_reports": per_image_reports,
     }
-
+    t = mark("write validation_report.json")
     report_path = out_dir / "validation_report.json"
     report_path.write_text(json.dumps(validation_report, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(validation_report, ensure_ascii=False, indent=2))
+    done("write validation_report.json", t)
+    #print(json.dumps(validation_report, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

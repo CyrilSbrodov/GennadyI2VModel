@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
+
+import numpy as np
+from PIL import Image
 
 from core.input_layer import AssetFrame
 from perception.backend import frame_to_features
@@ -197,8 +201,43 @@ class _HFSegmentationBackend:
         self._pipe = None
         self._id2label: dict[int, str] = {}
 
+    def _to_pil_image(self, patch: object) -> Image.Image:
+        if isinstance(patch, Image.Image):
+            return patch
+
+        arr = patch
+        if not isinstance(arr, np.ndarray):
+            arr = np.asarray(arr)
+
+        if arr.size == 0:
+            raise ValueError("empty patch passed to HF segmentation backend")
+
+        if arr.dtype != np.uint8:
+            if arr.dtype.kind in {"f"}:
+                arr = np.clip(arr, 0.0, 255.0)
+                if float(arr.max()) <= 1.0:
+                    arr = (arr * 255.0).astype(np.uint8)
+                else:
+                    arr = arr.astype(np.uint8)
+            else:
+                arr = np.clip(arr, 0, 255).astype(np.uint8)
+
+        if arr.ndim == 2:
+            return Image.fromarray(arr, mode="L")
+
+        if arr.ndim == 3:
+            if arr.shape[2] == 1:
+                return Image.fromarray(arr[:, :, 0], mode="L")
+            if arr.shape[2] >= 3:
+                return Image.fromarray(arr[:, :, :3], mode="RGB")
+
+        raise ValueError(f"unsupported patch shape for HF segmentation backend: {arr.shape}")
+
     def infer(self, patch: "object") -> object:
+        t0 = time.perf_counter()
         if self._pipe is None:
+            print(f"[HF] init pipeline start: model={self.model_id}, device={self.device}")
+            t_init = time.perf_counter()
             try:
                 from transformers import pipeline  # type: ignore
             except Exception as exc:  # pragma: no cover
@@ -210,7 +249,13 @@ class _HFSegmentationBackend:
             id2label = getattr(config, "id2label", None)
             if isinstance(id2label, dict):
                 self._id2label = {int(k): str(v) for k, v in id2label.items()}
-        return self._pipe(patch)
+            print(f"[HF] init pipeline done: {time.perf_counter() - t_init:.3f}s")
+
+        t_run = time.perf_counter()
+        pil_image = self._to_pil_image(patch)
+        out = self._pipe(pil_image)
+        print(f"[HF] infer done: {time.perf_counter() - t_run:.3f}s (total {time.perf_counter() - t0:.3f}s)")
+        return out
 
     @property
     def id2label(self) -> dict[int, str]:
@@ -256,13 +301,27 @@ class FashnHumanParserAdapter:
         return self._runtime.infer(patch), self._runtime.id2label, "hf_image_segmentation"
 
     def parse_patch(self, patch: "object") -> AdapterSegmentationOutput:
+        import time
+        t0 = time.perf_counter()
+
         if self.config.backend == "builtin":
             return AdapterSegmentationOutput(runtime_format="builtin")
+
         raw, id2label, runtime_format = self._infer(patch)
+        print(f"[FASHN] _infer: {time.perf_counter() - t0:.3f}s")
+
+        t1 = time.perf_counter()
         if isinstance(raw, dict) and "label_map" in raw:
             class_map = {int(k): v.lower().strip() for k, v in id2label.items()} if id2label else self.CLASS_MAP
             masks = _label_map_to_masks(raw["label_map"], class_map)
-            return AdapterSegmentationOutput(masks=masks, confidences={k: _mask_conf(v) for k, v in masks.items()}, runtime_format=runtime_format + ":label_map")
+            out = AdapterSegmentationOutput(
+                masks=masks,
+                confidences={k: _mask_conf(v) for k, v in masks.items()},
+                runtime_format=runtime_format + ":label_map",
+            )
+            print(f"[FASHN] postprocess label_map: {time.perf_counter() - t1:.3f}s")
+            return out
+
         masks: dict[str, object] = {}
         if isinstance(raw, list):
             for seg in raw:
@@ -272,8 +331,14 @@ class FashnHumanParserAdapter:
                 mask = seg.get("mask")
                 if mask is not None and label and label != "background":
                     masks[label] = _safe_array(mask)
-            return AdapterSegmentationOutput(masks=masks, confidences={k: _mask_conf(v) for k, v in masks.items()}, runtime_format=runtime_format + ":segments_list")
-        return AdapterSegmentationOutput(runtime_format=runtime_format + ":unsupported")
+
+        out = AdapterSegmentationOutput(
+            masks=masks,
+            confidences={k: _mask_conf(v) for k, v in masks.items()},
+            runtime_format=runtime_format + ":segments_list",
+        )
+        print(f"[FASHN] postprocess segments_list: {time.perf_counter() - t1:.3f}s; labels={list(masks.keys())}")
+        return out
 
 
 class SCHPPascalPartParserAdapter:
@@ -709,20 +774,36 @@ class SegFormerHumanParserAdapter:
                 }
             return result
 
+        t0 = time.perf_counter()
         frame_img = frame_to_numpy_rgb(frame)
+        print("parse: frame_to_numpy_rgb:", time.perf_counter() - t0)
+
         rgb = frame_img.rgb
         frame_size = (frame_img.width, frame_img.height)
         for person in persons:
+            tp = time.perf_counter()
             patch = crop_rgb(rgb, person.bbox)
+            print("parse: crop_rgb:", time.perf_counter() - tp)
+
+            tf = time.perf_counter()
             fashn = self.fashn.parse_patch(patch)
+            print("parse: fashn.parse_patch:", time.perf_counter() - tf, fashn.runtime_format)
+
+            ts = time.perf_counter()
             pascal = self.schp_pascal.parse_patch(patch)
+            print("parse: schp_pascal.parse_patch:", time.perf_counter() - ts, pascal.runtime_format)
+
+            ta = time.perf_counter()
             atr = self.schp_atr.parse_patch(patch)
+            print("parse: schp_atr.parse_patch:", time.perf_counter() - ta, atr.runtime_format)
+
+            tc = time.perf_counter()
             facer = self.facer.parse_patch(patch)
-            self.last_runtime_formats[person.detection_id] = {
-                "fashn": fashn.runtime_format,
-                "schp_pascal": pascal.runtime_format,
-                "schp_atr": atr.runtime_format,
-                "facer": facer.runtime_format,
-            }
-            result[person.detection_id] = self.fusion.fuse(person, fashn, pascal, atr, facer, frame_size=frame_size)
+            print("parse: facer.parse_patch:", time.perf_counter() - tc, facer.runtime_format)
+
+            tu = time.perf_counter()
+            fused = self.fusion.fuse(person, fashn, pascal, atr, facer, frame_size=frame_size)
+            print("parse: fusion.fuse:", time.perf_counter() - tu)
+
+            result[person.detection_id] = fused
         return result
