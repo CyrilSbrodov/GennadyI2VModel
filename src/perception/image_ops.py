@@ -46,7 +46,11 @@ def frame_to_numpy_rgb(frame: FrameLike) -> FrameImage:
 
     arr = np.asarray(tensor)
     if arr.dtype == np.uint8:
-        rgb = arr[..., :3].copy()
+        # For uint8 runtime tensors we keep a zero-copy view when possible.
+        # Create a compact copy only when the slice is not contiguous.
+        rgb = arr[..., :3]
+        if not rgb.flags["C_CONTIGUOUS"]:
+            rgb = np.ascontiguousarray(rgb)
     else:
         arr = np.asarray(arr, dtype=np.float32)
         arr = np.clip(arr, 0.0, 1.0)

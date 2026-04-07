@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
 
@@ -235,10 +234,7 @@ class _HFSegmentationBackend:
         raise ValueError(f"unsupported patch shape for HF segmentation backend: {arr.shape}")
 
     def infer(self, patch: "object") -> object:
-        t0 = time.perf_counter()
         if self._pipe is None:
-            print(f"[HF] init pipeline start: model={self.model_id}, device={self.device}")
-            t_init = time.perf_counter()
             try:
                 from transformers import pipeline  # type: ignore
             except Exception as exc:  # pragma: no cover
@@ -250,12 +246,9 @@ class _HFSegmentationBackend:
             id2label = getattr(config, "id2label", None)
             if isinstance(id2label, dict):
                 self._id2label = {int(k): str(v) for k, v in id2label.items()}
-            print(f"[HF] init pipeline done: {time.perf_counter() - t_init:.3f}s")
 
-        t_run = time.perf_counter()
         pil_image = self._to_pil_image(patch)
         out = self._pipe(pil_image)
-        print(f"[HF] infer done: {time.perf_counter() - t_run:.3f}s (total {time.perf_counter() - t0:.3f}s)")
         return out
 
     @property
