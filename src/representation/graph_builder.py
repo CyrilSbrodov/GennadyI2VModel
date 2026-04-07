@@ -98,18 +98,34 @@ class SceneGraphBuilder:
 
         for idx, p in enumerate(perception.persons, start=1):
             person_id = f"person_{idx}"
-            body_parts = [
-                BodyPartNode(
-                    part_id=f"{person_id}_{part_type}",
-                    part_type=part_type,
-                    confidence=self._calibrate_confidence(0.82, p.pose_source),
-                    visibility="visible",
-                    source=p.pose_source,
-                    frame_index=frame_index,
-                    alternatives=["torso", "limb"],
-                )
-                for part_type in taxonomy
-            ]
+            parsed_parts = [part for part in getattr(p, "body_parts", []) if isinstance(part, dict) and part.get("part_type")]
+            if parsed_parts:
+                body_parts = [
+                    BodyPartNode(
+                        part_id=f"{person_id}_{str(part['part_type'])}",
+                        part_type=str(part["part_type"]),
+                        mask_ref=part.get("mask_ref"),
+                        confidence=self._calibrate_confidence(float(part.get("confidence", 0.0)), str(part.get("source", "unknown"))),
+                        visibility=str(part.get("visibility", "unknown")),
+                        source=str(part.get("source", "unknown")),
+                        frame_index=frame_index,
+                        alternatives=["parser_dense", "torso" if "torso" in str(part["part_type"]) else "limb"],
+                    )
+                    for part in parsed_parts
+                ]
+            else:
+                body_parts = [
+                    BodyPartNode(
+                        part_id=f"{person_id}_{part_type}",
+                        part_type=part_type,
+                        confidence=self._calibrate_confidence(0.82, p.pose_source),
+                        visibility="visible",
+                        source=p.pose_source,
+                        frame_index=frame_index,
+                        alternatives=["torso", "limb"],
+                    )
+                    for part_type in taxonomy
+                ]
             garments: list[GarmentNode] = []
             for g_idx, garment in enumerate(p.garments, start=1):
                 garment_id = f"{garment['type']}_{idx}_{g_idx}"
