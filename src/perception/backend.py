@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 import hashlib
-import math
+from typing import Any
 
 from core.input_layer import AssetFrame
-from utils_tensor import mean_color, shape
+from perception.frame_context import FrameLike, PerceptionFrameContext, unwrap_frame
+from utils_tensor import shape
 
 
 @dataclass(slots=True)
@@ -108,7 +108,16 @@ def image_ref_to_features(image_ref: str) -> list[float]:
     return [b / 255.0 for b in digest[:8]]
 
 
-def frame_to_features(frame: AssetFrame | list[list[list[float]]] | str) -> list[float]:
+def frame_to_features(frame: FrameLike) -> list[float]:
+    if isinstance(frame, PerceptionFrameContext):
+        cached = frame.get("frame_features")
+        if cached is not None:
+            return cached
+        feats = frame_to_features(frame.frame)
+        frame.put("frame_features", feats)
+        return feats
+
+    frame = unwrap_frame(frame)
     if isinstance(frame, str):
         return image_ref_to_features(frame)
 
@@ -117,27 +126,24 @@ def frame_to_features(frame: AssetFrame | list[list[list[float]]] | str) -> list
     if h == 0 or w == 0:
         return [0.0] * 8
 
-    m = mean_color(tensor)
-    luminance_sum = 0.0
-    luminance_sq = 0.0
-    edge = 0.0
-    for y in range(h):
-        for x in range(w):
-            px = tensor[y][x]
-            lum = (px[0] + px[1] + px[2]) / 3.0
-            luminance_sum += lum
-            luminance_sq += lum * lum
-            if x + 1 < w:
-                n = tensor[y][x + 1]
-                edge += abs(px[0] - n[0]) + abs(px[1] - n[1]) + abs(px[2] - n[2])
-            if y + 1 < h:
-                n = tensor[y + 1][x]
-                edge += abs(px[0] - n[0]) + abs(px[1] - n[1]) + abs(px[2] - n[2])
+    import numpy as np
+
+    arr = np.asarray(tensor)
+    if arr.ndim != 3 or arr.shape[2] < 3:
+        return [0.0] * 8
+    arr = arr[..., :3]
+    arr = arr.astype(np.float32, copy=False)
+    if float(arr.max(initial=0.0)) > 1.0:
+        arr = arr / 255.0
+
+    m = arr.mean(axis=(0, 1))
+    lum = arr.mean(axis=2)
+    lum_mean = float(lum.mean())
+    lum_std = float(lum.std())
+    edge_x = np.abs(arr[:, 1:, :] - arr[:, :-1, :]).sum()
+    edge_y = np.abs(arr[1:, :, :] - arr[:-1, :, :]).sum()
     npx = float(h * w)
-    lum_mean = luminance_sum / npx
-    lum_var = max(0.0, luminance_sq / npx - lum_mean * lum_mean)
-    lum_std = math.sqrt(lum_var)
-    edge_density = edge / max(1.0, npx * 3.0)
+    edge_density = float((edge_x + edge_y) / max(1.0, npx * 3.0))
     aspect = w / max(1.0, h)
     return [
         float(m[0]),

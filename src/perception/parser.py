@@ -10,6 +10,7 @@ from PIL import Image
 from core.input_layer import AssetFrame
 from perception.backend import frame_to_features
 from perception.detector import BackendConfig, PersonDetection
+from perception.frame_context import FrameLike, PerceptionFrameContext
 from perception.image_ops import crop_rgb, frame_to_numpy_rgb
 from perception.mask_store import DEFAULT_MASK_STORE
 
@@ -112,7 +113,7 @@ class ParsingPrediction:
 
 
 class HumanParser(Protocol):
-    def parse(self, frame: AssetFrame | list[list[list[float]]] | str, persons: list[PersonDetection]) -> dict[str, ParsingPrediction]:
+    def parse(self, frame: FrameLike, persons: list[PersonDetection]) -> dict[str, ParsingPrediction]:
         ...
 
 
@@ -301,26 +302,18 @@ class FashnHumanParserAdapter:
         return self._runtime.infer(patch), self._runtime.id2label, "hf_image_segmentation"
 
     def parse_patch(self, patch: "object") -> AdapterSegmentationOutput:
-        import time
-        t0 = time.perf_counter()
-
         if self.config.backend == "builtin":
             return AdapterSegmentationOutput(runtime_format="builtin")
 
         raw, id2label, runtime_format = self._infer(patch)
-        print(f"[FASHN] _infer: {time.perf_counter() - t0:.3f}s")
-
-        t1 = time.perf_counter()
         if isinstance(raw, dict) and "label_map" in raw:
             class_map = {int(k): v.lower().strip() for k, v in id2label.items()} if id2label else self.CLASS_MAP
             masks = _label_map_to_masks(raw["label_map"], class_map)
-            out = AdapterSegmentationOutput(
+            return AdapterSegmentationOutput(
                 masks=masks,
                 confidences={k: _mask_conf(v) for k, v in masks.items()},
                 runtime_format=runtime_format + ":label_map",
             )
-            print(f"[FASHN] postprocess label_map: {time.perf_counter() - t1:.3f}s")
-            return out
 
         masks: dict[str, object] = {}
         if isinstance(raw, list):
@@ -332,13 +325,11 @@ class FashnHumanParserAdapter:
                 if mask is not None and label and label != "background":
                     masks[label] = _safe_array(mask)
 
-        out = AdapterSegmentationOutput(
+        return AdapterSegmentationOutput(
             masks=masks,
             confidences={k: _mask_conf(v) for k, v in masks.items()},
             runtime_format=runtime_format + ":segments_list",
         )
-        print(f"[FASHN] postprocess segments_list: {time.perf_counter() - t1:.3f}s; labels={list(masks.keys())}")
-        return out
 
 
 class SCHPPascalPartParserAdapter:
@@ -749,7 +740,7 @@ class SegFormerHumanParserAdapter:
     def is_builtin_backend(self) -> bool:
         return self.config.is_builtin()
 
-    def _builtin_parse(self, frame: AssetFrame | list[list[list[float]]] | str, person: PersonDetection) -> ParsingPrediction:
+    def _builtin_parse(self, frame: FrameLike, person: PersonDetection) -> ParsingPrediction:
         feats = frame_to_features(frame)
         return ParsingPrediction(
             mask_ref=f"mask::builtin::{person.detection_id}",
@@ -761,8 +752,12 @@ class SegFormerHumanParserAdapter:
             occlusion_hints=["torso_visible" if feats[3] <= 0.6 else "torso_partial"],
         )
 
-    def parse(self, frame: AssetFrame | list[list[list[float]]] | str, persons: list[PersonDetection]) -> dict[str, ParsingPrediction]:
+    def parse(self, frame: FrameLike, persons: list[PersonDetection]) -> dict[str, ParsingPrediction]:
         result: dict[str, ParsingPrediction] = {}
+        self.last_runtime_formats = {}
+        profiler = None
+        if isinstance(frame, PerceptionFrameContext):
+            profiler = frame.get("profiler")
         if self.config.is_builtin():
             for person in persons:
                 result[person.detection_id] = self._builtin_parse(frame, person)
@@ -774,36 +769,40 @@ class SegFormerHumanParserAdapter:
                 }
             return result
 
-        t0 = time.perf_counter()
         frame_img = frame_to_numpy_rgb(frame)
-        print("parse: frame_to_numpy_rgb:", time.perf_counter() - t0)
 
         rgb = frame_img.rgb
         frame_size = (frame_img.width, frame_img.height)
         for person in persons:
-            tp = time.perf_counter()
-            patch = crop_rgb(rgb, person.bbox)
-            print("parse: crop_rgb:", time.perf_counter() - tp)
+            if profiler:
+                with profiler.track("roi_crop"):
+                    patch = crop_rgb(rgb, person.bbox)
+            else:
+                patch = crop_rgb(rgb, person.bbox)
+            if profiler:
+                with profiler.track("parser_inference"):
+                    fashn = self.fashn.parse_patch(patch)
+                    pascal = self.schp_pascal.parse_patch(patch)
+                    atr = self.schp_atr.parse_patch(patch)
+                    facer = self.facer.parse_patch(patch)
+            else:
+                fashn = self.fashn.parse_patch(patch)
+                pascal = self.schp_pascal.parse_patch(patch)
+                atr = self.schp_atr.parse_patch(patch)
+                facer = self.facer.parse_patch(patch)
 
-            tf = time.perf_counter()
-            fashn = self.fashn.parse_patch(patch)
-            print("parse: fashn.parse_patch:", time.perf_counter() - tf, fashn.runtime_format)
+            if profiler:
+                with profiler.track("fusion"):
+                    fused = self.fusion.fuse(person, fashn, pascal, atr, facer, frame_size=frame_size)
+            else:
+                fused = self.fusion.fuse(person, fashn, pascal, atr, facer, frame_size=frame_size)
 
-            ts = time.perf_counter()
-            pascal = self.schp_pascal.parse_patch(patch)
-            print("parse: schp_pascal.parse_patch:", time.perf_counter() - ts, pascal.runtime_format)
-
-            ta = time.perf_counter()
-            atr = self.schp_atr.parse_patch(patch)
-            print("parse: schp_atr.parse_patch:", time.perf_counter() - ta, atr.runtime_format)
-
-            tc = time.perf_counter()
-            facer = self.facer.parse_patch(patch)
-            print("parse: facer.parse_patch:", time.perf_counter() - tc, facer.runtime_format)
-
-            tu = time.perf_counter()
-            fused = self.fusion.fuse(person, fashn, pascal, atr, facer, frame_size=frame_size)
-            print("parse: fusion.fuse:", time.perf_counter() - tu)
+            self.last_runtime_formats[person.detection_id] = {
+                "fashn": fashn.runtime_format,
+                "schp_pascal": pascal.runtime_format,
+                "schp_atr": atr.runtime_format,
+                "facer": facer.runtime_format,
+            }
 
             result[person.detection_id] = fused
         return result

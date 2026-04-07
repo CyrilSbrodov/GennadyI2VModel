@@ -6,9 +6,6 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from utils_tensor import zeros
-
-
 @dataclass(slots=True)
 class InputOptions:
     target_duration_sec: float = 4.0
@@ -105,9 +102,7 @@ class InputAssetLayer:
         image = Image.open(path).convert("RGB")
         width, height = image.size
 
-        arr = np.asarray(image, dtype=np.uint8)
-        arr = arr.astype(np.float32) / 255.0
-        return arr, (width, height)
+        return np.asarray(image, dtype=np.uint8), (width, height)
 
     def _normalize_tensor(self, tensor: np.ndarray, profile: str) -> tuple[np.ndarray, tuple[int, int]]:
         h, w = tensor.shape[:2]
@@ -117,12 +112,11 @@ class InputAssetLayer:
         if (nw, nh) == (w, h):
             return self._color_normalize(tensor), (nw, nh)
 
-        # Через PIL это будет на порядки быстрее, чем твои Python-циклы
-        img = Image.fromarray((np.clip(tensor, 0.0, 1.0) * 255.0).astype(np.uint8), mode="RGB")
+        # Нормализация и resize делаются в векторизованном пути PIL/Numpy без Python-циклов.
+        img = Image.fromarray(tensor.astype(np.uint8), mode="RGB")
         img = img.resize((nw, nh), Image.BILINEAR)
 
-        arr = np.asarray(img, dtype=np.uint8).astype(np.float32) / 255.0
-        return self._color_normalize(arr), (nw, nh)
+        return self._color_normalize(np.asarray(img, dtype=np.uint8)), (nw, nh)
 
     def _color_normalize(self, tensor: np.ndarray) -> np.ndarray:
         return tensor
@@ -156,7 +150,7 @@ class InputAssetLayer:
             )
 
         if not frames:
-            debug_tensor = np.full((256, 256, 3), 0.5, dtype=np.float32)
+            debug_tensor = np.full((256, 256, 3), 127, dtype=np.uint8)
             frames = [AssetFrame(frame_id="debug_0", tensor=debug_tensor, width=256, height=256, source="debug://blank")]
             first_size = (256, 256)
             normalized_size = (256, 256)
@@ -195,7 +189,6 @@ class InputAssetLayer:
 
                 if frame_idx % max(1, stride) == 0:
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    frame = frame.astype(np.float32) / 255.0
                     nt, ns = self._normalize_tensor(frame, "balanced")
 
                     frames.append(
@@ -222,7 +215,7 @@ class InputAssetLayer:
             frames = [
                 AssetFrame(
                     frame_id=f"video_{i}",
-                    tensor=np.zeros((256, 256, 3), dtype=np.float32),
+                    tensor=np.zeros((256, 256, 3), dtype=np.uint8),
                     width=256,
                     height=256,
                     timestamp=i / fps,

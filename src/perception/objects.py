@@ -7,6 +7,7 @@ from core.input_layer import AssetFrame
 from core.schema import BBox
 from perception.backend import BackendInferenceEngine, frame_to_features
 from perception.detector import BackendConfig
+from perception.frame_context import FrameLike
 from perception.image_ops import frame_to_numpy_rgb, rgb_to_bgr, xyxy_to_norm_bbox
 
 
@@ -20,7 +21,7 @@ class ObjectPrediction:
 
 
 class ObjectDetector(Protocol):
-    def detect(self, frame: AssetFrame | list[list[list[float]]] | str) -> list[ObjectPrediction]:
+    def detect(self, frame: FrameLike) -> list[ObjectPrediction]:
         ...
 
 
@@ -43,7 +44,7 @@ class YoloObjectDetectorAdapter:
         self._model = YOLO(self.config.checkpoint or "yolov8n.pt")
         return self._model
 
-    def _detect_ultralytics(self, frame: AssetFrame | list[list[list[float]]] | str) -> list[ObjectPrediction]:
+    def _detect_ultralytics(self, frame: FrameLike) -> list[ObjectPrediction]:
         image = frame_to_numpy_rgb(frame)
         model = self._load_ultralytics()
         results = model.predict(source=rgb_to_bgr(image.rgb), verbose=False, conf=float(self.config.confidence_threshold), device=self.config.device)
@@ -72,7 +73,7 @@ class YoloObjectDetectorAdapter:
                 )
         return predictions
 
-    def detect(self, frame: AssetFrame | list[list[list[float]]] | str) -> list[ObjectPrediction]:
+    def detect(self, frame: FrameLike) -> list[ObjectPrediction]:
         if self.config.backend == "ultralytics":
             return self._detect_ultralytics(frame)
 
@@ -97,7 +98,7 @@ class MonoDepthEstimator:
         self.config = config or BackendConfig(checkpoint="checkpoints/depth.torch")
         self.engine = BackendInferenceEngine(self.source_name, self.config.backend, self.config.checkpoint)
 
-    def estimate(self, frame: AssetFrame | list[list[list[float]]] | str) -> float:
+    def estimate(self, frame: FrameLike) -> float:
         feats = frame_to_features(frame)
         if self.config.backend in {"torch", "onnx"}:
             feats = self.engine.infer(feats)
