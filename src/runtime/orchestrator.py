@@ -10,12 +10,11 @@ from dynamics.state_update import apply_delta
 from learned.factory import BackendBundle, BackendConfig, LearnedBackendFactory
 from learned.interfaces import DynamicsTransitionRequest, PatchSynthesisRequest, TemporalRefinementRequest
 from learned.parity import (
+    build_parity_result,
     text_output_to_contract,
     dynamics_io_to_contract,
     patch_io_to_contract,
-    semantic_parity_checks,
     temporal_io_to_contract,
-    validate_parity,
 )
 from memory.summaries import AppearanceMemorySummarizer
 from memory.video_memory import MemoryManager
@@ -101,12 +100,17 @@ class GennadyEngine:
         action_plan = self.intent_parser.parse(request.text, scene_graph=scene_graph)
         text_encoding = self.backends.text_encoder.encode(request.text, scene_graph=scene_graph, action_plan=action_plan)
         text_contract = text_output_to_contract(request.text, text_encoding)
-        text_missing = validate_parity(text_contract, ["text", "parsed_actions", "action_embedding", "target_entities", "target_objects", "temporal_decomposition", "constraints"])
-        text_semantic = semantic_parity_checks(stage="text", contract=text_contract, request={"text": request.text, "actions": action_plan.actions}, output=text_encoding)
-        if text_missing:
-            fallback_log.append(f"step=0:text_parity_missing={text_missing}")
+        text_parity = build_parity_result(
+            contract=text_contract,
+            required_fields=["text", "parsed_actions", "action_embedding", "target_entities", "target_objects", "temporal_decomposition", "constraints"],
+            stage="text",
+            request={"text": request.text, "actions": action_plan.actions},
+            output=text_encoding,
+        )
+        if text_parity["missing_fields"]:
+            fallback_log.append(f"step=0:text_parity_missing={text_parity['missing_fields']}")
         for severity in ("errors", "warnings", "traces"):
-            for issue in text_semantic.get(severity, []):
+            for issue in text_parity.get(severity, []):
                 fallback_log.append(f"step=0:text_semantic_{severity}={issue}")
         state_plan = self.planner.expand(
             scene_graph,
@@ -133,6 +137,9 @@ class GennadyEngine:
             "count": 0,
             "synthesis_mode_counts": {},
             "strategy_counts": {},
+            "by_strategy": {},
+            "by_synthesis_mode": {},
+            "by_family": {"known_hidden": {"count": 0, "confidence_sum": 0.0, "quality_hint_sum": 0.0}, "unknown_hidden": {"count": 0, "confidence_sum": 0.0, "quality_hint_sum": 0.0}, "hidden_reveal": {"count": 0, "confidence_sum": 0.0, "quality_hint_sum": 0.0}},
         }
 
         for planned_state in state_plan.steps[1 : profile.max_transition_steps + 1]:
@@ -153,12 +160,17 @@ class GennadyEngine:
             )
             transition_output = self.backends.dynamics_backend.predict_transition(transition_request)
             parity_contract = dynamics_io_to_contract(transition_request, transition_output)
-            missing_fields = validate_parity(parity_contract, ["graph_before", "graph_after", "delta_contract", "transition_context"])
-            semantic_dynamics = semantic_parity_checks(stage="dynamics", contract=parity_contract, request=transition_request, output=transition_output)
-            if missing_fields:
-                fallback_log.append(f"step={planned_state.step_index}:dynamics_parity_missing={missing_fields}")
+            dynamics_parity = build_parity_result(
+                contract=parity_contract,
+                required_fields=["graph_before", "graph_after", "delta_contract", "transition_context"],
+                stage="dynamics",
+                request=transition_request,
+                output=transition_output,
+            )
+            if dynamics_parity["missing_fields"]:
+                fallback_log.append(f"step={planned_state.step_index}:dynamics_parity_missing={dynamics_parity['missing_fields']}")
             for severity in ("errors", "warnings", "traces"):
-                for issue in semantic_dynamics.get(severity, []):
+                for issue in dynamics_parity.get(severity, []):
                     fallback_log.append(f"step={planned_state.step_index}:dynamics_semantic_{severity}={issue}")
 
             delta = transition_output.delta
@@ -166,6 +178,7 @@ class GennadyEngine:
             patches: list[RenderedPatch] = []
             patch_step_debug: list[dict[str, object]] = []
             step_hidden_reconstruction = False
+            step_hidden_cases = 0
             for region in changed_regions[: profile.max_roi_count]:
                 patch_channels = self.build_patch_memory_channels(memory_channels)
                 patch_request = PatchSynthesisRequest(
@@ -181,26 +194,26 @@ class GennadyEngine:
                 )
                 patch_out = self.backends.patch_backend.synthesize_patch(patch_request)
                 patch_contract = patch_io_to_contract(patch_request, patch_out)
-                missing_patch_fields = validate_parity(
-                    patch_contract,
-                    ["roi_before", "roi_after", "region_metadata", "selected_strategy", "transition_context"],
+                patch_parity = build_parity_result(
+                    contract=patch_contract,
+                    required_fields=["roi_before", "roi_after", "region_metadata", "selected_strategy", "transition_context"],
+                    stage="patch",
+                    request=patch_request,
+                    output=patch_out,
                 )
-                semantic_patch = semantic_parity_checks(stage="patch", contract=patch_contract, request=patch_request, output=patch_out)
                 strategy = str(patch_out.execution_trace.get("selected_render_strategy", ""))
                 synth_mode = str(patch_out.execution_trace.get("synthesis_mode", "deterministic"))
+                patch_hidden_case = False
                 if "KNOWN_HIDDEN_REVEAL" in strategy:
                     hidden_recon_stats["known_hidden"] += 1
                     hidden_recon_stats["hidden_reveal"] += 1
-                    step_hidden_reconstruction = True
+                    patch_hidden_case = True
                 elif "UNKNOWN_HIDDEN_SYNTHESIS" in strategy:
                     hidden_recon_stats["unknown_hidden"] += 1
+                    patch_hidden_case = True
+                if patch_hidden_case:
                     step_hidden_reconstruction = True
-                if missing_patch_fields:
-                    fallback_log.append(f"step={planned_state.step_index}:patch_parity_missing={missing_patch_fields}")
-                if semantic_patch:
-                    for severity in ("errors", "warnings", "traces"):
-                        fallback_log.extend([f"step={planned_state.step_index}:patch_semantic_{severity}={x}" for x in semantic_patch.get(severity, [])])
-                if step_hidden_reconstruction:
+                    step_hidden_cases += 1
                     hint = float(patch_out.execution_trace.get("patch_refinement_strength", 0.0) or 0.0)
                     hidden_recon_quality["count"] += 1
                     hidden_recon_quality["confidence_sum"] += float(patch_out.confidence)
@@ -208,6 +221,23 @@ class GennadyEngine:
                     hidden_recon_quality["refinement_strength_sum"] += hint
                     hidden_recon_quality["synthesis_mode_counts"][synth_mode] = int(hidden_recon_quality["synthesis_mode_counts"].get(synth_mode, 0)) + 1
                     hidden_recon_quality["strategy_counts"][strategy] = int(hidden_recon_quality["strategy_counts"].get(strategy, 0)) + 1
+                    family = "hidden_reveal" if "REVEAL" in strategy else ("unknown_hidden" if "UNKNOWN_HIDDEN" in strategy else "known_hidden")
+                    fam = hidden_recon_quality["by_family"][family]
+                    fam["count"] += 1
+                    fam["confidence_sum"] += float(patch_out.confidence)
+                    fam["quality_hint_sum"] += hint
+                    strat = hidden_recon_quality["by_strategy"].setdefault(strategy, {"count": 0, "confidence_sum": 0.0, "quality_hint_sum": 0.0})
+                    strat["count"] += 1
+                    strat["confidence_sum"] += float(patch_out.confidence)
+                    strat["quality_hint_sum"] += hint
+                    mode = hidden_recon_quality["by_synthesis_mode"].setdefault(synth_mode, {"count": 0, "confidence_sum": 0.0, "quality_hint_sum": 0.0})
+                    mode["count"] += 1
+                    mode["confidence_sum"] += float(patch_out.confidence)
+                    mode["quality_hint_sum"] += hint
+                if patch_parity["missing_fields"]:
+                    fallback_log.append(f"step={planned_state.step_index}:patch_parity_missing={patch_parity['missing_fields']}")
+                for severity in ("errors", "warnings", "traces"):
+                    fallback_log.extend([f"step={planned_state.step_index}:patch_semantic_{severity}={x}" for x in patch_parity.get(severity, [])])
                 patch_step_debug.append(
                     {
                         "region_id": region.region_id,
@@ -217,13 +247,12 @@ class GennadyEngine:
                         "retrieval_summary": str(patch_request.retrieval_summary)[:120],
                         "learned_ready": patch_out.metadata.get("learned_ready_usage", {}),
                         "hidden_reconstruction": {
-                            "is_case": step_hidden_reconstruction,
+                            "patch_hidden_reconstruction_case": patch_hidden_case,
                             "strategy": strategy,
                             "mode": synth_mode,
                             "quality_hint": patch_out.execution_trace.get("patch_refinement_strength", 0.0),
                         },
-                        "missing_fields": missing_patch_fields,
-                        "semantic_issues": semantic_patch,
+                        "parity": patch_parity,
                     }
                 )
                 patches.append(
@@ -254,22 +283,18 @@ class GennadyEngine:
             )
             temporal_out = self.backends.temporal_backend.refine_temporal(temporal_request)
             temporal_contract = temporal_io_to_contract(temporal_request, temporal_out)
-            missing_temporal_fields = validate_parity(
-                temporal_contract,
-                ["previous_frame", "composed_frame", "target_frame", "changed_regions", "scene_transition_context"],
-            )
-            semantic_temporal = semantic_parity_checks(
-                stage="temporal",
+            temporal_parity = build_parity_result(
                 contract=temporal_contract,
+                required_fields=["previous_frame", "composed_frame", "target_frame", "changed_regions", "scene_transition_context"],
+                stage="temporal",
                 request=temporal_request,
                 output=temporal_out,
                 changed_regions_count=len(patches),
             )
-            if missing_temporal_fields:
-                fallback_log.append(f"step={planned_state.step_index}:temporal_parity_missing={missing_temporal_fields}")
-            if semantic_temporal:
-                for severity in ("errors", "warnings", "traces"):
-                    fallback_log.extend([f"step={planned_state.step_index}:temporal_semantic_{severity}={x}" for x in semantic_temporal.get(severity, [])])
+            if temporal_parity["missing_fields"]:
+                fallback_log.append(f"step={planned_state.step_index}:temporal_parity_missing={temporal_parity['missing_fields']}")
+            for severity in ("errors", "warnings", "traces"):
+                fallback_log.extend([f"step={planned_state.step_index}:temporal_semantic_{severity}={x}" for x in temporal_parity.get(severity, [])])
             stable_frame = temporal_out.refined_frame if profile.temporal_refinement else composed
 
             scene_graph = apply_delta(scene_graph, delta)
@@ -310,7 +335,8 @@ class GennadyEngine:
                     },
                     "patch": patch_step_debug,
                     "hidden_reconstruction": {
-                        "step_has_case": step_hidden_reconstruction,
+                        "step_has_hidden_reconstruction": step_hidden_reconstruction,
+                        "step_hidden_reconstruction_case_count": step_hidden_cases,
                         "known_hidden_count": hidden_recon_stats["known_hidden"],
                         "unknown_hidden_count": hidden_recon_stats["unknown_hidden"],
                         "hidden_reveal_count": hidden_recon_stats["hidden_reveal"],
@@ -326,14 +352,14 @@ class GennadyEngine:
                     },
                     "parity": {
                         "missing_fields": {
-                            "dynamics": missing_fields,
-                            "temporal": missing_temporal_fields,
-                            "patch": [p["missing_fields"] for p in patch_step_debug],
+                            "dynamics": dynamics_parity["missing_fields"],
+                            "temporal": temporal_parity["missing_fields"],
+                            "patch": [p["parity"]["missing_fields"] for p in patch_step_debug],
                         },
                         "semantic_issues": {
-                            "dynamics": semantic_dynamics,
-                            "temporal": semantic_temporal,
-                            "patch": [p["semantic_issues"] for p in patch_step_debug],
+                            "dynamics": dynamics_parity,
+                            "temporal": temporal_parity,
+                            "patch": [p["parity"] for p in patch_step_debug],
                         },
                     },
                 }
@@ -392,10 +418,7 @@ class GennadyEngine:
                         "patch": "PatchSynthesisRequest/Output->PatchSynthesisContract",
                         "temporal": "TemporalRefinementRequest/Output->TemporalConsistencyContract",
                     },
-                    "text_parity": {
-                        "missing_fields": text_missing,
-                        "semantic_issues": text_semantic,
-                    },
+                    "text_parity": text_parity,
                     "hidden_reconstruction_summary": {
                         **hidden_recon_stats,
                         "average_hidden_reconstruction_confidence": (hidden_recon_quality["confidence_sum"] / hidden_recon_quality["count"]) if hidden_recon_quality["count"] else 0.0,
@@ -403,6 +426,9 @@ class GennadyEngine:
                         "average_quality_hint": (hidden_recon_quality["quality_hint_sum"] / hidden_recon_quality["count"]) if hidden_recon_quality["count"] else 0.0,
                         "count_by_synthesis_mode": hidden_recon_quality["synthesis_mode_counts"],
                         "count_by_selected_strategy": hidden_recon_quality["strategy_counts"],
+                        "quality_by_selected_strategy": hidden_recon_quality["by_strategy"],
+                        "quality_by_synthesis_mode": hidden_recon_quality["by_synthesis_mode"],
+                        "quality_by_hidden_family": hidden_recon_quality["by_family"],
                     },
                 },
             },

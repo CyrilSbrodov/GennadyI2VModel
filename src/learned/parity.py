@@ -27,8 +27,19 @@ class ParityResult(TypedDict):
     traces: list[str]
 
 
+class StructuredParityResult(TypedDict):
+    missing_fields: list[str]
+    errors: list[str]
+    warnings: list[str]
+    traces: list[str]
+
+
 def _empty_parity() -> ParityResult:
     return {"errors": [], "warnings": [], "traces": []}
+
+
+def empty_structured_parity() -> StructuredParityResult:
+    return {"missing_fields": [], "errors": [], "warnings": [], "traces": []}
 
 
 def _push(parity: ParityResult, severity: str, issue: str) -> None:
@@ -174,6 +185,31 @@ def temporal_io_to_contract(request: TemporalRefinementRequest, output: Temporal
 def validate_parity(payload: dict[str, object], required_fields: list[str]) -> list[str]:
     missing = [name for name in required_fields if name not in payload]
     return missing
+
+
+def build_parity_result(
+    *,
+    contract: dict[str, object],
+    required_fields: list[str],
+    stage: str,
+    request: object,
+    output: object,
+    changed_regions_count: int | None = None,
+) -> StructuredParityResult:
+    missing = validate_parity(contract, required_fields)
+    semantic = semantic_parity_checks(
+        stage=stage,
+        contract=contract,
+        request=request,
+        output=output,
+        changed_regions_count=changed_regions_count,
+    )
+    result = empty_structured_parity()
+    result["missing_fields"] = missing
+    result["errors"].extend([f"missing_field:{m}" for m in missing])
+    for severity in ("errors", "warnings", "traces"):
+        result[severity].extend(semantic.get(severity, []))
+    return result
 
 
 def semantic_parity_checks(
