@@ -19,12 +19,35 @@ def build_text_eval_payload(contract: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _delta_magnitude_from_contract(delta: dict[str, object], transition_context: dict[str, object]) -> float:
+    if "magnitude" in delta:
+        return float(delta["magnitude"])
+
+    numeric_fields = ["pose_deltas", "interaction_deltas", "garment_deltas", "expression_deltas"]
+    magnitude = 0.0
+    for field_name in numeric_fields:
+        payload = delta.get(field_name, {})
+        if isinstance(payload, dict):
+            magnitude += sum(abs(float(v)) for v in payload.values() if isinstance(v, (int, float)))
+    if magnitude > 0.0:
+        return magnitude
+
+    diagnostics = transition_context.get("diagnostics", {}) if isinstance(transition_context, dict) else {}
+    if isinstance(diagnostics, dict) and "delta_magnitude" in diagnostics:
+        return float(diagnostics["delta_magnitude"])
+
+    return -1.0
+
+
 def build_graph_eval_payload(contract: dict[str, object]) -> dict[str, object]:
     delta = contract.get("delta_contract", {}) if isinstance(contract, dict) else {}
-    magnitude = float(delta.get("magnitude", 0.0)) if isinstance(delta, dict) else 0.0
+    transition_context = contract.get("transition_context", {}) if isinstance(contract, dict) else {}
+    magnitude = _delta_magnitude_from_contract(delta if isinstance(delta, dict) else {}, transition_context if isinstance(transition_context, dict) else {})
+    confidence = 0.0 if magnitude < 0.0 else 1.0
     return {
-        "delta_match": max(0.0, 1.0 - min(1.0, magnitude)),
+        "delta_match": 0.0 if magnitude < 0.0 else max(0.0, 1.0 - min(1.0, magnitude)),
         "delta_magnitude": magnitude,
+        "delta_signal_confidence": confidence,
     }
 
 
@@ -39,9 +62,10 @@ def build_patch_eval_payload(contract: dict[str, object]) -> dict[str, object]:
 
 def build_temporal_eval_payload(contract: dict[str, object]) -> dict[str, object]:
     changed = contract.get("changed_regions", []) if isinstance(contract, dict) else []
-    drift = 0.2 + 0.05 * max(0, len(changed) - 1)
+    metadata = contract.get("region_consistency_metadata", {}) if isinstance(contract, dict) else {}
+    drift = float(metadata.get("temporal_drift", 0.2 + 0.05 * max(0, len(changed) - 1))) if isinstance(metadata, dict) else (0.2 + 0.05 * max(0, len(changed) - 1))
     return {
-        "temporal_drift": min(1.0, drift),
+        "temporal_drift": min(1.0, max(0.0, drift)),
         "changed_count": float(len(changed)),
     }
 

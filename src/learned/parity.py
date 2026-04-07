@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import asdict
 
+from dynamics.state_update import apply_delta
 from learned.interfaces import (
     DynamicsTransitionOutput,
     DynamicsTransitionRequest,
@@ -31,10 +33,18 @@ def text_output_to_contract(text: str, output: TextEncodingOutput) -> TextAction
     }
 
 
+def _build_graph_after(request: DynamicsTransitionRequest, output: DynamicsTransitionOutput):
+    predicted = output.metadata.get("predicted_graph_after")
+    if predicted is not None:
+        return predicted
+    before = copy.deepcopy(request.graph_state)
+    return apply_delta(before, output.delta)
+
+
 def dynamics_io_to_contract(request: DynamicsTransitionRequest, output: DynamicsTransitionOutput) -> GraphTransitionContract:
     from training.learned_contracts import build_graph_transition_contract
 
-    after = request.graph_state
+    after = _build_graph_after(request, output)
     return build_graph_transition_contract(
         before=request.graph_state,
         after=after,
@@ -43,6 +53,7 @@ def dynamics_io_to_contract(request: DynamicsTransitionRequest, output: Dynamics
             "step_context": request.step_context,
             "text_tokens": request.text_action_summary.structured_action_tokens,
             "diagnostics": output.diagnostics,
+            "backend": output.metadata.get("backend", "unknown"),
         },
     )
 
@@ -79,6 +90,40 @@ def temporal_io_to_contract(request: TemporalRefinementRequest, output: Temporal
 def validate_parity(payload: dict[str, object], required_fields: list[str]) -> list[str]:
     missing = [name for name in required_fields if name not in payload]
     return missing
+
+
+def semantic_parity_checks(
+    *,
+    stage: str,
+    contract: dict[str, object],
+    request: object,
+    output: object,
+    changed_regions_count: int | None = None,
+) -> list[str]:
+    issues: list[str] = []
+    if stage == "dynamics":
+        delta_contract = contract.get("delta_contract", {}) if isinstance(contract, dict) else {}
+        if isinstance(delta_contract, dict):
+            affected = list(delta_contract.get("affected_regions", []))
+            before_idx = ((contract.get("graph_before") or {}).get("frame_index", -1)) if isinstance(contract.get("graph_before"), dict) else -1
+            after_idx = ((contract.get("graph_after") or {}).get("frame_index", -1)) if isinstance(contract.get("graph_after"), dict) else -1
+            if affected and after_idx <= before_idx:
+                issues.append("graph_after_not_progressed_for_non_empty_delta")
+            region_mode = contract.get("region_transition_mode", {})
+            if affected and (not isinstance(region_mode, dict) or not region_mode):
+                issues.append("region_transition_mode_missing_for_affected_regions")
+    if stage == "patch":
+        selected = str(contract.get("selected_strategy", "")) if isinstance(contract, dict) else ""
+        patch_obj = getattr(output, "rgb_patch", None)
+        if patch_obj and selected.strip() in {"", "unknown"}:
+            issues.append("selected_strategy_missing_for_non_empty_patch")
+        if isinstance(request, PatchSynthesisRequest) and request.memory_channels.get("identity") and not request.identity_embedding:
+            issues.append("identity_channel_requested_but_embedding_empty")
+    if stage == "temporal":
+        changed = contract.get("changed_regions", []) if isinstance(contract, dict) else []
+        if (changed_regions_count or 0) > 0 and not changed:
+            issues.append("changed_regions_missing_despite_patch_updates")
+    return issues
 
 
 def to_debug_dict(obj: object) -> dict[str, object]:
