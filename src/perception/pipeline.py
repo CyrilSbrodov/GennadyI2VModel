@@ -50,6 +50,13 @@ class PersonFacts:
     occlusion_hints: list[str] = field(default_factory=list)
     body_parts: list[dict] = field(default_factory=list)
     face_regions: list[dict] = field(default_factory=list)
+    garment_masks: dict[str, str] = field(default_factory=dict)
+    body_part_masks: dict[str, str] = field(default_factory=dict)
+    face_region_masks: dict[str, str] = field(default_factory=dict)
+    accessory_masks: dict[str, str] = field(default_factory=dict)
+    coverage_hints: dict[str, list[str]] = field(default_factory=dict)
+    visibility_hints: dict[str, str] = field(default_factory=dict)
+    provenance_by_region: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -218,7 +225,19 @@ class PerceptionPipeline:
             body_parts = []
             face_regions = []
             if parsed:
-                garments = [{"type": g.garment_type, "state": g.state, "confidence": g.confidence, "source": g.source} for g in parsed.garments]
+                garments = [
+                    {
+                        "type": g.garment_type,
+                        "state": g.state,
+                        "confidence": g.confidence,
+                        "source": g.source,
+                        "mask_ref": g.mask_ref,
+                        "coverage_targets": g.coverage_targets,
+                        "attachment_targets": g.attachment_targets,
+                        "layer_hint": g.layer_hint,
+                    }
+                    for g in parsed.garments
+                ]
                 body_parts = [
                     {"part_type": b.part_type, "mask_ref": b.mask_ref, "confidence": b.confidence, "visibility": b.visibility, "source": b.source}
                     for b in parsed.body_parts
@@ -256,6 +275,13 @@ class PerceptionPipeline:
                     occlusion_hints=(parsed.occlusion_hints if parsed else []),
                     body_parts=body_parts,
                     face_regions=face_regions,
+                    garment_masks=(parsed.enriched.garment_masks if parsed else {}),
+                    body_part_masks=(parsed.enriched.body_part_masks if parsed else {}),
+                    face_region_masks=(parsed.enriched.face_region_masks if parsed else {}),
+                    accessory_masks=(parsed.enriched.accessory_masks if parsed else {}),
+                    coverage_hints=(parsed.enriched.coverage_hints if parsed else {}),
+                    visibility_hints=(parsed.enriched.visibility_hints if parsed else {}),
+                    provenance_by_region=(parsed.enriched.provenance_by_region if parsed else {}),
                 )
             )
 

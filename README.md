@@ -78,16 +78,16 @@
 
 > Важно: часть текущих датасетов остаётся pseudo-labeled baseline для smoke/debug. Контракты и структуры данных уже пригодны как learned-ready входы.
 
-## Perception backends (builtin vs real)
+## Perception parser foundation (production-oriented stack)
 
-`PerceptionPipeline` поддерживает backend-конфиг для perception модулей. Для parser теперь используется **human-centric stack** (`SegFormerHumanParserAdapter`) из 4 подпарсеров + fusion:
+`PerceptionPipeline` использует **явный multi-parser stack** в `SegFormerHumanParserAdapter`:
 
-- person segmentation (`mediapipe` SelfieSegmentation или `builtin`),
-- body part parser (`hf` human parsing model или `builtin`),
-- garment parser (`hf` clothing/human parsing model или `builtin`),
-- face region parser (`mediapipe` FaceMesh или `builtin`).
+1. **Primary human+garment parser:** `fashn-ai/fashn-human-parser` (`backend="fashn"`).
+2. **Structural body refinement:** `SCHP Pascal-Person-Part` (`backend="schp_pascal"`).
+3. **Optional garment/body refinement:** `SCHP ATR` (`backend="schp_atr"`).
+4. **Face parser:** `FacePerceiver/facer` (`backend="facer"`, variant `farl/lapa/448` или `farl/celebm/448`).
 
-Важно: parser backend `hf` ожидает **модель human/clothing parsing**, а не generic scene segmentation.
+Это не generic “любой HF model_id”. Для каждого backend есть отдельный adapter и явный label mapping.
 
 Пример builtin режима:
 
@@ -106,10 +106,10 @@ from perception.pipeline import PerceptionBackendsConfig, PerceptionPipeline
 from perception.parser import ParserBackendConfig, ParserStackConfig
 
 parser_cfg = ParserStackConfig(
-    person_segmentation=ParserBackendConfig(backend="mediapipe"),
-    body_parts=ParserBackendConfig(backend="hf", model_id="<human-parsing-model>"),
-    garments=ParserBackendConfig(backend="hf", model_id="<clothing-parsing-model>"),
-    face_regions=ParserBackendConfig(backend="mediapipe"),
+    primary_human_parser=ParserBackendConfig(backend="fashn", variant="fashn-ai/fashn-human-parser"),
+    structural_body_parser=ParserBackendConfig(backend="schp_pascal", variant="<schp_pascal_checkpoint>"),
+    garment_refinement_parser=ParserBackendConfig(backend="schp_atr", variant="<schp_atr_checkpoint>"),
+    face_parser=ParserBackendConfig(backend="facer", variant="farl/lapa/448"),
 )
 
 pipe = PerceptionPipeline(backends=PerceptionBackendsConfig(parser=parser_cfg))
@@ -117,12 +117,13 @@ out = pipe.analyze(frame_tensor)
 ```
 
 Что реально умеет parser stack сейчас:
-- person mask и mask_ref с payload в in-memory mask store,
-- body-part masks (только для меток, которые реально есть в выходе выбранной модели),
-- garment predictions (только для реально распознанных garment labels, без scene-label hacks),
-- face-region hints (face/eyes/mouth),
-- occlusion hints из масок (torso/arms/lower body, fragmented/uncertain).
+- `FASHN` даёт primary human/garment masks (`face/hair/top/dress/skirt/pants/belt/bag/hat/scarf/glasses/arms/hands/legs/feet/torso/jewelry`);
+- `SCHP Pascal` уточняет body topology (`head/torso/upper_arm/lower_arm/upper_leg/lower_leg`) без выдумывания side-классов;
+- `SCHP ATR` добавляет garment/body fallback (`upper_clothes/pants/skirt/dress/belt/bag/scarf/arm_region/leg_region`);
+- `FACER` даёт face regions (`face_skin`, `hairline_or_hair_face_boundary`, `eyes`, `brows`, `nose`, `mouth`, `upper_lip`, `lower_lip`);
+- fusion-приоритеты: `FACER > FASHN` для face, `FASHN > ATR` для garments, `SCHP Pascal > FASHN` для body topology;
+- enriched payload в parser output: `person_mask_ref`, `body_part_masks`, `garment_masks`, `face_region_masks`, `accessory_masks`, `coverage_hints`, `visibility_hints`, `provenance_by_region`.
 
 Что пока ограничено:
-- качество и детализация body/garment классов зависят от конкретной выбранной модели на HF,
-- нет встроенной поставки весов в репозиторий, нужны внешние model_id/веса.
+- для SCHP/FACER в репозитории нет встроенных весов, нужен внешний runtime integration;
+- fallback path остаётся builtin-safe, если конкретный backend недоступен.
