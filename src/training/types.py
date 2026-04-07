@@ -7,7 +7,16 @@ from typing import Protocol
 @dataclass(slots=True)
 class TrainingConfig:
     stage_order: list[str] = field(
-        default_factory=lambda: ["perception", "representation", "dynamics", "renderer"]
+        default_factory=lambda: [
+            "perception",
+            "representation",
+            "text_encoder",
+            "dynamics",
+            "dynamics_transition",
+            "renderer",
+            "patch_synthesis",
+            "temporal_refinement",
+        ]
     )
     epochs: int = 2
     train_size: int = 8
