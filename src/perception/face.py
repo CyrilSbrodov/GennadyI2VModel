@@ -8,6 +8,7 @@ from typing import Protocol
 from core.schema import ExpressionState, OrientationState
 from perception.backend import BackendInferenceEngine, frame_to_features
 from perception.detector import BackendConfig, PersonDetection
+from perception.frame_context import FrameLike
 
 
 @dataclass(slots=True)
@@ -21,7 +22,7 @@ class FacePrediction:
 
 
 class FaceAnalyzer(Protocol):
-    def analyze(self, frame: AssetFrame | list[list[list[float]]] | str, persons: list[PersonDetection]) -> dict[str, FacePrediction]:
+    def analyze(self, frame: FrameLike, persons: list[PersonDetection]) -> dict[str, FacePrediction]:
         ...
 
 
@@ -32,7 +33,7 @@ class EmoNetFaceAnalyzerAdapter:
         self.config = config or BackendConfig(checkpoint="checkpoints/emonet.torch")
         self.engine = BackendInferenceEngine(self.source_name, self.config.backend, self.config.checkpoint)
 
-    def analyze(self, frame: AssetFrame | list[list[list[float]]] | str, persons: list[PersonDetection]) -> dict[str, FacePrediction]:
+    def analyze(self, frame: FrameLike, persons: list[PersonDetection]) -> dict[str, FacePrediction]:
         result: dict[str, FacePrediction] = {}
         feats = frame_to_features(frame)
         if self.config.backend in {"torch", "onnx"}:

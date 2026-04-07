@@ -6,6 +6,7 @@ from typing import Protocol
 from core.input_layer import AssetFrame
 from core.schema import BBox
 from perception.backend import BackendInferenceEngine, CheckpointManager, CheckpointSpec, frame_to_features
+from perception.frame_context import FrameLike
 from perception.image_ops import frame_to_numpy_rgb, rgb_to_bgr, xyxy_to_norm_bbox
 
 
@@ -33,7 +34,7 @@ class DetectorOutput:
 
 
 class Detector(Protocol):
-    def detect(self, frame: AssetFrame | list[list[list[float]]] | str) -> DetectorOutput:
+    def detect(self, frame: FrameLike) -> DetectorOutput:
         ...
 
 
@@ -45,7 +46,7 @@ class YoloPersonDetectorAdapter:
         self.engine = BackendInferenceEngine(self.source_name, self.config.backend, self.config.checkpoint)
         self._model = None
 
-    def _detect_builtin(self, frame: AssetFrame | list[list[list[float]]] | str) -> DetectorOutput:
+    def _detect_builtin(self, frame: FrameLike) -> DetectorOutput:
         feats = frame_to_features(frame)
         x = min(0.8, max(0.02, feats[0] * 0.6))
         y = min(0.8, max(0.02, feats[1] * 0.5))
@@ -76,7 +77,7 @@ class YoloPersonDetectorAdapter:
         self._model = YOLO(model_name)
         return self._model
 
-    def _detect_ultralytics(self, frame: AssetFrame | list[list[list[float]]] | str) -> DetectorOutput:
+    def _detect_ultralytics(self, frame: FrameLike) -> DetectorOutput:
         image = frame_to_numpy_rgb(frame)
         model = self._load_ultralytics()
         results = model.predict(
@@ -116,7 +117,7 @@ class YoloPersonDetectorAdapter:
                 CheckpointSpec(self.source_name, self.config.backend, self.config.checkpoint)
             )
 
-    def detect(self, frame: AssetFrame | list[list[list[float]]] | str) -> DetectorOutput:
+    def detect(self, frame: FrameLike) -> DetectorOutput:
         if self.config.backend == "builtin":
             return self._detect_builtin(frame)
         if self.config.backend == "ultralytics":

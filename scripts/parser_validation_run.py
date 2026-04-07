@@ -1,17 +1,5 @@
 from __future__ import annotations
 
-import time
-
-def mark(msg: str) -> float:
-    t = time.perf_counter()
-    print(f"[T] {msg}")
-    return t
-
-def done(msg: str, t0: float) -> None:
-    dt = time.perf_counter() - t0
-    print(f"[T] {msg}: {dt:.3f}s")
-
-t0 = mark("script start")
 import argparse
 import json
 import sys
@@ -25,12 +13,13 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from core.input_layer import InputAssetLayer
+from perception.image_ops import frame_to_numpy_rgb
 from perception.mask_projection import project_mask_to_frame
 from perception.mask_store import DEFAULT_MASK_STORE
 from perception.parser import ParserBackendConfig, ParserStackConfig
 from perception.parser_debug import export_parser_debug_artifacts
-from perception.pipeline import PerceptionBackendsConfig, PerceptionPipeline
-
+from perception.pipeline import ParserOnlyPipeline, PerceptionBackendsConfig, PerceptionPipeline
+from perception.profiling import StageTimer
 
 RUNTIME_FAIL_TYPES = {
     "image_decode_failed",
@@ -40,7 +29,6 @@ RUNTIME_FAIL_TYPES = {
     "validation_invalid_due_to_fallback",
 }
 
-done("after imports", t0)
 
 def build_parser_config(args: argparse.Namespace) -> ParserStackConfig:
     return ParserStackConfig(
@@ -52,12 +40,7 @@ def build_parser_config(args: argparse.Namespace) -> ParserStackConfig:
 
 
 def _aliases_for_expected_body_part(part: str) -> set[str]:
-    aliases = {
-        "arms": {"arms", "upper_arm", "lower_arm", "hands"},
-        "legs": {"legs", "upper_leg", "lower_leg", "feet"},
-        "torso": {"torso"},
-        "head": {"head"},
-    }
+    aliases = {"arms": {"arms", "upper_arm", "lower_arm", "hands"}, "legs": {"legs", "upper_leg", "lower_leg", "feet"}, "torso": {"torso"}, "head": {"head"}}
     return aliases.get(part, {part})
 
 
@@ -85,28 +68,19 @@ def _semantic_failures(record: dict[str, Any], out: Any) -> list[str]:
         reasons.append("person_missing")
     if expected.get("person") is True and not person_mask_present:
         reasons.append("person_mask_missing")
-
     garments_any_of = expected.get("garments_any_of") or []
     if garments_any_of and not any(g in detected_garments for g in garments_any_of):
         reasons.append("garments_any_of_missing")
-
     body_expected = expected.get("body_parts_expected") or []
     if body_expected:
-        found = False
-        for exp in body_expected:
-            if detected_body_parts.intersection(_aliases_for_expected_body_part(str(exp))):
-                found = True
-                break
+        found = any(detected_body_parts.intersection(_aliases_for_expected_body_part(str(exp))) for exp in body_expected)
         if not found:
             reasons.append("body_parts_expected_missing")
-
     if expected.get("face_regions_expected") is True and face_region_mask_count <= 0:
         reasons.append("face_regions_missing")
-
     accessories_any_of = expected.get("accessories_any_of") or []
     if accessories_any_of and not any(a in detected_accessories for a in accessories_any_of):
         reasons.append("accessories_any_of_missing")
-
     return reasons
 
 
@@ -140,43 +114,38 @@ def _base_report(record: dict[str, Any]) -> dict[str, Any]:
         "image_decode_failed": False,
         "frame_tensor_missing": False,
         "passed": False,
+        "timings_ms": {},
     }
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Run parser validation manifest through PerceptionPipeline")
+    ap = argparse.ArgumentParser(description="Run parser validation manifest through perception runtime")
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--strict-native-parser", action="store_true")
-
+    ap.add_argument("--profile", action="store_true")
+    ap.add_argument("--full-path", action="store_true", help="Use full PerceptionPipeline instead of parser-only pipeline")
+    ap.add_argument("--detector-backend", default="builtin", choices=["builtin", "ultralytics"])
+    ap.add_argument("--detector-model", default="yolov8n.pt")
     ap.add_argument("--fashn-backend", default="fashn")
     ap.add_argument("--fashn-model", default="fashn-ai/fashn-human-parser")
-
     ap.add_argument("--schp-pascal-backend", default="builtin")
     ap.add_argument("--schp-pascal-model", default="")
-
     ap.add_argument("--schp-atr-backend", default="builtin")
     ap.add_argument("--schp-atr-model", default="")
-
     ap.add_argument("--facer-backend", default="builtin")
     ap.add_argument("--facer-model", default="farl/lapa/448")
     args = ap.parse_args()
 
-    t = mark("read manifest")
-    manifest_path = Path(args.manifest)
-    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     records = payload.get("records", [])
-    done("read manifest", t)
-    t = mark("build_parser_config")
     parser_cfg = build_parser_config(args)
-    done("build_parser_config", t)
-    t = mark("create PerceptionPipeline")
-    pipe = PerceptionPipeline(backends=PerceptionBackendsConfig(parser=parser_cfg))
-    done("create PerceptionPipeline", t)
-    t = mark("create InputAssetLayer")
+    backends = PerceptionBackendsConfig(parser=parser_cfg)
+    backends.detector.backend = args.detector_backend
+    backends.detector.checkpoint = args.detector_model
+    pipe = PerceptionPipeline(backends=backends) if args.full_path else ParserOnlyPipeline(backends=backends)
     input_layer = InputAssetLayer()
-    done("create InputAssetLayer", t)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -187,11 +156,10 @@ def main() -> None:
     fallback_counts: dict[str, Counter[str]] = defaultdict(Counter)
     runtime_format_counts: dict[str, Counter[str]] = defaultdict(Counter)
     aggregate_geometry_stats: Counter[str] = Counter()
-
     native_parser_success_count = 0
     fallback_validation_count = 0
-
     per_image_reports: list[dict[str, Any]] = []
+    run_profiler = StageTimer(enabled=bool(args.profile))
 
     def _accumulate_report(report: dict[str, Any]) -> None:
         nonlocal native_parser_success_count, fallback_validation_count
@@ -199,49 +167,38 @@ def main() -> None:
             native_parser_success_count += 1
         if report.get("validation_invalid_due_to_fallback"):
             fallback_validation_count += 1
-
         for module, mode in report.get("module_fallbacks", {}).items():
             fallback_counts[module][str(mode)] += 1
         for person_runtime in report.get("runtime_formats", {}).values():
-            if not isinstance(person_runtime, dict):
-                continue
-            for backend_name, rt in person_runtime.items():
-                runtime_format_counts[backend_name][str(rt)] += 1
-
+            if isinstance(person_runtime, dict):
+                for backend_name, rt in person_runtime.items():
+                    runtime_format_counts[backend_name][str(rt)] += 1
         aggregate_geometry_stats.update(report.get("geometry_stats", {}))
         failures_by_type.update(report.get("fail_reasons", []))
         for reason in report.get("fail_reasons", []):
-            if reason in RUNTIME_FAIL_TYPES:
-                runtime_failures_by_type[reason] += 1
-            else:
-                semantic_failures_by_type[reason] += 1
+            (runtime_failures_by_type if reason in RUNTIME_FAIL_TYPES else semantic_failures_by_type)[reason] += 1
 
     for rec in records:
         image_path = rec.get("image")
         image_id = rec.get("id")
         if not image_path or not image_id:
             continue
-
         report = _base_report(rec)
         frame: Any = None
-        rgb: list[list[list[int]]] | None = None
+        rgb = None
+        timer = StageTimer(enabled=bool(args.profile))
 
-        print(f"\n[IMG] start: {image_id} -> {image_path}")
-
-        t = mark(f"{image_id}: build_request")
         try:
-            req = input_layer.build_request(images=[str(image_path)], text=f"parser-validation:{image_id}")
-            frame = req.unified_asset.frames[0] if req.unified_asset and req.unified_asset.frames else None
-            if frame is not None:
-                rgb = [[[int(max(0.0, min(1.0, ch)) * 255.0) for ch in px[:3]] for px in row] for row in frame.tensor]
+            with timer.track("image_decode"):
+                req = input_layer.build_request(images=[str(image_path)], text=f"parser-validation:{image_id}")
+                frame = req.unified_asset.frames[0] if req.unified_asset and req.unified_asset.frames else None
+                if frame is not None:
+                    rgb = frame_to_numpy_rgb(frame).rgb
         except Exception as exc:
-            print(f"[ERR] {image_id}: build_request failed -> {exc!r}")
             report["warnings"].append(f"image_decode_failed:{exc}")
             report["image_decode_failed"] = True
             report["runtime_failure"] = True
             report["fail_reasons"].append("image_decode_failed")
-        finally:
-            done(f"{image_id}: build_request", t)
 
         if frame is None:
             report["frame_tensor_missing"] = True
@@ -249,15 +206,13 @@ def main() -> None:
             report["fail_reasons"].append("frame_tensor_missing")
             report["fail_reasons"] = sorted(set(report["fail_reasons"]))
             report["passed"] = False
-            report["semantic_failure"] = False
             report["debug_summary_path"] = None
             per_image_reports.append(report)
             _accumulate_report(report)
             continue
 
-        t = mark(f"{image_id}: pipe.analyze")
-        out = pipe.analyze(frame)
-        done(f"{image_id}: pipe.analyze", t)
+        with timer.track("pipeline_analyze"):
+            out = pipe.analyze(frame, profiler=timer) if isinstance(pipe, ParserOnlyPipeline) else pipe.analyze(frame)
         report["warnings"].extend(out.warnings)
         report["module_fallbacks"] = out.module_fallbacks
 
@@ -268,23 +223,18 @@ def main() -> None:
         if report["fallback_used"]:
             report["runtime_failure"] = True
             report["native_backend_missing"] = True
-            report["fail_reasons"].append("fallback_used")
-            report["fail_reasons"].append("native_backend_missing")
-
+            report["fail_reasons"].extend(["fallback_used", "native_backend_missing"])
         if args.strict_native_parser and not report["native_parser_used"]:
             report["validation_invalid_due_to_fallback"] = True
             report["runtime_failure"] = True
             report["fail_reasons"].append("validation_invalid_due_to_fallback")
 
-        runtime_formats = getattr(pipe.parser, "last_runtime_formats", {})
+        runtime_formats = getattr(getattr(pipe, "parser", None), "last_runtime_formats", {})
         report["runtime_formats"] = runtime_formats
-
         image_dir = out_dir / str(image_id)
-        t = mark(f"{image_id}: export_parser_debug_artifacts")
-        debug_summary = export_parser_debug_artifacts(rgb or [[[0, 0, 0]]], out, image_dir)
-        done(f"{image_id}: export_parser_debug_artifacts", t)
+        with timer.track("debug_export"):
+            report["debug_summary"] = export_parser_debug_artifacts(rgb if rgb is not None else [[[0, 0, 0]]], out, image_dir)
         report["debug_summary_path"] = str(image_dir / "fused_summary.json")
-        report["debug_summary"] = debug_summary
 
         report["person_detected"] = len(out.persons) > 0
         report["person_mask_present"] = any(bool(p.mask_ref) for p in out.persons)
@@ -296,34 +246,26 @@ def main() -> None:
         report["detected_body_parts"] = sorted({bp["part_type"] for p in out.persons for bp in p.body_parts})
         report["detected_face_regions"] = sorted({fr["region_type"] for p in out.persons for fr in p.face_regions})
         report["detected_accessories"] = sorted({a for p in out.persons for a in p.accessory_masks.keys()})
-
-        report["geometry_stats"] = _collect_geometry_stats(
-            out.frame_size,
-            [
-                ref
-                for p in out.persons
-                for ref in [
-                    *p.garment_masks.values(),
-                    *p.body_part_masks.values(),
-                    *p.face_region_masks.values(),
-                    *p.accessory_masks.values(),
-                ]
-            ],
-        )
+        report["geometry_stats"] = _collect_geometry_stats(out.frame_size, [ref for p in out.persons for ref in [*p.garment_masks.values(), *p.body_part_masks.values(), *p.face_region_masks.values(), *p.accessory_masks.values()]])
 
         semantic_fails = _semantic_failures(rec, out)
         if semantic_fails:
             report["semantic_failure"] = True
             report["fail_reasons"].extend(semantic_fails)
 
+        report["timings_ms"] = {k: round(v["total_ms"], 3) for k, v in timer.summary().items()}
+        for stage, stats in timer.summary().items():
+            run_profiler.add(stage, stats["total_ms"] / 1000.0)
         report["fail_reasons"] = sorted(set(report["fail_reasons"]))
         report["passed"] = not report["fail_reasons"]
-
         per_image_reports.append(report)
         _accumulate_report(report)
 
     validation_report = {
+        "pipeline_mode": "full" if args.full_path else "parser_only",
         "strict_native_mode": bool(args.strict_native_parser),
+        "detector_backend": args.detector_backend,
+        "parser_backend": args.fashn_backend,
         "total_images": len(records),
         "total_failures": sum(1 for r in per_image_reports if not r.get("passed", False)),
         "native_parser_success_count": native_parser_success_count,
@@ -334,13 +276,10 @@ def main() -> None:
         "fallback_counts_by_module": {k: dict(v) for k, v in fallback_counts.items()},
         "runtime_format_counts_by_backend": {k: dict(v) for k, v in runtime_format_counts.items()},
         "aggregate_geometry_stats": dict(aggregate_geometry_stats),
+        "timing_summary": run_profiler.summary() if args.profile else {},
         "per_image_reports": per_image_reports,
     }
-    t = mark("write validation_report.json")
-    report_path = out_dir / "validation_report.json"
-    report_path.write_text(json.dumps(validation_report, ensure_ascii=False, indent=2), encoding="utf-8")
-    done("write validation_report.json", t)
-    #print(json.dumps(validation_report, ensure_ascii=False, indent=2))
+    (out_dir / "validation_report.json").write_text(json.dumps(validation_report, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":

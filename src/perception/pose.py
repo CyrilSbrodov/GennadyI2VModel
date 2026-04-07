@@ -7,6 +7,7 @@ from core.input_layer import AssetFrame
 from core.schema import Keypoint, PoseState
 from perception.backend import BackendInferenceEngine, frame_to_features
 from perception.detector import BackendConfig, PersonDetection
+from perception.frame_context import FrameLike
 from perception.image_ops import crop_rgb, frame_to_numpy_rgb
 
 
@@ -20,7 +21,7 @@ class PosePrediction:
 
 
 class PoseEstimator(Protocol):
-    def estimate(self, frame: AssetFrame | list[list[list[float]]] | str, persons: list[PersonDetection]) -> dict[str, PosePrediction]:
+    def estimate(self, frame: FrameLike, persons: list[PersonDetection]) -> dict[str, PosePrediction]:
         ...
 
 
@@ -55,7 +56,7 @@ class VitPoseAdapter:
             hand_landmarks={"left": left_hand, "right": right_hand},
         )
 
-    def _estimate_mediapipe(self, frame: AssetFrame | list[list[list[float]]] | str, persons: list[PersonDetection]) -> dict[str, PosePrediction]:
+    def _estimate_mediapipe(self, frame: FrameLike, persons: list[PersonDetection]) -> dict[str, PosePrediction]:
         try:
             import mediapipe as mp  # type: ignore
         except Exception as exc:  # pragma: no cover
@@ -95,7 +96,7 @@ class VitPoseAdapter:
                 )
         return result
 
-    def estimate(self, frame: AssetFrame | list[list[list[float]]] | str, persons: list[PersonDetection]) -> dict[str, PosePrediction]:
+    def estimate(self, frame: FrameLike, persons: list[PersonDetection]) -> dict[str, PosePrediction]:
         result: dict[str, PosePrediction] = {}
         if self.config.backend == "mediapipe":
             return self._estimate_mediapipe(frame, persons)

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from core.input_layer import AssetFrame
 from core.schema import BBox
+from perception.frame_context import FrameLike, PerceptionFrameContext, unwrap_frame
 from utils_tensor import shape
 
 
@@ -23,7 +24,16 @@ def _empty_image() -> FrameImage:
         raise RuntimeError("numpy is required for real perception backends") from exc
 
 
-def frame_to_numpy_rgb(frame: AssetFrame | list[list[list[float]]] | str) -> FrameImage:
+def frame_to_numpy_rgb(frame: FrameLike) -> FrameImage:
+    if isinstance(frame, PerceptionFrameContext):
+        cached = frame.get("frame_rgb")
+        if cached is not None:
+            return cached
+        image = frame_to_numpy_rgb(frame.frame)
+        frame.put("frame_rgb", image)
+        return image
+
+    frame = unwrap_frame(frame)
     if isinstance(frame, str):
         return _empty_image()
 
@@ -34,9 +44,13 @@ def frame_to_numpy_rgb(frame: AssetFrame | list[list[list[float]]] | str) -> Fra
 
     import numpy as np  # type: ignore
 
-    arr = np.asarray(tensor, dtype=np.float32)
-    arr = np.clip(arr, 0.0, 1.0)
-    rgb = (arr * 255.0).astype(np.uint8)
+    arr = np.asarray(tensor)
+    if arr.dtype == np.uint8:
+        rgb = arr[..., :3].copy()
+    else:
+        arr = np.asarray(arr, dtype=np.float32)
+        arr = np.clip(arr, 0.0, 1.0)
+        rgb = (arr[..., :3] * 255.0).astype(np.uint8)
     return FrameImage(rgb=rgb, width=w, height=h)
 
 
