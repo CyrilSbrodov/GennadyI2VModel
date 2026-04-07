@@ -10,6 +10,7 @@ from dynamics.state_update import apply_delta
 from learned.factory import BackendBundle, BackendConfig, LearnedBackendFactory
 from learned.interfaces import DynamicsTransitionRequest, PatchSynthesisRequest, TemporalRefinementRequest
 from learned.parity import (
+    text_output_to_contract,
     dynamics_io_to_contract,
     patch_io_to_contract,
     semantic_parity_checks,
@@ -95,9 +96,17 @@ class GennadyEngine:
 
         memory = self.memory_manager.initialize_from_scene(scene_graph)
         graph_encoding = self.backends.graph_encoder.encode(scene_graph)
+        fallback_log: list[str] = []
 
         action_plan = self.intent_parser.parse(request.text, scene_graph=scene_graph)
         text_encoding = self.backends.text_encoder.encode(request.text, scene_graph=scene_graph, action_plan=action_plan)
+        text_contract = text_output_to_contract(request.text, text_encoding)
+        text_missing = validate_parity(text_contract, ["text", "parsed_actions", "action_embedding", "target_entities", "target_objects", "temporal_decomposition", "constraints"])
+        text_semantic = semantic_parity_checks(stage="text", contract=text_contract, request={"text": request.text, "actions": action_plan.actions}, output=text_encoding)
+        if text_missing:
+            fallback_log.append(f"step=0:text_parity_missing={text_missing}")
+        if text_semantic:
+            fallback_log.extend([f"step=0:text_semantic={x}" for x in text_semantic])
         state_plan = self.planner.expand(
             scene_graph,
             action_plan,
@@ -114,7 +123,6 @@ class GennadyEngine:
         overlay_log: list[str] = []
         dynamics_metrics_log: list[str] = []
         channel_usage_log: list[dict[str, object]] = []
-        fallback_log: list[str] = []
         step_debug: list[dict[str, object]] = []
 
         for planned_state in state_plan.steps[1 : profile.max_transition_steps + 1]:
@@ -177,6 +185,7 @@ class GennadyEngine:
                         "confidence": patch_out.confidence,
                         "synthesis_mode": patch_contract.get("synthesis_mode", "unknown"),
                         "retrieval_summary": str(patch_request.retrieval_summary)[:120],
+                        "learned_ready": patch_out.metadata.get("learned_ready_usage", {}),
                         "missing_fields": missing_patch_fields,
                         "semantic_issues": semantic_patch,
                     }
@@ -258,12 +267,14 @@ class GennadyEngine:
                             "delta_magnitude": transition_output.diagnostics.get("delta_magnitude"),
                             "smoothness": transition_output.diagnostics.get("temporal_smoothness_proxy"),
                             "violations": transition_output.diagnostics.get("constraint_violations"),
+                            "learned_ready": transition_output.metadata.get("learned_ready_usage", {}),
                         },
                     },
                     "patch": patch_step_debug,
                     "temporal": {
                         "backend": self.backends.backend_names.get("temporal_backend", "unknown"),
                         "region_consistency_summary": temporal_out.region_consistency_scores,
+                        "learned_ready": temporal_out.metadata.get("learned_ready_usage", {}),
                         "drift_consistency": {
                             "changed_regions": len(temporal_request.changed_regions),
                             "drift_proxy": 1.0 - (sum(temporal_out.region_consistency_scores.values()) / max(1.0, float(len(temporal_out.region_consistency_scores) or 1))),
@@ -278,7 +289,7 @@ class GennadyEngine:
                         "semantic_issues": {
                             "dynamics": semantic_dynamics,
                             "temporal": semantic_temporal,
-                            "patch": [p["semantic_issues"] for p in patch_step_debug],
+                    "patch": [p["semantic_issues"] for p in patch_step_debug],
                         },
                     },
                 }
@@ -291,6 +302,7 @@ class GennadyEngine:
                     "temporal_channels": list(temporal_request.memory_channels.keys()),
                     "identity_encoder_used": bool(identity_embedding),
                     "graph_embedding_dim": len(graph_encoding.graph_embedding),
+                    "dynamics_backend_usage": transition_output.metadata.get("learned_ready_usage", {}),
                 }
             )
 
@@ -333,6 +345,10 @@ class GennadyEngine:
                         "dynamics": "DynamicsTransitionRequest/Output->GraphTransitionContract",
                         "patch": "PatchSynthesisRequest/Output->PatchSynthesisContract",
                         "temporal": "TemporalRefinementRequest/Output->TemporalConsistencyContract",
+                    },
+                    "text_parity": {
+                        "missing_fields": text_missing,
+                        "semantic_issues": text_semantic,
                     },
                 },
             },

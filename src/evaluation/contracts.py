@@ -60,6 +60,29 @@ def build_patch_eval_payload(contract: dict[str, object]) -> dict[str, object]:
     }
 
 
+def build_hidden_reconstruction_payload(contract: dict[str, object]) -> dict[str, object]:
+    hidden = contract.get("hidden_lifecycle_state", {}) if isinstance(contract, dict) else {}
+    lifecycle = str(hidden.get("lifecycle", hidden.get("state", "stable"))) if isinstance(hidden, dict) else "stable"
+    retrieval_profile = str(hidden.get("retrieval_profile", "unknown")) if isinstance(hidden, dict) else "unknown"
+    known = "known_hidden" in lifecycle
+    quality = 0.45
+    if known:
+        quality = 0.8
+    elif "unknown_hidden_synthesis" in lifecycle:
+        quality = 0.62
+    elif "reveal" in lifecycle:
+        quality = 0.72
+    if retrieval_profile == "poor":
+        quality -= 0.12
+    if retrieval_profile == "rich":
+        quality += 0.08
+    return {
+        "reconstruction_quality": max(0.0, min(1.0, quality)),
+        "hidden_lifecycle": lifecycle,
+        "retrieval_profile": retrieval_profile,
+    }
+
+
 def build_temporal_eval_payload(contract: dict[str, object]) -> dict[str, object]:
     changed = contract.get("changed_regions", []) if isinstance(contract, dict) else []
     metadata = contract.get("region_consistency_metadata", {}) if isinstance(contract, dict) else {}
