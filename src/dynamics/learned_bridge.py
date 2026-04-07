@@ -62,6 +62,7 @@ class BaselineDynamicsTransitionModel(DynamicsTransitionModel):
                 "graph_encoding_signal": float(graph_dim),
                 "identity_signal": float(identity_dim),
                 "memory_channel_signal": memory_signal,
+                "transition_diagnostics": delta.transition_diagnostics,
             },
             metadata={
                 "backend": "deterministic_graph_delta_predictor",
