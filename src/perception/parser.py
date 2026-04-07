@@ -116,6 +116,7 @@ class HumanParser(Protocol):
 class AdapterSegmentationOutput:
     masks: dict[str, "object"] = field(default_factory=dict)
     confidences: dict[str, float] = field(default_factory=dict)
+    runtime_format: str = "unknown"
 
 
 class ParserAdapter(Protocol):
@@ -158,7 +159,18 @@ def _mask_conf(mask: "object") -> float:
     return float(max(0.0, min(1.0, ones / total)))
 
 
-def _store_mask(mask: "object", confidence: float, source: str, prefix: str, kind: str, backend: str) -> str | None:
+def _store_mask(
+    mask: "object",
+    confidence: float,
+    source: str,
+    prefix: str,
+    kind: str,
+    backend: str,
+    *,
+    roi_bbox: tuple[float, float, float, float] | None = None,
+    frame_size: tuple[int, int] | None = None,
+    person_id: str | None = None,
+) -> str | None:
     try:
         arr = _safe_array(mask)
         if not arr or max((max(row) if row else 0 for row in arr), default=0) <= 0:
@@ -170,14 +182,43 @@ def _store_mask(mask: "object", confidence: float, source: str, prefix: str, kin
             prefix=prefix,
             mask_kind=kind,
             backend=backend,
+            roi_bbox=roi_bbox,
+            frame_size=frame_size,
+            tags=[f"person:{person_id}"] if person_id else [],
         )
     except Exception:
         return None
 
 
+class _HFSegmentationBackend:
+    def __init__(self, model_id: str, device: str) -> None:
+        self.model_id = model_id
+        self.device = device
+        self._pipe = None
+        self._id2label: dict[int, str] = {}
+
+    def infer(self, patch: "object") -> object:
+        if self._pipe is None:
+            try:
+                from transformers import pipeline  # type: ignore
+            except Exception as exc:  # pragma: no cover
+                raise RuntimeError("transformers is not installed for parser backend") from exc
+            dev = -1 if self.device in {"cpu", "-1"} else 0
+            self._pipe = pipeline("image-segmentation", model=self.model_id, device=dev)
+            model = getattr(self._pipe, "model", None)
+            config = getattr(model, "config", None)
+            id2label = getattr(config, "id2label", None)
+            if isinstance(id2label, dict):
+                self._id2label = {int(k): str(v) for k, v in id2label.items()}
+        return self._pipe(patch)
+
+    @property
+    def id2label(self) -> dict[int, str]:
+        return dict(self._id2label)
+
+
 class FashnHumanParserAdapter:
     source_name = "parser:fashn"
-    # Контракт по классам FASHN (18 useful classes + background=0)
     CLASS_MAP = {
         0: "background",
         1: "face",
@@ -202,40 +243,41 @@ class FashnHumanParserAdapter:
     def __init__(self, config: ParserBackendConfig, infer_fn: Callable[["object"], "object"] | None = None) -> None:
         self.config = config
         self._infer_fn = infer_fn
+        self._runtime = None
 
-    def _hf_infer(self, patch: "object"):
+    def _infer(self, patch: "object"):
         if self._infer_fn is not None:
-            return self._infer_fn(patch)
-        try:
-            from transformers import pipeline  # type: ignore
-        except Exception as exc:  # pragma: no cover
-            raise RuntimeError("transformers is not installed for fashn parser") from exc
+            return self._infer_fn(patch), {}, "test_override"
+        if self.config.backend == "builtin":
+            return None, {}, "builtin"
         model_id = self.config.variant or "fashn-ai/fashn-human-parser"
-        pipe = pipeline("image-segmentation", model=model_id, device=self.config.device)
-        return pipe(patch)
+        if self._runtime is None:
+            self._runtime = _HFSegmentationBackend(model_id=model_id, device=self.config.device)
+        return self._runtime.infer(patch), self._runtime.id2label, "hf_image_segmentation"
 
     def parse_patch(self, patch: "object") -> AdapterSegmentationOutput:
         if self.config.backend == "builtin":
-            return AdapterSegmentationOutput()
-        raw = self._hf_infer(patch)
+            return AdapterSegmentationOutput(runtime_format="builtin")
+        raw, id2label, runtime_format = self._infer(patch)
         if isinstance(raw, dict) and "label_map" in raw:
-            masks = _label_map_to_masks(raw["label_map"], self.CLASS_MAP)
-        else:
-            # Для production-контракта принимаем только label_map path; list fallback лишь для тестов.
-            masks = {}
-            if isinstance(raw, list):
-                for seg in raw:
-                    label = str(seg.get("label", "")).lower().strip()
-                    mask = seg.get("mask")
-                    if mask is not None and label in self.CLASS_MAP.values() and label != "background":
-                        masks[label] = _safe_array(mask)
-        confs = {name: _mask_conf(mask) for name, mask in masks.items()}
-        return AdapterSegmentationOutput(masks=masks, confidences=confs)
+            class_map = {int(k): v.lower().strip() for k, v in id2label.items()} if id2label else self.CLASS_MAP
+            masks = _label_map_to_masks(raw["label_map"], class_map)
+            return AdapterSegmentationOutput(masks=masks, confidences={k: _mask_conf(v) for k, v in masks.items()}, runtime_format=runtime_format + ":label_map")
+        masks: dict[str, object] = {}
+        if isinstance(raw, list):
+            for seg in raw:
+                if not isinstance(seg, dict):
+                    continue
+                label = str(seg.get("label", "")).lower().strip()
+                mask = seg.get("mask")
+                if mask is not None and label and label != "background":
+                    masks[label] = _safe_array(mask)
+            return AdapterSegmentationOutput(masks=masks, confidences={k: _mask_conf(v) for k, v in masks.items()}, runtime_format=runtime_format + ":segments_list")
+        return AdapterSegmentationOutput(runtime_format=runtime_format + ":unsupported")
 
 
 class SCHPPascalPartParserAdapter:
     source_name = "parser:schp_pascal"
-    # Явный mapping Pascal-Person-Part -> canonical body topology.
     LABEL_TO_CANONICAL = {
         "head": "head",
         "torso": "torso",
@@ -248,20 +290,45 @@ class SCHPPascalPartParserAdapter:
     def __init__(self, config: ParserBackendConfig, infer_fn: Callable[["object"], dict[str, "object"]] | None = None) -> None:
         self.config = config
         self._infer_fn = infer_fn
+        self._runtime = None
+
+    def _infer(self, patch: "object") -> tuple[object, str]:
+        if self._infer_fn is not None:
+            return self._infer_fn(patch), "test_override"
+        if self.config.backend == "builtin":
+            return {}, "builtin"
+        if self.config.backend == "generic_hf_structural":
+            if self._runtime is None:
+                model_id = self.config.variant
+                if not model_id:
+                    raise RuntimeError("generic_hf_structural requires checkpoint/model id in ParserBackendConfig.variant")
+                self._runtime = _HFSegmentationBackend(model_id=model_id, device=self.config.device)
+            return self._runtime.infer(patch), "hf_image_segmentation"
+        if self.config.backend == "schp_pascal":
+            raise RuntimeError(
+                "schp_pascal backend requires SCHP-specific runtime integration; "
+                "use backend='generic_hf_structural' for generic HF segmentation models"
+            )
+        raise RuntimeError(f"Unsupported SCHP Pascal backend: {self.config.backend}")
 
     def parse_patch(self, patch: "object") -> AdapterSegmentationOutput:
         if self.config.backend == "builtin":
-            return AdapterSegmentationOutput()
-        if self._infer_fn is None:
-            raise RuntimeError("SCHP Pascal parser requires infer_fn or backend-specific integration")
-        raw_masks = self._infer_fn(patch)
+            return AdapterSegmentationOutput(runtime_format="builtin")
+        raw, runtime_format = self._infer(patch)
+        raw_masks: dict[str, object] = {}
+        if isinstance(raw, list):
+            for seg in raw:
+                if isinstance(seg, dict) and seg.get("mask") is not None:
+                    raw_masks[str(seg.get("label", ""))] = seg["mask"]
+        elif isinstance(raw, dict):
+            raw_masks = {str(k): v for k, v in raw.items() if k != "label_map"}
         masks: dict[str, object] = {}
         for src_label, mask in raw_masks.items():
             canonical = self.LABEL_TO_CANONICAL.get(src_label.lower().strip())
             if canonical:
                 masks[canonical] = _safe_array(mask)
         confs = {name: _mask_conf(mask) for name, mask in masks.items()}
-        return AdapterSegmentationOutput(masks=masks, confidences=confs)
+        return AdapterSegmentationOutput(masks=masks, confidences=confs, runtime_format=runtime_format)
 
 
 class SCHPATRParserAdapter:
@@ -284,13 +351,38 @@ class SCHPATRParserAdapter:
     def __init__(self, config: ParserBackendConfig, infer_fn: Callable[["object"], dict[str, "object"]] | None = None) -> None:
         self.config = config
         self._infer_fn = infer_fn
+        self._runtime = None
+
+    def _infer(self, patch: "object") -> tuple[object, str]:
+        if self._infer_fn is not None:
+            return self._infer_fn(patch), "test_override"
+        if self.config.backend == "builtin":
+            return {}, "builtin"
+        if self.config.backend == "generic_hf_garment":
+            if self._runtime is None:
+                model_id = self.config.variant
+                if not model_id:
+                    raise RuntimeError("generic_hf_garment requires checkpoint/model id in ParserBackendConfig.variant")
+                self._runtime = _HFSegmentationBackend(model_id=model_id, device=self.config.device)
+            return self._runtime.infer(patch), "hf_image_segmentation"
+        if self.config.backend == "schp_atr":
+            raise RuntimeError(
+                "schp_atr backend requires SCHP-specific runtime integration; "
+                "use backend='generic_hf_garment' for generic HF segmentation models"
+            )
+        raise RuntimeError(f"Unsupported SCHP ATR backend: {self.config.backend}")
 
     def parse_patch(self, patch: "object") -> AdapterSegmentationOutput:
         if self.config.backend == "builtin":
-            return AdapterSegmentationOutput()
-        if self._infer_fn is None:
-            raise RuntimeError("SCHP ATR parser requires infer_fn or backend-specific integration")
-        raw_masks = self._infer_fn(patch)
+            return AdapterSegmentationOutput(runtime_format="builtin")
+        raw, runtime_format = self._infer(patch)
+        raw_masks: dict[str, object] = {}
+        if isinstance(raw, list):
+            for seg in raw:
+                if isinstance(seg, dict) and seg.get("mask") is not None:
+                    raw_masks[str(seg.get("label", ""))] = seg["mask"]
+        elif isinstance(raw, dict):
+            raw_masks = {str(k): v for k, v in raw.items() if k != "label_map"}
         masks: dict[str, object] = {}
         for src_label, mask in raw_masks.items():
             canonical = self.LABEL_TO_CANONICAL.get(src_label.lower().strip())
@@ -298,12 +390,11 @@ class SCHPATRParserAdapter:
                 out_name = canonical if canonical not in {"arm", "leg"} else f"{canonical}_region"
                 masks[out_name] = _safe_array(mask)
         confs = {name: _mask_conf(mask) for name, mask in masks.items()}
-        return AdapterSegmentationOutput(masks=masks, confidences=confs)
+        return AdapterSegmentationOutput(masks=masks, confidences=confs, runtime_format=runtime_format)
 
 
 class FacerFaceParserAdapter:
     source_name = "parser:facer"
-    # Явный mapping для face parsing outputs (варианты lapa/celebm допускаются).
     LABEL_TO_CANONICAL = {
         "face": "face_skin",
         "skin": "face_skin",
@@ -323,24 +414,65 @@ class FacerFaceParserAdapter:
     def __init__(self, config: ParserBackendConfig, infer_fn: Callable[["object"], dict[str, "object"]] | None = None) -> None:
         self.config = config
         self._infer_fn = infer_fn
+        self._runtime = None
+
+    def _infer(self, patch: "object") -> tuple[dict[str, object], str]:
+        if self._infer_fn is not None:
+            return self._infer_fn(patch), "test_override"
+        if self.config.backend == "builtin":
+            return {}, "builtin"
+        try:
+            import facer  # type: ignore
+            import torch  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("FACER backend requires facer+torch packages") from exc
+        if self._runtime is None:
+            parser_variant = self.config.variant or "farl/lapa/448"
+            self._runtime = (
+                facer.face_detector("retinaface/mobilenet", device=self.config.device),
+                facer.face_parser(parser_variant, device=self.config.device),
+                torch,
+            )
+        detector, parser, torch_mod = self._runtime
+        img = patch
+        if hasattr(img, "shape"):
+            shape = getattr(img, "shape", ())
+            if len(shape) == 3:
+                img = [img]
+        tensor = torch_mod.tensor(img, device=self.config.device)
+        if len(tensor.shape) == 3:
+            tensor = tensor.unsqueeze(0)
+        tensor = tensor.permute(0, 3, 1, 2).float() / 255.0
+        faces = detector(tensor)
+        if int(getattr(faces.get("scores", []), "numel", lambda: 0)()) == 0:
+            return {}, "facer:no_faces"
+        faces = parser(tensor, faces)
+        seg_logits = faces.get("seg", {}).get("logits")
+        label_names = faces.get("seg", {}).get("label_names", [])
+        if seg_logits is None:
+            return {}, "facer:no_seg"
+        seg_map = seg_logits.argmax(dim=1)[0].detach().cpu().numpy()
+        out: dict[str, object] = {}
+        for idx, name in enumerate(label_names):
+            if idx == 0:
+                continue
+            out[str(name)] = [[1 if int(px) == idx else 0 for px in row] for row in seg_map.tolist()]
+        return out, "facer:runtime"
 
     def parse_patch(self, patch: "object") -> AdapterSegmentationOutput:
         if self.config.backend == "builtin":
-            return AdapterSegmentationOutput()
-        if self._infer_fn is None:
-            raise RuntimeError("FACER parser requires infer_fn or backend-specific integration")
-        raw_masks = self._infer_fn(patch)
+            return AdapterSegmentationOutput(runtime_format="builtin")
+        raw_masks, runtime_format = self._infer(patch)
         masks: dict[str, object] = {}
         for src_label, mask in raw_masks.items():
             canonical = self.LABEL_TO_CANONICAL.get(src_label.lower().strip())
             if canonical:
                 masks[canonical] = _safe_array(mask)
         confs = {name: _mask_conf(mask) for name, mask in masks.items()}
-        return AdapterSegmentationOutput(masks=masks, confidences=confs)
+        return AdapterSegmentationOutput(masks=masks, confidences=confs, runtime_format=runtime_format)
 
 
 class ParserFusionEngine:
-    # Приоритеты по ТЗ.
     GARMENT_PRIORITY = ("fashn", "schp_atr", "builtin")
 
     def fuse(
@@ -350,6 +482,7 @@ class ParserFusionEngine:
         pascal: AdapterSegmentationOutput,
         atr: AdapterSegmentationOutput,
         facer: AdapterSegmentationOutput,
+        frame_size: tuple[int, int] | None = None,
     ) -> ParsingPrediction:
         garments: list[GarmentPrediction] = []
         body_parts: list[BodyPartMaskPrediction] = []
@@ -369,10 +502,19 @@ class ParserFusionEngine:
                     for x, v in enumerate(row):
                         if v > 0:
                             union_mask[y][x] = 1
-            pref = _store_mask(union_mask, _mask_conf(union_mask), "parser:fusion", "person", "person_mask", "fusion")
+            pref = _store_mask(
+                union_mask,
+                _mask_conf(union_mask),
+                "parser:fusion",
+                "person",
+                "person_mask",
+                "fusion",
+                roi_bbox=(person.bbox.x, person.bbox.y, person.bbox.w, person.bbox.h),
+                frame_size=frame_size,
+                person_id=person.detection_id,
+            )
             enriched.person_mask_ref = pref
 
-        # Body topology: Pascal > FASHN coarse.
         topology = dict(fashn.masks)
         topology.update(pascal.masks)
         for part, mask in topology.items():
@@ -380,14 +522,23 @@ class ParserFusionEngine:
                 continue
             conf = pascal.confidences.get(part, fashn.confidences.get(part, 0.0))
             source = "parser:schp_pascal" if part in pascal.masks else "parser:fashn"
-            ref = _store_mask(mask, conf, source, "body", "body_part_mask", source.split(":")[-1])
+            ref = _store_mask(
+                mask,
+                conf,
+                source,
+                "body",
+                "body_part_mask",
+                source.split(":")[-1],
+                roi_bbox=(person.bbox.x, person.bbox.y, person.bbox.w, person.bbox.h),
+                frame_size=frame_size,
+                person_id=person.detection_id,
+            )
             if ref is None:
                 continue
             body_parts.append(BodyPartMaskPrediction(part, ref, conf, "visible" if conf >= 0.5 else "partially_visible", source))
             enriched.body_part_masks[part] = ref
             enriched.provenance_by_region[f"body:{part}"] = source
 
-        # Garments: FASHN primary, ATR fallback/enrichment.
         garment_candidates = {
             "top": "upper_torso",
             "upper_clothes": "upper_torso",
@@ -407,7 +558,17 @@ class ParserFusionEngine:
                 seen.add(g)
                 conf = out.confidences.get(g, 0.0)
                 src = f"parser:{source_name}"
-                ref = _store_mask(out.masks[g], conf, src, "garment", "garment_mask", source_name)
+                ref = _store_mask(
+                    out.masks[g],
+                    conf,
+                    src,
+                    "garment",
+                    "garment_mask",
+                    source_name,
+                    roi_bbox=(person.bbox.x, person.bbox.y, person.bbox.w, person.bbox.h),
+                    frame_size=frame_size,
+                    person_id=person.detection_id,
+                )
                 garments.append(
                     GarmentPrediction(
                         garment_type=("top" if g == "upper_clothes" else g),
@@ -428,12 +589,21 @@ class ParserFusionEngine:
         for acc in ("bag", "hat", "glasses", "jewelry", "scarf", "belt"):
             if acc in fashn.masks:
                 conf = fashn.confidences.get(acc, 0.0)
-                ref = _store_mask(fashn.masks[acc], conf, "parser:fashn", "accessory", "accessory_mask", "fashn")
+                ref = _store_mask(
+                    fashn.masks[acc],
+                    conf,
+                    "parser:fashn",
+                    "accessory",
+                    "accessory_mask",
+                    "fashn",
+                    roi_bbox=(person.bbox.x, person.bbox.y, person.bbox.w, person.bbox.h),
+                    frame_size=frame_size,
+                    person_id=person.detection_id,
+                )
                 if ref:
                     enriched.accessory_masks[acc] = ref
                     enriched.provenance_by_region[f"accessory:{acc}"] = "parser:fashn"
 
-        # Face regions: FACER authoritative > FASHN coarse face/hair.
         face_source = facer if facer.masks else AdapterSegmentationOutput(
             masks={k: v for k, v in fashn.masks.items() if k in {"face", "hair"}},
             confidences={k: fashn.confidences.get(k, 0.0) for k in ("face", "hair")},
@@ -442,7 +612,17 @@ class ParserFusionEngine:
             canonical = "face_skin" if region == "face" else ("hairline_or_hair_face_boundary" if region == "hair" else region)
             conf = face_source.confidences.get(region, 0.0)
             src = "parser:facer" if facer.masks else "parser:fashn"
-            ref = _store_mask(mask, conf, src, "face", "face_region_mask", src.split(":")[-1])
+            ref = _store_mask(
+                mask,
+                conf,
+                src,
+                "face",
+                "face_region_mask",
+                src.split(":")[-1],
+                roi_bbox=(person.bbox.x, person.bbox.y, person.bbox.w, person.bbox.h),
+                frame_size=frame_size,
+                person_id=person.detection_id,
+            )
             if ref is None:
                 continue
             face_regions.append(FaceRegionPrediction(canonical, ref, conf, src))
@@ -499,6 +679,7 @@ class SegFormerHumanParserAdapter:
         self.schp_atr = schp_atr_adapter or SCHPATRParserAdapter(self.config.garment_refinement_parser)
         self.facer = facer_adapter or FacerFaceParserAdapter(self.config.face_parser)
         self.fusion = ParserFusionEngine()
+        self.last_runtime_formats: dict[str, dict[str, str]] = {}
 
     def is_builtin_backend(self) -> bool:
         return self.config.is_builtin()
@@ -520,14 +701,28 @@ class SegFormerHumanParserAdapter:
         if self.config.is_builtin():
             for person in persons:
                 result[person.detection_id] = self._builtin_parse(frame, person)
+                self.last_runtime_formats[person.detection_id] = {
+                    "fashn": "builtin",
+                    "schp_pascal": "builtin",
+                    "schp_atr": "builtin",
+                    "facer": "builtin",
+                }
             return result
 
-        rgb = frame_to_numpy_rgb(frame).rgb
+        frame_img = frame_to_numpy_rgb(frame)
+        rgb = frame_img.rgb
+        frame_size = (frame_img.width, frame_img.height)
         for person in persons:
             patch = crop_rgb(rgb, person.bbox)
             fashn = self.fashn.parse_patch(patch)
             pascal = self.schp_pascal.parse_patch(patch)
             atr = self.schp_atr.parse_patch(patch)
             facer = self.facer.parse_patch(patch)
-            result[person.detection_id] = self.fusion.fuse(person, fashn, pascal, atr, facer)
+            self.last_runtime_formats[person.detection_id] = {
+                "fashn": fashn.runtime_format,
+                "schp_pascal": pascal.runtime_format,
+                "schp_atr": atr.runtime_format,
+                "facer": facer.runtime_format,
+            }
+            result[person.detection_id] = self.fusion.fuse(person, fashn, pascal, atr, facer, frame_size=frame_size)
         return result

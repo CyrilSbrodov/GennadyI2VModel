@@ -16,4 +16,5 @@ perception-real = [
   "transformers>=4.40",
   "torch>=2.2",
   "pillow>=10.0",
+  "facer>=0.0.7",
 ]
