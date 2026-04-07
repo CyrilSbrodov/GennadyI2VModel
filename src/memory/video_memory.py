@@ -8,6 +8,7 @@ from core.semantic_roi import SemanticROIHelper
 from core.region_ids import make_region_id, parse_region_id
 from core.schema import (
     BBox,
+    GarmentSemanticProfile,
     HiddenRegionSlot,
     MemoryEntry,
     RegionDescriptor,
@@ -171,6 +172,10 @@ class MemoryManager:
                     confidence=min(1.0, 0.35 + person.confidence * 0.25 + evidence * confidence_boost),
                     descriptor=desc,
                     evidence_score=min(1.0, evidence),
+                    semantic_family=self._semantic_family(region_type),
+                    coverage_targets=self._default_coverage_targets(region_type),
+                    attachment_targets=self._default_attachment_targets(region_type),
+                    suitable_for_reveal=region_type in {"torso", "sleeves", "garments", "pelvis"},
                 )
                 memory.patch_cache[patch_id] = patch
 
@@ -309,14 +314,16 @@ class MemoryManager:
         region_type: str,
         entity_id: str,
         query_descriptor: dict[str, float | list[float]] | None = None,
+        garment_semantics: GarmentSemanticProfile | None = None,
         transition_context: dict[str, str] | None = None,
+        hidden_mode: str = "not_hidden",
     ) -> dict[str, object]:
         slot = self.retrieve_hidden_region(memory, region_id)
         phase = (transition_context or {}).get("transition_phase", "single")
         visibility_phase = (transition_context or {}).get("visibility_phase", "stable")
         region_mode = (transition_context or {}).get("region_transition_mode", "")
-        hidden_bias = 0.22 if slot and slot.hidden_type == "known_hidden" else -0.05
-        recency_weight = 0.2 if phase in {"lower_pelvis", "contact_chair", "garment_opening"} else 0.1
+        hidden_bias = 0.24 if hidden_mode == "known_hidden" and slot else (-0.1 if hidden_mode == "unknown_hidden" else 0.0)
+        recency_weight = 0.18 if phase in {"lower_pelvis", "contact_chair", "garment_opening"} else 0.1
         transition_bias = 0.12 if region_mode.startswith("garment_") or region_mode in {"pose_exposure", "expression_refine"} else 0.0
         hint = self._strategy_hint(region_type, visibility_phase, region_mode)
 
@@ -329,6 +336,14 @@ class MemoryManager:
             recency = 1.0 / (1.0 + max(0, most_recent - patch.source_frame))
             descriptor_sim = self._descriptor_similarity(query_descriptor, patch.descriptor)
             hidden_slot_contrib = 0.15 if slot and patch.patch_id in slot.candidate_patch_ids else 0.0
+            same_entity_bonus = 0.16 if patch.entity_id == entity_id else 0.0
+            semantic_family_bonus = 0.14 if patch.semantic_family == self._semantic_family(region_type) else 0.0
+            region_compat = 0.12 if patch.region_type == region_type else 0.0
+            transition_compat = 0.07 if (region_mode.startswith("garment_") and patch.semantic_family == "garment") or (region_mode == "expression_refine" and patch.semantic_family == "face") else 0.0
+            reveal_compat = 0.1 if visibility_phase == "revealing" and patch.suitable_for_reveal else 0.0
+            garment_cov_compat = self._garment_coverage_compatibility(patch, garment_semantics)
+            garment_attach_compat = self._garment_attachment_compatibility(patch, garment_semantics)
+            lifecycle_compat = 0.08 if hidden_mode == "known_hidden" and hidden_slot_contrib > 0 else (0.03 if hidden_mode == "not_hidden" else -0.04)
             contributions = {
                 "base_confidence": patch.confidence,
                 "evidence": 0.2 * patch.evidence_score,
@@ -336,6 +351,14 @@ class MemoryManager:
                 "similarity": 0.25 * descriptor_sim,
                 "hidden_slot": hidden_bias + hidden_slot_contrib,
                 "transition_bias": transition_bias,
+                "same_entity_bonus": same_entity_bonus,
+                "semantic_family_bonus": semantic_family_bonus,
+                "region_compatibility": region_compat,
+                "transition_compatibility": transition_compat,
+                "coverage_compatibility": garment_cov_compat,
+                "attachment_compatibility": garment_attach_compat,
+                "visibility_lifecycle_compatibility": lifecycle_compat,
+                "reveal_compatibility": reveal_compat,
             }
             score = sum(contributions.values())
             scored.append((score, patch, contributions))
@@ -359,7 +382,29 @@ class MemoryManager:
             "hidden_slot_contribution": round(top_contrib.get("hidden_slot", 0.0), 4),
             "transition_bias_contribution": round(top_contrib.get("transition_bias", 0.0), 4),
         }
-        return {"candidates": candidates, "strategy_hint": hint, "explanation": explanation}
+        return {
+            "candidates": candidates,
+            "strategy_hint": hint,
+            "explanation": explanation,
+            "top_score": round(scored[0][0], 4) if scored else 0.0,
+            "top_semantic_compatibility": round(
+                top_contrib.get("semantic_family_bonus", 0.0)
+                + top_contrib.get("coverage_compatibility", 0.0)
+                + top_contrib.get("attachment_compatibility", 0.0),
+                4,
+            ),
+            "summary": {
+                "candidate_count": len(candidates),
+                "hidden_mode": hidden_mode,
+                "strategy_hint": hint,
+            },
+            "top_score_breakdown": top_contrib,
+            "candidate_summaries": [
+                {"patch_id": patch.patch_id, "region_type": patch.region_type, "semantic_family": patch.semantic_family}
+                for patch in candidates
+            ],
+            "fallback_reason": "no_candidates" if not candidates else "none",
+        }
 
     def to_dict(self, memory: VideoMemory) -> dict[str, object]:
         return asdict(memory)
@@ -458,6 +503,49 @@ class MemoryManager:
             return 0.22
         if garment_phase in {"opening", "removed"} and region_type in {"garments", "sleeves", "torso"}:
             return 0.48
-        if region_mode == "pose_exposure":
-            return 0.36
         return 0.3
+
+    def _semantic_family(self, region_type: str) -> str:
+        if region_type in {"face", "head"}:
+            return "face"
+        if region_type in {"garments", "sleeves"}:
+            return "garment"
+        if region_type in {"left_arm", "right_arm", "legs", "pelvis"}:
+            return "limb_pose"
+        if region_type in {"torso"}:
+            return "torso"
+        return "generic"
+
+    def _default_coverage_targets(self, region_type: str) -> list[str]:
+        mapping = {
+            "garments": ["torso"],
+            "sleeves": ["left_upper_arm", "right_upper_arm"],
+            "torso": ["torso"],
+            "pelvis": ["pelvis"],
+            "legs": ["legs"],
+        }
+        return mapping.get(region_type, [region_type])
+
+    def _default_attachment_targets(self, region_type: str) -> list[str]:
+        mapping = {
+            "garments": ["torso"],
+            "sleeves": ["arms", "torso"],
+            "torso": ["torso"],
+            "pelvis": ["pelvis"],
+            "legs": ["pelvis"],
+        }
+        return mapping.get(region_type, ["torso"])
+
+    def _garment_coverage_compatibility(self, patch: TexturePatchMemory, garment: GarmentSemanticProfile | None) -> float:
+        if garment is None or not garment.coverage_targets:
+            return 0.0
+        overlap = len(set(patch.coverage_targets).intersection(set(garment.coverage_targets)))
+        denom = max(1, len(set(garment.coverage_targets)))
+        return 0.12 * (overlap / denom)
+
+    def _garment_attachment_compatibility(self, patch: TexturePatchMemory, garment: GarmentSemanticProfile | None) -> float:
+        if garment is None or not garment.attachment_targets:
+            return 0.0
+        overlap = len(set(patch.attachment_targets).intersection(set(garment.attachment_targets)))
+        denom = max(1, len(set(garment.attachment_targets)))
+        return 0.1 * (overlap / denom)

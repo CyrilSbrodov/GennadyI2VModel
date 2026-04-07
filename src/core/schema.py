@@ -94,6 +94,26 @@ class GarmentNode:
 
 
 @dataclass(slots=True)
+class GarmentSemanticProfile:
+    """Нормализованный профиль одежды для property-driven рендера."""
+
+    entity_class: str = "garment"
+    raw_label: str = "unknown"
+    layer_role: str = "unknown"
+    coverage_targets: list[str] = field(default_factory=list)
+    attachment_targets: list[str] = field(default_factory=list)
+    front_openable: bool | None = None
+    removable: bool | None = None
+    sleeve_presence: str = "unknown"
+    sleeve_length_hint: str = "unknown"
+    fit_hint: str = "unknown"
+    deformation_mode: str = "unknown"
+    occlusion_priority: float = 0.5
+    exposure_behavior: str = "unknown"
+    semantic_confidence: float = 0.0
+
+
+@dataclass(slots=True)
 class PersonNode:
     person_id: str
     track_id: str | None
@@ -222,6 +242,10 @@ class TexturePatchMemory:
     confidence: float
     descriptor: dict[str, float | list[float]] = field(default_factory=dict)
     evidence_score: float = 0.0
+    semantic_family: str = "generic"
+    coverage_targets: list[str] = field(default_factory=list)
+    attachment_targets: list[str] = field(default_factory=list)
+    suitable_for_reveal: bool = False
 
 
 @dataclass(slots=True)
