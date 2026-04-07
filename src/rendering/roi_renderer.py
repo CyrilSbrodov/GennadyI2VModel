@@ -6,6 +6,7 @@ from enum import Enum
 from core.semantic_roi import SemanticROIHelper
 from core.region_ids import make_region_id, parse_region_id
 from core.schema import BBox, GraphDelta, RegionRef, SceneGraph, VideoMemory
+from memory.video_memory import MemoryManager
 from representation.scene_graph_queries import SceneGraphQueries
 from utils_tensor import alpha_radial, crop, mean_color, shape, zeros
 
@@ -96,6 +97,9 @@ class PatchRenderer:
         MEMORY_BLEND = "MEMORY_BLEND"
         FALLBACK = "FALLBACK"
 
+    def __init__(self) -> None:
+        self.memory_manager = MemoryManager()
+
     def _bbox_to_pixels(self, bbox: BBox, frame: list) -> tuple[int, int, int, int]:
         h, w, _ = shape(frame)
         x0 = max(0, min(w - 1, int(bbox.x * w)))
@@ -121,10 +125,25 @@ class PatchRenderer:
         entity, region_type = parse_region_id(region.region_id)
         is_revealed = region.region_id in {r.region_id for r in delta.newly_revealed_regions}
         slot = memory.hidden_region_slots.get(region.region_id)
+        state_before = delta.state_before
+        state_after = delta.state_after
+        transition_phase = delta.transition_phase
+        visibility_after = delta.predicted_visibility_changes.get(region_type, state_after.get("visibility_phase", "stable"))
+        attached_garments = SceneGraphQueries.get_attached_garments(scene_graph, entity)
+        covering = SceneGraphQueries.get_covering_entities(scene_graph, entity, region_type)
+        likely_revealed = SceneGraphQueries.is_region_likely_revealed(scene_graph, entity, region_type, delta.predicted_visibility_changes)
+        region_mode = delta.region_transition_mode.get(region_type, "")
         if is_revealed and slot and slot.hidden_type == "known_hidden" and slot.candidate_patch_ids:
             return self.RenderStrategy.KNOWN_HIDDEN_REVEAL
-        if is_revealed and (slot is None or slot.hidden_type == "unknown_hidden" or not slot.candidate_patch_ids):
+        if is_revealed and (slot is None or slot.hidden_type == "unknown_hidden" or not slot.candidate_patch_ids) and likely_revealed:
             return self.RenderStrategy.UNKNOWN_HIDDEN_SYNTHESIS
+        if region_mode.startswith("garment_") or (state_before.get("garment_phase") in {"worn", "opening"} and state_after.get("garment_phase") in {"opening", "removed"}):
+            return self.RenderStrategy.GARMENT_UPDATE
+        if region_mode == "pose_exposure" or transition_phase in {"bend_knees", "lower_pelvis"} or (state_before.get("pose_phase") != state_after.get("pose_phase") and region_type in {"left_arm", "right_arm", "pelvis", "legs"}):
+            return self.RenderStrategy.POSE_TRANSFORM
+        if visibility_after in {"visible", "partially_visible", "revealing"} and (covering or not attached_garments):
+            if slot and slot.hidden_type == "unknown_hidden":
+                return self.RenderStrategy.UNKNOWN_HIDDEN_SYNTHESIS
         if "expression_change" in delta.semantic_reasons or region_type in {"face", "head"}:
             return self.RenderStrategy.IDENTITY_FACE_UPDATE
         if "garment_change" in delta.semantic_reasons or region_type in {"garments", "sleeves"}:
@@ -136,14 +155,39 @@ class PatchRenderer:
             return self.RenderStrategy.MEMORY_BLEND
         return self.RenderStrategy.FALLBACK
 
-    def _strategy_memory_candidates(self, memory: VideoMemory, entity: str, region_type: str, strategy: "PatchRenderer.RenderStrategy") -> tuple[list, str]:
-        if strategy == self.RenderStrategy.GARMENT_UPDATE:
-            return [p for p in memory.texture_patches.values() if p.entity_id == entity and p.region_type in {"garments", "sleeves", "torso"}], "garment_update"
-        if strategy == self.RenderStrategy.IDENTITY_FACE_UPDATE:
-            return [p for p in memory.texture_patches.values() if p.entity_id == entity and p.region_type in {"face", "head"}], "identity_face_update"
-        if strategy == self.RenderStrategy.POSE_TRANSFORM:
-            return [p for p in memory.texture_patches.values() if p.entity_id == entity and p.region_type in {region_type, "left_arm", "right_arm", "pelvis", "legs"}], "pose_transform"
-        return [p for p in memory.texture_patches.values() if p.entity_id == entity and p.region_type == region_type], "memory_blend"
+    def _unknown_hidden_synthesis(
+        self,
+        roi: list[list[list[float]]],
+        region_type: str,
+        identity_embedding: list[float] | None,
+        descriptor_hint: dict[str, float | list[float]] | None,
+        visibility: str,
+    ) -> list[list[list[float]]]:
+        h, w, c = shape(roi)
+        base_mean = mean_color(roi)
+        hint_mean = (descriptor_hint or {}).get("mean", base_mean)
+        hint_std = (descriptor_hint or {}).get("std", [0.05, 0.05, 0.05])
+        tint = [float(hint_mean[0]), float(hint_mean[1]), float(hint_mean[2])]
+        if identity_embedding:
+            tint = [max(0.0, min(1.0, tint[k] * 0.75 + (identity_embedding[k] + 1.0) * 0.125)) for k in range(3)]
+        if region_type in {"face", "head"}:
+            tint = [min(1.0, tint[0] + 0.03), min(1.0, tint[1] + 0.015), tint[2]]
+        elif region_type in {"garments", "sleeves"}:
+            tint = [tint[0] * 0.95, min(1.0, tint[1] * 1.03), min(1.0, tint[2] * 1.04)]
+        elif region_type in {"torso", "left_arm", "right_arm", "pelvis", "legs"}:
+            tint = [min(1.0, tint[0] * 1.02), tint[1] * 0.98, tint[2] * 0.96]
+        visibility_boost = 0.18 if visibility in {"visible", "partially_visible"} else 0.08
+
+        out = zeros(h, w, c)
+        for y in range(h):
+            for x in range(w):
+                radial = abs((x / max(1, w - 1)) - 0.5) + abs((y / max(1, h - 1)) - 0.5)
+                smooth = max(0.0, min(1.0, 1.0 - radial))
+                for k in range(c):
+                    std_term = float(hint_std[k]) * (0.15 - 0.1 * smooth)
+                    mixed = roi[y][x][k] * (1.0 - visibility_boost) + tint[k] * visibility_boost + std_term
+                    out[y][x][k] = max(0.0, min(1.0, mixed))
+        return out
 
     def render(
         self,
@@ -169,6 +213,12 @@ class PatchRenderer:
         confidence = 0.5
 
         strategy = self._pick_strategy(scene_graph, delta, region, memory)
+        debug_trace.append(f"strategy_selected={strategy.value}")
+        debug_trace.append(f"state={delta.state_before.get('pose_phase', 'na')}->{delta.state_after.get('pose_phase', 'na')}")
+        debug_trace.append(f"visibility_hint={delta.predicted_visibility_changes.get(region_type, 'none')}")
+        relation_hints = SceneGraphQueries.relations_for_entity(scene_graph, entity)
+        if relation_hints:
+            debug_trace.append(f"graph_relations={len(relation_hints)}")
         if strategy == self.RenderStrategy.KNOWN_HIDDEN_REVEAL:
             slot = memory.hidden_region_slots.get(region.region_id)
             if slot and slot.candidate_patch_ids:
@@ -179,29 +229,61 @@ class PatchRenderer:
                     confidence = min(0.99, 0.65 + slot.confidence * 0.3)
                     debug_trace.append("strategy=known_hidden_reveal")
                     debug_trace.append(f"hidden_candidate={hidden_id}")
+                    debug_trace.append(f"hidden_slot={slot.hidden_type}:{slot.last_transition}")
 
-        if len(debug_trace) <= 2 and strategy == self.RenderStrategy.UNKNOWN_HIDDEN_SYNTHESIS:
-            mc = mean_color(roi)
-            for y in range(h):
-                for x in range(w):
-                    for k in range(ch):
-                        rendered[y][x][k] = max(0.0, min(1.0, 0.85 * rendered[y][x][k] + 0.15 * mc[k]))
+        if "strategy=known_hidden_reveal" not in debug_trace and strategy == self.RenderStrategy.UNKNOWN_HIDDEN_SYNTHESIS:
+            query_desc = self.memory_manager._patch_descriptor(roi)
+            route = self.memory_manager.route_region_retrieval(
+                memory,
+                region.region_id,
+                region_type,
+                entity,
+                query_descriptor=query_desc,
+                transition_context={
+                    "transition_phase": delta.transition_phase,
+                    "visibility_phase": delta.state_after.get("visibility_phase", "stable"),
+                },
+            )
+            identity = memory.identity_memory.get(entity)
+            synth_hint = route["candidates"][0].descriptor if route["candidates"] else query_desc
+            rendered = self._unknown_hidden_synthesis(
+                rendered,
+                region_type,
+                identity.embedding if identity else None,
+                synth_hint,
+                delta.predicted_visibility_changes.get(region_type, "unknown"),
+            )
             confidence = 0.4
             debug_trace.append("strategy=unknown_hidden_synthesis")
+            debug_trace.append(f"retrieval_hint={route['strategy_hint']}")
+            debug_trace.append(f"retrieval_debug={route['explanation']}")
 
-        if len(debug_trace) <= 2:
-            candidates, strategy_name = self._strategy_memory_candidates(memory, entity, region_type, strategy)
+        if not any(msg.startswith("strategy=") for msg in debug_trace[2:]):
+            query_desc = self.memory_manager._patch_descriptor(roi)
+            route = self.memory_manager.route_region_retrieval(
+                memory,
+                region.region_id,
+                region_type,
+                entity,
+                query_descriptor=query_desc,
+                transition_context={
+                    "transition_phase": delta.transition_phase,
+                    "visibility_phase": delta.state_after.get("visibility_phase", "stable"),
+                },
+            )
+            candidates = route["candidates"]
             if candidates:
-                top = sorted(candidates, key=lambda c: (c.confidence, c.evidence_score), reverse=True)[0]
+                top = candidates[0]
                 mem_patch = memory.patch_cache.get(top.patch_id)
                 if mem_patch:
                     mem_weight = min(0.75, 0.25 + top.confidence * 0.5)
                     rendered = self._blend_memory_patch(rendered, mem_patch, mem_weight)
                     confidence = min(0.98, 0.6 + top.confidence * 0.35)
-                    debug_trace.append(f"strategy={strategy_name}")
+                    debug_trace.append(f"strategy={route['strategy_hint']}")
                     debug_trace.append(f"memory_patch={top.patch_id}")
+                    debug_trace.append(f"retrieval_source={route['explanation']}")
 
-        if len(debug_trace) <= 2:
+        if not any(msg.startswith("strategy=") for msg in debug_trace[2:]):
             mc = mean_color(roi)
             for y in range(h):
                 for x in range(w):
@@ -209,6 +291,7 @@ class PatchRenderer:
                         rendered[y][x][k] = max(0.0, min(1.0, rendered[y][x][k] * 0.95 + mc[k] * 0.05))
             confidence = 0.45
             debug_trace.append("strategy=deterministic_refine_fallback")
+            debug_trace.append("fallback_reason=no_viable_retrieval")
 
         semantic_tint = 0.02 if ("expression_change" in delta.semantic_reasons or region_type == "face") else 0.01
         for y in range(h):

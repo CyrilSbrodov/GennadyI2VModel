@@ -2,12 +2,13 @@ import json
 from pathlib import Path
 
 from core.region_ids import is_canonical_region_id, make_region_id
-from core.schema import BBox, GraphDelta, Keypoint, PersonNode, RegionRef, SceneGraph
+from core.schema import BBox, GraphDelta, Keypoint, PersonNode, RegionRef, RelationEdge, SceneGraph
 from dynamics.graph_delta_predictor import GraphDeltaPredictor
 from memory.video_memory import MemoryManager
 from perception.pipeline import PerceptionPipeline
 from rendering.compositor import TemporalStabilizer
 from rendering.roi_renderer import PatchRenderer, ROISelector
+from representation.scene_graph_queries import SceneGraphQueries
 from training.datasets import DynamicsDataset, RepresentationDataset, load_graph_cache, save_graph_cache
 
 
@@ -151,3 +152,63 @@ def test_dynamics_dataset_from_transition_manifest(tmp_path: Path) -> None:
     sample = ds[0]
     assert sample["deltas"][0].affected_regions
     assert sample["deltas"][0].semantic_reasons
+    assert sample["delta_contract"]["transition_phase"]
+
+
+def test_graph_queries_relation_aware_helpers() -> None:
+    graph = SceneGraph(
+        frame_index=0,
+        persons=[PersonNode(person_id="p1", track_id="t1", bbox=BBox(0.1, 0.1, 0.8, 0.8), mask_ref=None)],
+        objects=[],
+        relations=[
+            RelationEdge(source="coat_1", relation="covers", target="p1_torso", confidence=0.8),
+            RelationEdge(source="coat_1", relation="attached_to", target="p1", confidence=0.75),
+            RelationEdge(source="p1", relation="supports", target="chair_1", confidence=0.9),
+        ],
+    )
+    assert SceneGraphQueries.get_covering_entities(graph, "p1", "torso") == ["coat_1"]
+    assert SceneGraphQueries.get_supported_by(graph, "p1") == ["chair_1"]
+    assert "coat_1" in SceneGraphQueries.get_attached_garments(graph, "p1")
+
+
+def test_hidden_slot_lifecycle_promotes_and_decays() -> None:
+    mm = MemoryManager()
+    graph = SceneGraph(frame_index=0, persons=[PersonNode(person_id="p1", track_id="t1", bbox=BBox(0.1, 0.1, 0.8, 0.8), mask_ref=None)], objects=[])
+    mem = mm.initialize(graph)
+    rid = make_region_id("p1", "garments")
+    slot = mm.query_hidden_region(mem, rid)
+    assert slot is not None
+
+    slot.hidden_type = "unknown_hidden"
+    slot.evidence_score = 0.7
+    slot.candidate_patch_ids = ["patch_a", "patch_b"]
+    mm.apply_visibility_event(mem, {"region_id": rid, "entity": "p1"}, {}, "hidden")
+    assert slot.hidden_type == "known_hidden"
+    assert slot.last_transition in {"unknown_to_known", "revealed_to_hidden"}
+
+    slot.stale_frames = 7
+    slot.confidence = 0.2
+    mm.update_from_graph(mem, SceneGraph(frame_index=1, persons=graph.persons, objects=[]))
+    assert slot.hidden_type == "unknown_hidden"
+
+
+def test_unknown_hidden_synthesis_has_explainable_trace() -> None:
+    mm = MemoryManager()
+    renderer = PatchRenderer()
+    graph = SceneGraph(frame_index=0, persons=[PersonNode(person_id="p1", track_id="t1", bbox=BBox(0.1, 0.1, 0.8, 0.8), mask_ref=None)], objects=[])
+    mem = mm.initialize(graph)
+    rid = make_region_id("p1", "torso")
+    mem.hidden_region_slots[rid].hidden_type = "unknown_hidden"
+    mem.hidden_region_slots[rid].candidate_patch_ids = []
+    region = RegionRef(region_id=rid, bbox=BBox(0.2, 0.2, 0.4, 0.4), reason="reveal")
+    delta = GraphDelta(
+        newly_revealed_regions=[region],
+        affected_entities=["p1"],
+        affected_regions=["torso"],
+        predicted_visibility_changes={"torso": "visible"},
+        state_before={"pose_phase": "standing"},
+        state_after={"pose_phase": "standing", "visibility_phase": "revealing"},
+    )
+    patch = renderer.render(_solid(64, 64, (0.1, 0.3, 0.4)), graph, delta, mem, region)
+    assert "strategy=unknown_hidden_synthesis" in patch.debug_trace
+    assert any(msg.startswith("retrieval_debug=") for msg in patch.debug_trace)

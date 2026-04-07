@@ -41,6 +41,7 @@ class TrainingSample(TypedDict, total=False):
     memory_records: list[dict[str, object]]
     source: str
     sanity_metrics: dict[str, float]
+    delta_contract: dict[str, object]
 
 
 @dataclass(slots=True)
@@ -167,7 +168,7 @@ class DynamicsDataset(BaseStageDataset):
         for idx in range(size):
             action = ActionStep(type="move", priority=1, target_entity=f"person_{idx}")
             delta = GraphDelta(pose_deltas={"torso_pitch": 0.1 * (idx + 1)})
-            samples.append({"graphs": [SceneGraph(frame_index=idx)], "actions": [action], "deltas": [delta], "frames": [zeros(64, 64, 3), [[[1.0, 1.0, 1.0] for _ in range(64)] for _ in range(64)]], "source": "synthetic"})
+            samples.append({"graphs": [SceneGraph(frame_index=idx)], "actions": [action], "deltas": [delta], "frames": [zeros(64, 64, 3), [[[1.0, 1.0, 1.0] for _ in range(64)] for _ in range(64)]], "source": "synthetic", "delta_contract": _serialize_delta_contract(delta)})
         return cls(samples=samples)
 
     @classmethod
@@ -175,7 +176,7 @@ class DynamicsDataset(BaseStageDataset):
         samples: list[TrainingSample] = []
         for idx in range(max(0, len(graphs) - 1)):
             delta = GraphDelta(pose_deltas={"frame_delta": float(graphs[idx + 1].frame_index - graphs[idx].frame_index)})
-            samples.append({"graphs": [graphs[idx], graphs[idx + 1]], "actions": actions, "deltas": [delta], "source": "graph_sequence"})
+            samples.append({"graphs": [graphs[idx], graphs[idx + 1]], "actions": actions, "deltas": [delta], "source": "graph_sequence", "delta_contract": _serialize_delta_contract(delta)})
         return cls(samples=samples)
 
     @classmethod
@@ -191,7 +192,7 @@ class DynamicsDataset(BaseStageDataset):
             planned_state = type("_PS", (), {"labels": action_labels, "step_index": idx + 1})()
             delta, _ = predictor.predict(prev, planned_state)
             actions = [ActionStep(type=label, priority=i + 1) for i, label in enumerate(action_labels)]
-            out.append({"graphs": [prev, nxt], "actions": actions, "deltas": [delta], "source": rec.get("source", "transition_manifest")})
+            out.append({"graphs": [prev, nxt], "actions": actions, "deltas": [delta], "source": rec.get("source", "transition_manifest"), "delta_contract": _serialize_delta_contract(delta)})
         return cls(samples=out)
 
 
@@ -333,3 +334,14 @@ def save_graph_cache(graphs: list[SceneGraph], path: str) -> None:
 def load_graph_cache(path: str) -> list[SceneGraph]:
     payload = json.loads(Path(path).read_text())
     return [_deserialize_graph(rec) for rec in payload.get("graphs", [])]
+
+
+def _serialize_delta_contract(delta: GraphDelta) -> dict[str, object]:
+    return {
+        "state_before": dict(delta.state_before),
+        "state_after": dict(delta.state_after),
+        "transition_phase": delta.transition_phase,
+        "region_transition_mode": dict(delta.region_transition_mode),
+        "predicted_visibility_changes": dict(delta.predicted_visibility_changes),
+        "semantic_reasons": list(delta.semantic_reasons),
+    }

@@ -131,6 +131,12 @@ class MemoryManager:
                 descriptor.confidence *= 0.95
                 if descriptor.confidence < 0.3:
                     descriptor.visibility = "hidden"
+        for region_id, slot in memory.hidden_region_slots.items():
+            if region_id not in visible_regions:
+                slot.stale_frames += 1
+            else:
+                slot.stale_frames = 0
+            self._promote_or_decay_hidden_slot(slot)
         return memory
 
     def update_from_frame(self, memory: VideoMemory, frame: list, scene_graph: SceneGraph) -> VideoMemory:
@@ -171,6 +177,8 @@ class MemoryManager:
                     slot.stale_frames = 0
                     slot.hidden_type = "known_hidden"
                     slot.evidence_score = max(slot.evidence_score, min(1.0, evidence))
+                    slot.last_transition = "observed_visible"
+                    self._promote_or_decay_hidden_slot(slot)
         return memory
 
     def mark_region_revealed(self, memory: VideoMemory, region_id: str, owner_entity: str) -> None:
@@ -199,6 +207,7 @@ class MemoryManager:
         slot = memory.hidden_region_slots.get(region_id)
         if slot is None:
             return None
+        self._refresh_hidden_slot_priority(slot)
         if hidden_type is not None and slot.hidden_type != hidden_type:
             return None
         return slot
@@ -225,11 +234,14 @@ class MemoryManager:
             slot.stale_frames = 0
             if slot.candidate_patch_ids:
                 slot.hidden_type = "known_hidden"
+            slot.last_transition = "hidden_to_revealed"
         elif visibility == "hidden":
             slot.confidence = max(0.1, slot.confidence - 0.12)
             slot.stale_frames += 1
             if not slot.candidate_patch_ids:
                 slot.hidden_type = "unknown_hidden"
+            slot.last_transition = "revealed_to_hidden"
+        self._promote_or_decay_hidden_slot(slot)
 
     def retrieve(self, memory: VideoMemory, query_embedding: list[float], bank: str = "texture", top_k: int = 3) -> list[dict[str, object]]:
         qn = math.sqrt(sum(v * v for v in query_embedding)) or 1.0
@@ -264,6 +276,52 @@ class MemoryManager:
             return None
         return max(candidates, key=lambda c: (c.confidence, c.evidence_score))
 
+    def route_region_retrieval(
+        self,
+        memory: VideoMemory,
+        region_id: str,
+        region_type: str,
+        entity_id: str,
+        query_descriptor: dict[str, float | list[float]] | None = None,
+        transition_context: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        slot = self.retrieve_hidden_region(memory, region_id)
+        phase = (transition_context or {}).get("transition_phase", "single")
+        visibility_phase = (transition_context or {}).get("visibility_phase", "stable")
+        hidden_bias = 0.2 if slot and slot.hidden_type == "known_hidden" else -0.05
+        recency_weight = 0.2 if phase in {"lower_pelvis", "contact_chair", "garment_opening"} else 0.1
+        hint = "direct_patch"
+        if region_type in {"face", "head"}:
+            hint = "identity_patch"
+        elif region_type in {"garments", "sleeves"}:
+            hint = "garment_patch"
+        elif visibility_phase in {"revealing", "occluding"}:
+            hint = "visibility_transition_patch"
+
+        patches = [p for p in memory.texture_patches.values() if p.entity_id == entity_id and (p.region_type == region_type or hint == "visibility_transition_patch")]
+        if not patches:
+            patches = [p for p in memory.texture_patches.values() if p.entity_id == entity_id]
+        most_recent = max((p.source_frame for p in patches), default=0)
+        scored: list[tuple[float, TexturePatchMemory]] = []
+        for patch in patches:
+            recency = 1.0 / (1.0 + max(0, most_recent - patch.source_frame))
+            descriptor_sim = self._descriptor_similarity(query_descriptor, patch.descriptor)
+            score = patch.confidence + 0.2 * patch.evidence_score + recency_weight * recency + 0.25 * descriptor_sim + hidden_bias
+            if slot and patch.patch_id in slot.candidate_patch_ids:
+                score += 0.15
+            scored.append((score, patch))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        candidates = [patch for _, patch in scored[:5]]
+        explanation = {
+            "hint": hint,
+            "slot_type": slot.hidden_type if slot else "none",
+            "slot_transition": slot.last_transition if slot else "none",
+            "visibility_phase": visibility_phase,
+            "phase": phase,
+            "candidate_count": len(candidates),
+        }
+        return {"candidates": candidates, "strategy_hint": hint, "explanation": explanation}
+
     def to_dict(self, memory: VideoMemory) -> dict[str, object]:
         return asdict(memory)
 
@@ -287,6 +345,21 @@ class MemoryManager:
     def _refresh_entry(self, entry: MemoryEntry, frame_index: int) -> None:
         entry.confidence = min(1.0, entry.confidence * 0.9 + 0.1)
         entry.last_seen_frames.append(frame_index)
+
+    def _refresh_hidden_slot_priority(self, slot: HiddenRegionSlot) -> None:
+        recency = 1.0 / (1.0 + slot.stale_frames)
+        slot.retrieval_priority = max(0.0, min(1.0, slot.confidence * 0.6 + slot.evidence_score * 0.3 + recency * 0.1))
+
+    def _promote_or_decay_hidden_slot(self, slot: HiddenRegionSlot) -> None:
+        self._refresh_hidden_slot_priority(slot)
+        if slot.hidden_type == "unknown_hidden" and slot.evidence_score >= 0.55 and len(slot.candidate_patch_ids) >= 2:
+            slot.hidden_type = "known_hidden"
+            slot.last_transition = "unknown_to_known"
+        if slot.stale_frames >= 6 and slot.hidden_type == "known_hidden":
+            slot.confidence = max(0.1, slot.confidence * 0.9)
+            if slot.confidence < 0.35:
+                slot.hidden_type = "unknown_hidden"
+                slot.last_transition = "known_to_unknown_decay"
 
     def _seed_person_semantic_regions(self, memory: VideoMemory, person_id: str, bbox: BBox, frame_index: int) -> None:
         for offset, region_type in enumerate(self._SEMANTIC_REGIONS):
