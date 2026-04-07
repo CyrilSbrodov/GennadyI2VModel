@@ -1,0 +1,175 @@
+{
+  "records": [
+    {
+      "id": "coat_front_01",
+      "image": "validation/parser_pack/1.jpg",
+      "expected": {
+        "person": true,
+        "garments_any_of": ["coat", "top", "upper_clothes"],
+        "body_parts_expected": ["torso", "arms"],
+        "face_regions_expected": true
+      }
+    },
+    {
+      "id": "coat_fullbody_02",
+      "image": "validation/parser_pack/2.jpg",
+      "expected": {
+        "person": true,
+        "garments_any_of": ["coat", "top", "upper_clothes"],
+        "body_parts_expected": ["torso", "legs"],
+        "face_regions_expected": false
+      }
+    },
+    {
+      "id": "coat_hat_03",
+      "image": "validation/parser_pack/3.jpg",
+      "expected": {
+        "person": true,
+        "garments_any_of": ["coat", "top", "upper_clothes"],
+        "body_parts_expected": ["torso"],
+        "face_regions_expected": true,
+        "accessories_any_of": ["hat"]
+      }
+    },
+    {
+      "id": "coat_glasses_04",
+      "image": "validation/parser_pack/4.jpg",
+      "expected": {
+        "person": true,
+        "garments_any_of": ["coat", "top", "upper_clothes"],
+        "body_parts_expected": ["torso"],
+        "face_regions_expected": true,
+        "accessories_any_of": ["glasses"]
+      }
+    },
+    {
+      "id": "coat_hat_long_05",
+      "image": "validation/parser_pack/5.jpg",
+      "expected": {
+        "person": true,
+        "garments_any_of": ["coat", "top", "upper_clothes"],
+        "body_parts_expected": ["torso", "legs"],
+        "face_regions_expected": false,
+        "accessories_any_of": ["hat"]
+      }
+    },
+    {
+      "id": "coat_female_06",
+      "image": "validation/parser_pack/6.jpg",
+      "expected": {
+        "person": true,
+        "garments_any_of": ["coat", "top", "dress", "upper_clothes"],
+        "body_parts_expected": ["torso"],
+        "face_regions_expected": true
+      }
+    },
+    {
+      "id": "hoodie_07",
+      "image": "validation/parser_pack/7.jpg",
+      "expected": {
+        "person": true,
+        "garments_any_of": ["hoodie", "top", "upper_clothes"],
+        "body_parts_expected": ["torso"],
+        "face_regions_expected": false,
+        "accessories_any_of": ["hood"]
+      }
+    },
+    {
+      "id": "scarf_08",
+      "image": "validation/parser_pack/8.jpg",
+      "expected": {
+        "person": true,
+        "garments_any_of": ["top", "upper_clothes", "coat"],
+        "body_parts_expected": ["torso"],
+        "face_regions_expected": true,
+        "accessories_any_of": ["scarf"]
+      }
+    },
+    {
+      "id": "hat_scarf_bag_09",
+      "image": "validation/parser_pack/9.jpg",
+      "expected": {
+        "person": true,
+        "garments_any_of": ["top", "upper_clothes", "coat"],
+        "body_parts_expected": ["torso"],
+        "face_regions_expected": true,
+        "accessories_any_of": ["hat", "scarf", "bag"]
+      }
+    },
+    {
+      "id": "bag_10",
+      "image": "validation/parser_pack/10.jpg",
+      "expected": {
+        "person": true,
+        "garments_any_of": ["top", "upper_clothes", "coat"],
+        "body_parts_expected": ["torso", "arms"],
+        "face_regions_expected": false,
+        "accessories_any_of": ["bag"]
+      }
+    },
+    {
+      "id": "seated_chair_11",
+      "image": "validation/parser_pack/11.jpg",
+      "expected": {
+        "person": true,
+        "garments_any_of": ["top", "upper_clothes", "pants", "dress", "skirt"],
+        "body_parts_expected": ["torso", "legs"],
+        "face_regions_expected": false,
+        "pose_hint": "seated"
+      }
+    },
+    {
+      "id": "seated_portrait_12",
+      "image": "validation/parser_pack/12.jpg",
+      "expected": {
+        "person": true,
+        "garments_any_of": ["top", "upper_clothes", "coat"],
+        "body_parts_expected": ["torso"],
+        "face_regions_expected": true,
+        "pose_hint": "seated"
+      }
+    },
+    {
+      "id": "dress_front_13",
+      "image": "validation/parser_pack/13.jpg",
+      "expected": {
+        "person": true,
+        "garments_any_of": ["dress"],
+        "body_parts_expected": ["torso", "legs"],
+        "face_regions_expected": true
+      }
+    },
+    {
+      "id": "dress_texture_14",
+      "image": "validation/parser_pack/14.jpg",
+      "expected": {
+        "person": true,
+        "garments_any_of": ["dress"],
+        "body_parts_expected": ["torso"],
+        "face_regions_expected": true
+      }
+    },
+    {
+      "id": "dress_belt_15",
+      "image": "validation/parser_pack/15.jpg",
+      "expected": {
+        "person": true,
+        "garments_any_of": ["dress"],
+        "body_parts_expected": ["torso"],
+        "face_regions_expected": true,
+        "accessories_any_of": ["belt"]
+      }
+    },
+    {
+      "id": "bag_outerwear_16",
+      "image": "validation/parser_pack/16.jpg",
+      "expected": {
+        "person": true,
+        "garments_any_of": ["top", "upper_clothes", "coat"],
+        "body_parts_expected": ["torso", "arms"],
+        "face_regions_expected": false,
+        "accessories_any_of": ["bag"]
+      }
+    }
+  ]
+}
