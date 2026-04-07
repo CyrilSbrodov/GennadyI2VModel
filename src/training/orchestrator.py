@@ -71,7 +71,7 @@ def _build_stage_trainers() -> dict[str, StageTrainer]:
 
 
 def train_learned_stage(stage_name: str, config: TrainingConfig, backend: str = "baseline") -> StageResult:
-    runner = build_stage_runner(stage_name, backend=backend)
+    runner = build_stage_runner(stage_name, backend=backend, backend_config=config.learned_backend_config)
     scaffold = StageScaffoldConfig(
         stage_name=stage_name,
         model_backend=backend,
@@ -79,6 +79,8 @@ def train_learned_stage(stage_name: str, config: TrainingConfig, backend: str = 
         learning_rate=config.learning_rate,
         epochs=config.epochs,
         checkpoint_path=f"{config.checkpoint_dir}/{stage_name}.ckpt",
+        dataset_path=config.learned_dataset_path,
+        backend_config=config.learned_backend_config,
     )
     result = runner.run(scaffold)
     return StageResult(

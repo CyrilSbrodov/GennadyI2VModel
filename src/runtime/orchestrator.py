@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from core.input_layer import InputAssetLayer
 from core.schema import SceneGraph
 from dynamics.state_update import apply_delta
-from learned.factory import LearnedBackendFactory
+from learned.factory import BackendBundle, BackendConfig, LearnedBackendFactory
 from learned.interfaces import DynamicsTransitionRequest, PatchSynthesisRequest, TemporalRefinementRequest
-from learned.parity import dynamics_io_to_contract, patch_io_to_contract, temporal_io_to_contract, validate_parity
+from learned.parity import (
+    dynamics_io_to_contract,
+    patch_io_to_contract,
+    semantic_parity_checks,
+    temporal_io_to_contract,
+    validate_parity,
+)
 from memory.summaries import AppearanceMemorySummarizer
 from memory.video_memory import MemoryManager
 from perception.pipeline import PerceptionPipeline
@@ -28,11 +34,11 @@ class InferenceArtifacts:
     frames: list[list]
     scene_graphs: list[SceneGraph]
     state_plan: StatePlan
-    debug: dict[str, list[str] | str | dict[str, object]] = field(default_factory=dict)
+    debug: dict[str, list[str] | str | dict[str, object] | list[dict[str, object]]] = field(default_factory=dict)
 
 
 class GennadyEngine:
-    def __init__(self) -> None:
+    def __init__(self, backend_config: BackendConfig | None = None, backend_bundle: BackendBundle | None = None) -> None:
         self.input_layer = InputAssetLayer()
         self.perception = PerceptionPipeline()
         self.graph_builder = SceneGraphBuilder()
@@ -42,7 +48,23 @@ class GennadyEngine:
         self.roi_selector = ROISelector()
         self.compositor = Compositor()
         self.memory_summarizer = AppearanceMemorySummarizer()
-        self.backends = LearnedBackendFactory().build()
+        self.backend_config = backend_config or BackendConfig()
+        self.backends = backend_bundle or LearnedBackendFactory(self.backend_config).build()
+
+    @staticmethod
+    def build_dynamics_memory_channels(memory_channels: dict[str, object]) -> dict[str, object]:
+        keep = ("identity", "garments", "hidden_regions", "body_regions")
+        return {k: memory_channels.get(k, {}) for k in keep}
+
+    @staticmethod
+    def build_patch_memory_channels(memory_channels: dict[str, object]) -> dict[str, object]:
+        keep = ("identity", "garments", "hidden_regions")
+        return {k: memory_channels.get(k, {}) for k in keep}
+
+    @staticmethod
+    def build_temporal_memory_channels(memory_channels: dict[str, object]) -> dict[str, object]:
+        keep = ("identity", "body_regions", "hidden_regions")
+        return {k: memory_channels.get(k, {}) for k in keep}
 
     def run(
         self,
@@ -93,17 +115,19 @@ class GennadyEngine:
         dynamics_metrics_log: list[str] = []
         channel_usage_log: list[dict[str, object]] = []
         fallback_log: list[str] = []
+        step_debug: list[dict[str, object]] = []
 
         for planned_state in state_plan.steps[1 : profile.max_transition_steps + 1]:
             memory_summary = self.memory_summarizer.summarize(memory).as_dict()
             memory_channels = summarize_memory(memory)
+            dynamics_channels = self.build_dynamics_memory_channels(memory_channels)
             entity_id = scene_graph.persons[0].person_id if scene_graph.persons else "scene"
             identity_embedding = self.backends.identity_encoder.encode_identity(memory_channels, entity_id)
 
             transition_request = DynamicsTransitionRequest(
                 graph_state=scene_graph,
                 memory_summary=memory_summary,
-                memory_channels=memory_channels,
+                memory_channels=dynamics_channels,
                 text_action_summary=text_encoding,
                 graph_encoding=graph_encoding,
                 identity_embeddings={entity_id: identity_embedding},
@@ -112,13 +136,18 @@ class GennadyEngine:
             transition_output = self.backends.dynamics_backend.predict_transition(transition_request)
             parity_contract = dynamics_io_to_contract(transition_request, transition_output)
             missing_fields = validate_parity(parity_contract, ["graph_before", "graph_after", "delta_contract", "transition_context"])
+            semantic_dynamics = semantic_parity_checks(stage="dynamics", contract=parity_contract, request=transition_request, output=transition_output)
             if missing_fields:
-                fallback_log.append(f"dynamics_parity_missing={missing_fields}")
+                fallback_log.append(f"step={planned_state.step_index}:dynamics_parity_missing={missing_fields}")
+            if semantic_dynamics:
+                fallback_log.extend([f"step={planned_state.step_index}:dynamics_semantic={x}" for x in semantic_dynamics])
 
             delta = transition_output.delta
             changed_regions = self.roi_selector.select(scene_graph, delta)
             patches: list[RenderedPatch] = []
+            patch_step_debug: list[dict[str, object]] = []
             for region in changed_regions[: profile.max_roi_count]:
+                patch_channels = self.build_patch_memory_channels(memory_channels)
                 patch_request = PatchSynthesisRequest(
                     region=region,
                     scene_state=scene_graph,
@@ -126,11 +155,7 @@ class GennadyEngine:
                     transition_context={"graph_delta": delta, "video_memory": memory},
                     retrieval_summary={"backend": "deterministic", "identity_entity": entity_id},
                     current_frame=current_frame,
-                    memory_channels={
-                        "identity": memory_channels.get("identity", {}),
-                        "garments": memory_channels.get("garments", {}),
-                        "hidden_regions": memory_channels.get("hidden_regions", {}),
-                    },
+                    memory_channels=patch_channels,
                     graph_encoding=graph_encoding,
                     identity_embedding=identity_embedding,
                 )
@@ -140,8 +165,22 @@ class GennadyEngine:
                     patch_contract,
                     ["roi_before", "roi_after", "region_metadata", "selected_strategy", "transition_context"],
                 )
+                semantic_patch = semantic_parity_checks(stage="patch", contract=patch_contract, request=patch_request, output=patch_out)
                 if missing_patch_fields:
-                    fallback_log.append(f"patch_parity_missing={missing_patch_fields}")
+                    fallback_log.append(f"step={planned_state.step_index}:patch_parity_missing={missing_patch_fields}")
+                if semantic_patch:
+                    fallback_log.extend([f"step={planned_state.step_index}:patch_semantic={x}" for x in semantic_patch])
+                patch_step_debug.append(
+                    {
+                        "region_id": region.region_id,
+                        "selected_strategy": patch_contract.get("selected_strategy", "unknown"),
+                        "confidence": patch_out.confidence,
+                        "synthesis_mode": patch_contract.get("synthesis_mode", "unknown"),
+                        "retrieval_summary": str(patch_request.retrieval_summary)[:120],
+                        "missing_fields": missing_patch_fields,
+                        "semantic_issues": semantic_patch,
+                    }
+                )
                 patches.append(
                     RenderedPatch(
                         region=patch_out.region,
@@ -159,17 +198,14 @@ class GennadyEngine:
                 )
 
             composed = self.compositor.compose(current_frame, patches, delta)
+            temporal_channels = self.build_temporal_memory_channels(memory_channels)
             temporal_request = TemporalRefinementRequest(
                 previous_frame=frames[-1],
                 current_composed_frame=composed,
                 changed_regions=[p.region for p in patches],
                 scene_state=scene_graph,
                 memory_state=memory,
-                memory_channels={
-                    "identity": memory_channels.get("identity", {}),
-                    "body_regions": memory_channels.get("body_regions", {}),
-                    "hidden_regions": memory_channels.get("hidden_regions", {}),
-                },
+                memory_channels=temporal_channels,
             )
             temporal_out = self.backends.temporal_backend.refine_temporal(temporal_request)
             temporal_contract = temporal_io_to_contract(temporal_request, temporal_out)
@@ -177,8 +213,17 @@ class GennadyEngine:
                 temporal_contract,
                 ["previous_frame", "composed_frame", "target_frame", "changed_regions", "scene_transition_context"],
             )
+            semantic_temporal = semantic_parity_checks(
+                stage="temporal",
+                contract=temporal_contract,
+                request=temporal_request,
+                output=temporal_out,
+                changed_regions_count=len(patches),
+            )
             if missing_temporal_fields:
-                fallback_log.append(f"temporal_parity_missing={missing_temporal_fields}")
+                fallback_log.append(f"step={planned_state.step_index}:temporal_parity_missing={missing_temporal_fields}")
+            if semantic_temporal:
+                fallback_log.extend([f"step={planned_state.step_index}:temporal_semantic={x}" for x in semantic_temporal])
             stable_frame = temporal_out.refined_frame if profile.temporal_refinement else composed
 
             scene_graph = apply_delta(scene_graph, delta)
@@ -203,11 +248,46 @@ class GennadyEngine:
             dynamics_metrics_log.append(
                 f"delta={transition_output.diagnostics.get('delta_magnitude', 0.0):.3f}, smooth={transition_output.diagnostics.get('temporal_smoothness_proxy', 0.0):.3f}, violations={transition_output.diagnostics.get('constraint_violations', 0.0):.0f}"
             )
+            step_debug.append(
+                {
+                    "step_index": planned_state.step_index,
+                    "dynamics": {
+                        "backend": self.backends.backend_names.get("dynamics_backend", "unknown"),
+                        "confidence": transition_output.confidence,
+                        "diagnostics_summary": {
+                            "delta_magnitude": transition_output.diagnostics.get("delta_magnitude"),
+                            "smoothness": transition_output.diagnostics.get("temporal_smoothness_proxy"),
+                            "violations": transition_output.diagnostics.get("constraint_violations"),
+                        },
+                    },
+                    "patch": patch_step_debug,
+                    "temporal": {
+                        "backend": self.backends.backend_names.get("temporal_backend", "unknown"),
+                        "region_consistency_summary": temporal_out.region_consistency_scores,
+                        "drift_consistency": {
+                            "changed_regions": len(temporal_request.changed_regions),
+                            "drift_proxy": 1.0 - (sum(temporal_out.region_consistency_scores.values()) / max(1.0, float(len(temporal_out.region_consistency_scores) or 1))),
+                        },
+                    },
+                    "parity": {
+                        "missing_fields": {
+                            "dynamics": missing_fields,
+                            "temporal": missing_temporal_fields,
+                            "patch": [p["missing_fields"] for p in patch_step_debug],
+                        },
+                        "semantic_issues": {
+                            "dynamics": semantic_dynamics,
+                            "temporal": semantic_temporal,
+                            "patch": [p["semantic_issues"] for p in patch_step_debug],
+                        },
+                    },
+                }
+            )
             channel_usage_log.append(
                 {
                     "step_index": planned_state.step_index,
                     "dynamics_channels": list(transition_request.memory_channels.keys()),
-                    "patch_channels": list(patch_request.memory_channels.keys()) if changed_regions else [],
+                    "patch_channels": list(self.build_patch_memory_channels(memory_channels).keys()) if changed_regions else [],
                     "temporal_channels": list(temporal_request.memory_channels.keys()),
                     "identity_encoder_used": bool(identity_embedding),
                     "graph_embedding_dim": len(graph_encoding.graph_embedding),
@@ -222,6 +302,7 @@ class GennadyEngine:
             debug={
                 "overlay_log": overlay_log,
                 "dynamics_metrics": dynamics_metrics_log,
+                "step_execution": step_debug,
                 "profile": {
                     "name": profile.name,
                     "internal_resolution": profile.internal_resolution,
@@ -241,6 +322,7 @@ class GennadyEngine:
                 },
                 "learned_ready": {
                     "backend_selection": self.backends.backend_names,
+                    "backend_config": asdict(self.backend_config),
                     "graph_encoder_used": True,
                     "identity_encoder_used": True,
                     "graph_encoding_confidence": graph_encoding.confidence,

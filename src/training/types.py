@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from learned.factory import BackendConfig
+
 
 @dataclass(slots=True)
 class TrainingConfig:
@@ -27,6 +29,8 @@ class TrainingConfig:
     dataset_mix: dict[str, float] = field(default_factory=lambda: {"synthetic": 0.3, "real": 0.7})
     freeze_base: bool = True
     train_head_only: bool = True
+    learned_dataset_path: str = ""
+    learned_backend_config: BackendConfig | None = None
 
 
 @dataclass(slots=True)

@@ -404,6 +404,9 @@ def load_graph_cache(path: str) -> list[SceneGraph]:
 
 
 def _serialize_delta_contract(delta: GraphDelta) -> dict[str, object]:
+    magnitude = 0.0
+    for payload in (delta.pose_deltas, delta.interaction_deltas, delta.garment_deltas, delta.expression_deltas):
+        magnitude += sum(abs(float(v)) for v in payload.values() if isinstance(v, (int, float)))
     return {
         "state_before": dict(delta.state_before),
         "state_after": dict(delta.state_after),
@@ -411,4 +414,11 @@ def _serialize_delta_contract(delta: GraphDelta) -> dict[str, object]:
         "region_transition_mode": dict(delta.region_transition_mode),
         "predicted_visibility_changes": dict(delta.predicted_visibility_changes),
         "semantic_reasons": list(delta.semantic_reasons),
+        "affected_entities": list(delta.affected_entities),
+        "affected_regions": list(delta.affected_regions),
+        "pose_deltas": dict(delta.pose_deltas),
+        "interaction_deltas": dict(delta.interaction_deltas),
+        "garment_deltas": dict(delta.garment_deltas),
+        "expression_deltas": dict(delta.expression_deltas),
+        "magnitude": magnitude,
     }
