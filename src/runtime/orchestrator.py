@@ -105,8 +105,9 @@ class GennadyEngine:
         text_semantic = semantic_parity_checks(stage="text", contract=text_contract, request={"text": request.text, "actions": action_plan.actions}, output=text_encoding)
         if text_missing:
             fallback_log.append(f"step=0:text_parity_missing={text_missing}")
-        if text_semantic:
-            fallback_log.extend([f"step=0:text_semantic={x}" for x in text_semantic])
+        for severity in ("errors", "warnings", "traces"):
+            for issue in text_semantic.get(severity, []):
+                fallback_log.append(f"step=0:text_semantic_{severity}={issue}")
         state_plan = self.planner.expand(
             scene_graph,
             action_plan,
@@ -125,6 +126,14 @@ class GennadyEngine:
         channel_usage_log: list[dict[str, object]] = []
         step_debug: list[dict[str, object]] = []
         hidden_recon_stats = {"known_hidden": 0, "unknown_hidden": 0, "hidden_reveal": 0, "steps_with_hidden_reconstruction": 0}
+        hidden_recon_quality = {
+            "confidence_sum": 0.0,
+            "quality_hint_sum": 0.0,
+            "refinement_strength_sum": 0.0,
+            "count": 0,
+            "synthesis_mode_counts": {},
+            "strategy_counts": {},
+        }
 
         for planned_state in state_plan.steps[1 : profile.max_transition_steps + 1]:
             memory_summary = self.memory_summarizer.summarize(memory).as_dict()
@@ -148,10 +157,9 @@ class GennadyEngine:
             semantic_dynamics = semantic_parity_checks(stage="dynamics", contract=parity_contract, request=transition_request, output=transition_output)
             if missing_fields:
                 fallback_log.append(f"step={planned_state.step_index}:dynamics_parity_missing={missing_fields}")
-            if semantic_dynamics:
-                for issue in semantic_dynamics:
-                    label = "trace" if issue.endswith("_trace") else "dynamics_semantic"
-                    fallback_log.append(f"step={planned_state.step_index}:{label}={issue}")
+            for severity in ("errors", "warnings", "traces"):
+                for issue in semantic_dynamics.get(severity, []):
+                    fallback_log.append(f"step={planned_state.step_index}:dynamics_semantic_{severity}={issue}")
 
             delta = transition_output.delta
             changed_regions = self.roi_selector.select(scene_graph, delta)
@@ -190,7 +198,16 @@ class GennadyEngine:
                 if missing_patch_fields:
                     fallback_log.append(f"step={planned_state.step_index}:patch_parity_missing={missing_patch_fields}")
                 if semantic_patch:
-                    fallback_log.extend([f"step={planned_state.step_index}:patch_semantic={x}" for x in semantic_patch])
+                    for severity in ("errors", "warnings", "traces"):
+                        fallback_log.extend([f"step={planned_state.step_index}:patch_semantic_{severity}={x}" for x in semantic_patch.get(severity, [])])
+                if step_hidden_reconstruction:
+                    hint = float(patch_out.execution_trace.get("patch_refinement_strength", 0.0) or 0.0)
+                    hidden_recon_quality["count"] += 1
+                    hidden_recon_quality["confidence_sum"] += float(patch_out.confidence)
+                    hidden_recon_quality["quality_hint_sum"] += hint
+                    hidden_recon_quality["refinement_strength_sum"] += hint
+                    hidden_recon_quality["synthesis_mode_counts"][synth_mode] = int(hidden_recon_quality["synthesis_mode_counts"].get(synth_mode, 0)) + 1
+                    hidden_recon_quality["strategy_counts"][strategy] = int(hidden_recon_quality["strategy_counts"].get(strategy, 0)) + 1
                 patch_step_debug.append(
                     {
                         "region_id": region.region_id,
@@ -251,7 +268,8 @@ class GennadyEngine:
             if missing_temporal_fields:
                 fallback_log.append(f"step={planned_state.step_index}:temporal_parity_missing={missing_temporal_fields}")
             if semantic_temporal:
-                fallback_log.extend([f"step={planned_state.step_index}:temporal_semantic={x}" for x in semantic_temporal])
+                for severity in ("errors", "warnings", "traces"):
+                    fallback_log.extend([f"step={planned_state.step_index}:temporal_semantic_{severity}={x}" for x in semantic_temporal.get(severity, [])])
             stable_frame = temporal_out.refined_frame if profile.temporal_refinement else composed
 
             scene_graph = apply_delta(scene_graph, delta)
@@ -282,6 +300,7 @@ class GennadyEngine:
                     "dynamics": {
                         "backend": self.backends.backend_names.get("dynamics_backend", "unknown"),
                         "confidence": transition_output.confidence,
+                        "supervision_mode": parity_contract.get("transition_context", {}).get("supervision_mode", "inference"),
                         "diagnostics_summary": {
                             "delta_magnitude": transition_output.diagnostics.get("delta_magnitude"),
                             "smoothness": transition_output.diagnostics.get("temporal_smoothness_proxy"),
@@ -314,7 +333,7 @@ class GennadyEngine:
                         "semantic_issues": {
                             "dynamics": semantic_dynamics,
                             "temporal": semantic_temporal,
-                    "patch": [p["semantic_issues"] for p in patch_step_debug],
+                            "patch": [p["semantic_issues"] for p in patch_step_debug],
                         },
                     },
                 }
@@ -377,7 +396,14 @@ class GennadyEngine:
                         "missing_fields": text_missing,
                         "semantic_issues": text_semantic,
                     },
-                    "hidden_reconstruction_summary": hidden_recon_stats,
+                    "hidden_reconstruction_summary": {
+                        **hidden_recon_stats,
+                        "average_hidden_reconstruction_confidence": (hidden_recon_quality["confidence_sum"] / hidden_recon_quality["count"]) if hidden_recon_quality["count"] else 0.0,
+                        "average_refinement_strength": (hidden_recon_quality["refinement_strength_sum"] / hidden_recon_quality["count"]) if hidden_recon_quality["count"] else 0.0,
+                        "average_quality_hint": (hidden_recon_quality["quality_hint_sum"] / hidden_recon_quality["count"]) if hidden_recon_quality["count"] else 0.0,
+                        "count_by_synthesis_mode": hidden_recon_quality["synthesis_mode_counts"],
+                        "count_by_selected_strategy": hidden_recon_quality["strategy_counts"],
+                    },
                 },
             },
         )
