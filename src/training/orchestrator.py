@@ -17,6 +17,7 @@ from training.stage_scaffolds import StageScaffoldConfig, build_stage_runner
 from training.perception_trainer import PerceptionTrainer
 from training.renderer_trainer import RendererTrainer
 from training.representation_trainer import RepresentationTrainer
+from training.temporal_trainer import TemporalTrainer
 from training.types import StageResult, StageTrainer, TrainingConfig
 
 
@@ -69,6 +70,7 @@ def _build_stage_trainers() -> dict[str, StageTrainer]:
         RepresentationTrainer(),
         DynamicsTrainer(),
         RendererTrainer(),
+        TemporalTrainer(),
     ]
     return {trainer.stage_name: trainer for trainer in trainers}
 
@@ -95,7 +97,7 @@ def train_learned_stage(stage_name: str, config: TrainingConfig, backend: str = 
 
 
 def train_stage(stage_name: str, config: TrainingConfig) -> StageResult:
-    if stage_name in {"text_encoder", "dynamics_transition", "patch_synthesis", "temporal_refinement"}:
+    if stage_name in {"text_encoder", "dynamics_transition", "patch_synthesis"}:
         return train_learned_stage(stage_name, config)
     trainers = _build_stage_trainers()
     if stage_name not in trainers:
