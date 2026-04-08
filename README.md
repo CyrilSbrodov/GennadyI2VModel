@@ -78,6 +78,41 @@
 
 > Важно: часть текущих датасетов остаётся pseudo-labeled baseline для smoke/debug. Контракты и структуры данных уже пригодны как learned-ready входы.
 
+### Dynamics manifest-backed dataset (primary path when provided)
+
+`DynamicsTrainer` теперь использует `DynamicsDataset.from_transition_manifest(...)` как **primary data path**, если задан `TrainingConfig.learned_dataset_path` (или `--learned-dataset-path` в CLI). Synthetic путь сохранён только как bootstrap fallback (single-sample/empty-manifest cases).
+
+Минимальный contract записи `records[]`:
+- `scene_graph` — текущий graph-like runtime input (`frame_index`, `persons[]`, optional `relations[]`).
+- `actions` (или `labels`) — conditioning для planner/action tokens.
+- `planner_context` — `step_index`, `total_steps`, `phase`, `target_duration`.
+- `graph_delta_target` — целевой `GraphDelta` supervision:
+  - `pose_deltas`
+  - `garment_deltas`
+  - `visibility_deltas`
+  - `expression_deltas`
+  - `interaction_deltas`
+  - optional `newly_revealed_regions` / `newly_occluded_regions` / `region_transition_mode`
+- optional runtime-aligned context:
+  - `target_transition_context`
+  - `memory_context`
+  - `tags`, `notes`, `scenario`, `record_id`
+
+Диагностика загрузчика:
+- `total_records`, `loaded_records`, `usable_records`, `invalid_records`, `skipped_records`
+- `invalid_examples`
+- `family_counts` по meaningful delta groups
+- `tag_counts`
+
+Train/eval запуск:
+
+```bash
+python -m training.cli --stage dynamics --epochs 2 --learned-dataset-path /path/to/dynamics_manifest.json
+python -m training.cli --eval-dynamics --weights-path artifacts/checkpoints/dynamics/dynamics_weights.json --learned-dataset-path /path/to/dynamics_manifest.json
+```
+
+Dynamics eval report считает component MSE по head-группам + `contract_valid_ratio`, `conditioning_sensitivity`, `fallback_free_ratio`, delta-group coverage (`*_group_coverage`), dataset diagnostics (`usable/invalid/skipped`) и regression `summary_score`.
+
 ## Perception parser runtime stack (real backend pass)
 
 `SegFormerHumanParserAdapter` теперь использует реальные runtime-paths, а не только adapter shells:
@@ -162,4 +197,3 @@ Benchmark report теперь содержит:
 - coverage по scenario families,
 - missing/invalid dataset diagnostics,
 - regression-oriented warnings и comparison deltas между `learned_primary` и `legacy`.
-

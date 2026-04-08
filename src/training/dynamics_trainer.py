@@ -18,6 +18,10 @@ class DynamicsBatch:
     graph_before: object
     graph_before_source: str
     action_tokens: list[str]
+    planner_context: dict[str, float | str]
+    target_transition_context: dict[str, object]
+    memory_context: dict[str, object]
+    delta_groups: dict[str, float]
 
 
 class DynamicsDatasetAdapter:
@@ -28,12 +32,14 @@ class DynamicsDatasetAdapter:
         graph_before = sample["graphs"][0]
         actions = sample.get("actions", [])
         action_tokens = [a.type for a in actions] or ["micro_adjust"]
+        contract = sample.get("graph_transition_contract", {}) if isinstance(sample.get("graph_transition_contract"), dict) else {}
+        base_ctx = contract.get("planner_context", {}) if isinstance(contract.get("planner_context"), dict) else {}
         target_state = PlannedState(step_index=step_index, labels=action_tokens)
         planner_context = {
-            "step_index": float(step_index),
-            "total_steps": float(max(2, len(sample.get("graphs", [])) + 1)),
-            "phase": "mid" if step_index > 1 else "early",
-            "target_duration": 1.5,
+            "step_index": float(base_ctx.get("step_index", step_index)),
+            "total_steps": float(base_ctx.get("total_steps", max(2, len(sample.get("graphs", [])) + 1))),
+            "phase": str(base_ctx.get("phase", "mid" if step_index > 1 else "early")),
+            "target_duration": float(base_ctx.get("target_duration", 1.5)),
         }
         inputs = featurize_runtime(graph_before, target_state, planner_context, None)
         delta = sample.get("deltas", [])[0]
@@ -44,19 +50,43 @@ class DynamicsDatasetAdapter:
             graph_before=graph_before,
             graph_before_source=str(sample.get("source", "unknown")),
             action_tokens=action_tokens,
+            planner_context=planner_context,
+            target_transition_context=contract.get("target_transition_context", {}) if isinstance(contract, dict) else {},
+            memory_context=contract.get("memory_context", {}) if isinstance(contract, dict) else {},
+            delta_groups={
+                "pose": 1.0 if delta.pose_deltas else 0.0,
+                "garment": 1.0 if delta.garment_deltas else 0.0,
+                "visibility": 1.0 if delta.visibility_deltas else 0.0,
+                "expression": 1.0 if delta.expression_deltas else 0.0,
+                "interaction": 1.0 if delta.interaction_deltas else 0.0,
+                "region": 1.0 if delta.region_transition_mode else 0.0,
+            },
         )
 
 
 class DynamicsTrainer(BaseTrainer):
     stage_name = "dynamics"
+    dataset_source: str = "synthetic_dynamics_bootstrap"
+    dataset_diagnostics: dict[str, object] = {}
 
     def build_datasets(self, config: TrainingConfig) -> tuple[DynamicsDataset, DynamicsDataset]:
+        self.dataset_source = "synthetic_dynamics_bootstrap"
+        self.dataset_diagnostics = {}
         if config.learned_dataset_path:
-            manifest_ds = DynamicsDataset.from_transition_manifest(config.learned_dataset_path)
+            manifest_ds = DynamicsDataset.from_transition_manifest(config.learned_dataset_path, strict=False)
+            self.dataset_diagnostics = getattr(manifest_ds, "diagnostics", {})
             if len(manifest_ds) > 1:
                 split = max(1, int(0.8 * len(manifest_ds)))
-                return DynamicsDataset(samples=manifest_ds.samples[:split]), DynamicsDataset(samples=manifest_ds.samples[split:])
-            return manifest_ds, DynamicsDataset.synthetic(max(1, config.val_size))
+                self.dataset_source = "manifest_dynamics_primary"
+                train_ds = DynamicsDataset(samples=manifest_ds.samples[:split])
+                val_ds = DynamicsDataset(samples=manifest_ds.samples[split:])
+                train_ds.diagnostics = dict(self.dataset_diagnostics, split="train")
+                val_ds.diagnostics = dict(self.dataset_diagnostics, split="val")
+                return train_ds, val_ds
+            if len(manifest_ds) == 1:
+                self.dataset_source = "manifest_dynamics_primary_with_synthetic_val_fallback"
+                return manifest_ds, DynamicsDataset.synthetic(max(1, config.val_size))
+            self.dataset_source = "synthetic_dynamics_bootstrap_fallback_manifest_empty"
         train = DynamicsDataset.synthetic(config.train_size)
         val = DynamicsDataset.synthetic(config.val_size)
         return train, val
@@ -74,6 +104,15 @@ class DynamicsTrainer(BaseTrainer):
             "region_mse": 0.0,
             "contract_valid_ratio": 0.0,
             "conditioning_sensitivity": 0.0,
+            "usable_sample_count": 0.0,
+            "invalid_records": 0.0,
+            "skipped_records": 0.0,
+            "pose_group_coverage": 0.0,
+            "garment_group_coverage": 0.0,
+            "visibility_group_coverage": 0.0,
+            "expression_group_coverage": 0.0,
+            "interaction_group_coverage": 0.0,
+            "region_group_coverage": 0.0,
         }
         if not batches:
             metrics["score"] = 0.0
@@ -94,10 +133,16 @@ class DynamicsTrainer(BaseTrainer):
             probe_inputs = featurize_runtime(batch.graph_before, PlannedState(step_index=3, labels=batch.action_tokens + ["intensity=0.9"]), probe_ctx, None)
             probe_pred = model.forward(probe_inputs)
             metrics["conditioning_sensitivity"] += float(abs(probe_pred.pose[0] - prediction.pose[0]))
+            metrics["usable_sample_count"] += 1.0
+            for group, present in batch.delta_groups.items():
+                metrics[f"{group}_group_coverage"] += present
 
         denom = float(len(batches))
         for key in list(metrics):
             metrics[key] = round(metrics[key] / denom, 6)
+        if self.dataset_diagnostics:
+            metrics["invalid_records"] = float(self.dataset_diagnostics.get("invalid_records", 0))
+            metrics["skipped_records"] = float(self.dataset_diagnostics.get("skipped_records", 0))
         metrics["score"] = round(max(0.0, 1.0 - metrics["pose_mse"]), 6)
         return metrics
 
@@ -136,7 +181,8 @@ class DynamicsTrainer(BaseTrainer):
                     "dataset_profile": {
                         "train_samples": len(train_dataset),
                         "val_samples": len(val_dataset),
-                        "source": "manifest" if config.learned_dataset_path else "synthetic_bootstrap",
+                        "source": self.dataset_source,
+                        "diagnostics": self.dataset_diagnostics,
                     },
                 },
                 ensure_ascii=False,
@@ -145,4 +191,3 @@ class DynamicsTrainer(BaseTrainer):
             encoding="utf-8",
         )
         return StageResult(stage_name=self.stage_name, train_metrics=train_metrics, val_metrics=val_metrics, checkpoint_path=str(checkpoint_path))
-

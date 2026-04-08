@@ -174,8 +174,10 @@ class DynamicsDataset(BaseStageDataset):
         for idx in range(size):
             action = ActionStep(type="move", priority=1, target_entity=f"person_{idx}")
             delta = GraphDelta(pose_deltas={"torso_pitch": 0.1 * (idx + 1)})
-            samples.append({"graphs": [SceneGraph(frame_index=idx)], "actions": [action], "deltas": [delta], "frames": [zeros(64, 64, 3), [[[1.0, 1.0, 1.0] for _ in range(64)] for _ in range(64)]], "source": "synthetic", "delta_contract": _serialize_delta_contract(delta)})
-        return cls(samples=samples)
+            samples.append({"graphs": [SceneGraph(frame_index=idx)], "actions": [action], "deltas": [delta], "frames": [zeros(64, 64, 3), [[[1.0, 1.0, 1.0] for _ in range(64)] for _ in range(64)]], "source": "synthetic_dynamics_bootstrap", "delta_contract": _serialize_delta_contract(delta)})
+        ds = cls(samples=samples)
+        ds.diagnostics = {"source": "synthetic_dynamics_bootstrap", "total_records": len(samples), "loaded_records": len(samples), "invalid_records": 0, "skipped_records": 0, "family_counts": {}, "tag_counts": {}}
+        return ds
 
     @classmethod
     def from_graph_sequence(cls, graphs: list[SceneGraph], actions: list[ActionStep]) -> "DynamicsDataset":
@@ -203,20 +205,101 @@ class DynamicsDataset(BaseStageDataset):
         return cls(samples=samples)
 
     @classmethod
-    def from_transition_manifest(cls, manifest_path: str) -> "DynamicsDataset":
-        records = json.loads(Path(manifest_path).read_text()).get("records", [])
+    def from_transition_manifest(cls, manifest_path: str, strict: bool = False) -> "DynamicsDataset":
+        records = json.loads(Path(manifest_path).read_text(encoding="utf-8")).get("records", [])
         predictor = GraphDeltaPredictor()
         out: list[TrainingSample] = []
+        diagnostics: dict[str, object] = {
+            "source": "manifest_dynamics_transition",
+            "manifest_path": manifest_path,
+            "total_records": len(records),
+            "loaded_records": 0,
+            "invalid_records": 0,
+            "skipped_records": 0,
+            "invalid_examples": [],
+            "family_counts": {"pose": 0, "garment": 0, "visibility": 0, "expression": 0, "interaction": 0, "region": 0},
+            "tag_counts": {},
+        }
         for idx, rec in enumerate(records):
-            person = PersonNode(person_id="person_1", track_id="track_1", bbox=BBox(0.2, 0.1, 0.6, 0.8), mask_ref=None)
-            prev = SceneGraph(frame_index=idx, persons=[person])
-            nxt = SceneGraph(frame_index=idx + 1, persons=[person])
-            action_labels = rec.get("labels", ["micro_adjust"])
-            planned_state = type("_PS", (), {"labels": action_labels, "step_index": idx + 1})()
-            delta, _ = predictor.predict(prev, planned_state)
-            actions = [ActionStep(type=label, priority=i + 1) for i, label in enumerate(action_labels)]
-            out.append({"graphs": [prev, nxt], "actions": actions, "deltas": [delta], "source": rec.get("source", "transition_manifest"), "delta_contract": _serialize_delta_contract(delta)})
-        return cls(samples=out)
+            try:
+                if not isinstance(rec, dict):
+                    raise ValueError("record must be json object")
+                if rec.get("memory_context") is not None and not isinstance(rec.get("memory_context"), dict):
+                    raise ValueError("memory_context must be object")
+                if rec.get("target_transition_context") is not None and not isinstance(rec.get("target_transition_context"), dict):
+                    raise ValueError("target_transition_context must be object")
+                person = PersonNode(person_id="person_1", track_id="track_1", bbox=BBox(0.2, 0.1, 0.6, 0.8), mask_ref=None)
+                sg_raw = rec.get("scene_graph")
+                if isinstance(sg_raw, dict):
+                    persons = sg_raw.get("persons", [])
+                    if isinstance(persons, list) and persons and isinstance(persons[0], dict):
+                        p0 = persons[0]
+                        bb = p0.get("bbox", {"x": 0.2, "y": 0.1, "w": 0.6, "h": 0.8})
+                        person = PersonNode(person_id=str(p0.get("person_id", "person_1")), track_id=str(p0.get("track_id", "track_1")), bbox=BBox(float(bb.get("x", 0.2)), float(bb.get("y", 0.1)), float(bb.get("w", 0.6)), float(bb.get("h", 0.8))), mask_ref=None)
+                prev = SceneGraph(frame_index=idx, persons=[person])
+                nxt = SceneGraph(frame_index=idx + 1, persons=[person])
+                action_labels = rec.get("labels", ["micro_adjust"])
+                if isinstance(rec.get("actions"), list) and rec["actions"]:
+                    action_labels = [str(a.get("type", "micro_adjust")) for a in rec["actions"] if isinstance(a, dict)]
+                if not isinstance(action_labels, list) or not action_labels:
+                    action_labels = ["micro_adjust"]
+                actions = [ActionStep(type=str(label), priority=i + 1) for i, label in enumerate(action_labels)]
+                delta_raw = rec.get("graph_delta_target")
+                if isinstance(delta_raw, dict):
+                    delta = GraphDelta(
+                        pose_deltas={str(k): float(v) for k, v in (delta_raw.get("pose_deltas", {}) or {}).items()},
+                        garment_deltas={str(k): float(v) for k, v in (delta_raw.get("garment_deltas", {}) or {}).items()},
+                        visibility_deltas={str(k): str(v) for k, v in (delta_raw.get("visibility_deltas", {}) or {}).items()},
+                        expression_deltas={str(k): float(v) for k, v in (delta_raw.get("expression_deltas", {}) or {}).items()},
+                        interaction_deltas={str(k): float(v) for k, v in (delta_raw.get("interaction_deltas", {}) or {}).items()},
+                        affected_entities=[str(x) for x in delta_raw.get("affected_entities", [person.person_id])],
+                        affected_regions=[str(x) for x in delta_raw.get("affected_regions", [])],
+                        semantic_reasons=[str(x) for x in delta_raw.get("semantic_reasons", action_labels)],
+                        region_transition_mode={str(k): str(v) for k, v in (delta_raw.get("region_transition_mode", {}) or {}).items()},
+                        transition_phase=str(delta_raw.get("transition_phase", "mid")),
+                    )
+                    if not delta.region_transition_mode:
+                        delta.region_transition_mode = {"global": "stable"}
+                    if not delta.affected_regions:
+                        delta.affected_regions = ["torso"]
+                    if not (delta.pose_deltas or delta.garment_deltas or delta.visibility_deltas or delta.expression_deltas or delta.interaction_deltas):
+                        raise ValueError("graph_delta_target requires at least one delta group")
+                else:
+                    planned_state = type("_PS", (), {"labels": action_labels, "step_index": idx + 1})()
+                    delta, _ = predictor.predict(prev, planned_state)
+                graph_contract = {
+                    "planner_context": {
+                        "step_index": float((rec.get("planner_context") or {}).get("step_index", idx + 1)) if isinstance(rec.get("planner_context"), dict) else float(idx + 1),
+                        "total_steps": float((rec.get("planner_context") or {}).get("total_steps", max(2, idx + 2))) if isinstance(rec.get("planner_context"), dict) else float(max(2, idx + 2)),
+                        "phase": str((rec.get("planner_context") or {}).get("phase", "mid")) if isinstance(rec.get("planner_context"), dict) else "mid",
+                        "target_duration": float((rec.get("planner_context") or {}).get("target_duration", 1.5)) if isinstance(rec.get("planner_context"), dict) else 1.5,
+                    },
+                    "target_transition_context": rec.get("target_transition_context", {}) if isinstance(rec.get("target_transition_context"), dict) else {},
+                    "memory_context": rec.get("memory_context", {}) if isinstance(rec.get("memory_context"), dict) else {},
+                    "metadata": {"record_id": rec.get("record_id", f"record_{idx}"), "tags": rec.get("tags", []), "notes": rec.get("notes", "")},
+                }
+                out.append({"graphs": [prev, nxt], "actions": actions, "deltas": [delta], "source": rec.get("source", "transition_manifest"), "delta_contract": _serialize_delta_contract(delta), "graph_transition_contract": graph_contract})
+                diagnostics["loaded_records"] = int(diagnostics["loaded_records"]) + 1
+                diagnostics["family_counts"]["pose"] = int(diagnostics["family_counts"]["pose"]) + (1 if delta.pose_deltas else 0)
+                diagnostics["family_counts"]["garment"] = int(diagnostics["family_counts"]["garment"]) + (1 if delta.garment_deltas else 0)
+                diagnostics["family_counts"]["visibility"] = int(diagnostics["family_counts"]["visibility"]) + (1 if delta.visibility_deltas else 0)
+                diagnostics["family_counts"]["expression"] = int(diagnostics["family_counts"]["expression"]) + (1 if delta.expression_deltas else 0)
+                diagnostics["family_counts"]["interaction"] = int(diagnostics["family_counts"]["interaction"]) + (1 if delta.interaction_deltas else 0)
+                diagnostics["family_counts"]["region"] = int(diagnostics["family_counts"]["region"]) + (1 if delta.region_transition_mode else 0)
+                if isinstance(rec.get("tags"), list):
+                    for tag in rec["tags"]:
+                        k = str(tag).strip().lower()
+                        if k:
+                            diagnostics["tag_counts"][k] = int(diagnostics["tag_counts"].get(k, 0)) + 1
+            except ValueError as exc:
+                diagnostics["invalid_records"] = int(diagnostics["invalid_records"]) + 1
+                if len(diagnostics["invalid_examples"]) < 8:
+                    diagnostics["invalid_examples"].append({"index": idx, "reason": str(exc)})
+                if strict:
+                    raise ValueError(f"dynamics manifest record {idx} invalid: {exc}") from exc
+        ds = cls(samples=out)
+        ds.diagnostics = diagnostics
+        return ds
 
 
 class RendererDataset(BaseStageDataset):
