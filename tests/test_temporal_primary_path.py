@@ -79,6 +79,10 @@ def test_fallback_is_explicit_and_legacy_only() -> None:
 
 
 def test_temporal_batch_adapter_and_trainer_eval_metrics_are_real(tmp_path: Path) -> None:
+    alpha_hint = np.full((16, 16, 1), 0.62, dtype=np.float32).tolist()
+    confidence_hint = np.full((16, 16, 1), 0.8, dtype=np.float32).tolist()
+    changed_region_mask = np.zeros((16, 16, 1), dtype=np.float32)
+    changed_region_mask[2:12, 2:12, 0] = 1.0
     sample = {
         "frames": [_solid(16, 16, (0.2, 0.2, 0.2)), _solid(16, 16, (0.5, 0.3, 0.3)), _solid(16, 16, (0.45, 0.28, 0.28))],
         "temporal_consistency_contract": {
@@ -86,14 +90,22 @@ def test_temporal_batch_adapter_and_trainer_eval_metrics_are_real(tmp_path: Path
             "composed_frame": _solid(16, 16, (0.5, 0.3, 0.3)),
             "target_frame": _solid(16, 16, (0.45, 0.28, 0.28)),
             "changed_regions": [{"region_id": "p1:torso", "reason": "temporal_drift", "bbox": {"x": 0.2, "y": 0.2, "w": 0.5, "h": 0.5}}],
+            "changed_region_mask": changed_region_mask.tolist(),
+            "alpha_hint": alpha_hint,
+            "confidence_hint": confidence_hint,
+            "patch_history": [{"frame": _solid(16, 16, (0.36, 0.24, 0.24))}],
             "region_consistency_metadata": {"alpha_mean": 0.58, "confidence_mean": 0.73},
-            "scene_transition_context": {"step_index": 1, "transition_phase": "motion"},
-            "memory_transition_context": {"drift": 0.05},
+            "transition_context": {"step_index": 1, "transition_phase": "motion"},
+            "memory_context": {"drift": 0.05, "identity": {"p1": 1.0}},
         },
     }
     batch = TemporalBatchAdapter().adapt(sample)
     assert batch.transition_cond.shape[0] == 6
     assert batch.memory_cond.shape[0] == 6
+    assert float(np.mean(batch.alpha_hint)) > 0.55
+    assert float(np.mean(batch.confidence_hint)) > 0.75
+    assert float(np.mean(batch.changed_mask)) > 0.3
+    assert batch.history_cond[0] > 0.0
 
     manifest = tmp_path / "temporal_manifest.json"
     records = []
@@ -103,16 +115,28 @@ def test_temporal_batch_adapter_and_trainer_eval_metrics_are_real(tmp_path: Path
         cur[2:8, 2:8, :] = [0.65, 0.42, 0.38]
         target = cur.copy()
         target[3:7, 3:7, :] = [0.58, 0.4, 0.35]
+        local_mask = np.zeros((10, 10, 1), dtype=np.float32)
+        local_mask[2:8, 2:8, 0] = 1.0
+        local_alpha = np.full((10, 10, 1), 0.62, dtype=np.float32).tolist()
+        local_confidence = np.full((10, 10, 1), 0.8, dtype=np.float32).tolist()
         records.append(
             {
                 "previous_frame": prev.tolist(),
                 "current_composed_frame": cur.tolist(),
                 "target_frame": target.tolist(),
                 "changed_regions": [{"region_id": "p1:torso", "reason": "temporal_drift", "bbox": {"x": 0.2, "y": 0.2, "w": 0.6, "h": 0.6}}],
+                "changed_region_mask": local_mask.tolist(),
+                "alpha_hint": local_alpha,
+                "confidence_hint": local_confidence,
                 "region_consistency_metadata": {"alpha_mean": 0.5, "confidence_mean": 0.7},
-                "memory_transition_context": {"drift": 0.06},
+                "memory_context": {"drift": 0.06},
+                "transition_context": {"step_index": i + 1, "transition_phase": "motion"},
+                "patch_history": [{"frame": prev.tolist()}],
+                "scenario": "temporal_refine_motion",
+                "tags": ["torso", "consistency"],
             }
         )
+    records.append({"record_id": "invalid_missing_current", "previous_frame": _solid(10, 10, (0.2, 0.2, 0.2))})
     manifest.write_text(json.dumps({"records": records}), encoding="utf-8")
 
     trainer = TemporalTrainer()
@@ -121,3 +145,30 @@ def test_temporal_batch_adapter_and_trainer_eval_metrics_are_real(tmp_path: Path
     assert result.val_metrics["contract_validity"] > 0.0
     assert result.val_metrics["flicker_delta_mae"] >= 0.0
     assert result.val_metrics["region_consistency_mae"] >= 0.0
+    assert result.val_metrics["seam_temporal_mae"] >= 0.0
+    assert result.val_metrics["confidence_alignment_mae"] >= 0.0
+    assert result.val_metrics["invalid_records"] == 1.0
+    assert result.val_metrics["scenario_coverage"] >= 1.0
+    assert trainer.dataset_diagnostics["family_counts"]["alpha_consistency"] >= 1
+
+
+def test_temporal_manifest_single_sample_is_primary_without_silent_synthetic_mix(tmp_path: Path) -> None:
+    manifest = tmp_path / "temporal_single.json"
+    rec = {
+        "record_id": "r1",
+        "previous_frame": _solid(8, 8, (0.1, 0.1, 0.1)),
+        "current_composed_frame": _solid(8, 8, (0.25, 0.2, 0.2)),
+        "target_refined_frame": _solid(8, 8, (0.21, 0.18, 0.18)),
+        "changed_regions": [{"region_id": "p1:torso", "reason": "temporal_drift", "bbox": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}}],
+        "scenario": "single_case",
+        "tags": ["bootstrap_replacement"],
+    }
+    manifest.write_text(json.dumps({"records": [rec]}), encoding="utf-8")
+
+    trainer = TemporalTrainer()
+    train_ds, val_ds = trainer.build_datasets(TrainingConfig(epochs=1, learned_dataset_path=str(manifest), checkpoint_dir=str(tmp_path / "ckpt")))
+    assert trainer.dataset_source == "manifest_temporal_primary_single_sample_reused_for_val"
+    assert len(train_ds) == 1
+    assert len(val_ds) == 1
+    assert train_ds.samples[0]["source"] == "temporal_manifest"
+    assert val_ds.samples[0]["source"] == "temporal_manifest"

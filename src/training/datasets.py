@@ -574,6 +574,19 @@ class TemporalDataset(BaseStageDataset):
             raise ValueError(f"{field_name} channel count must be 3 or 1")
         return np.clip(arr, 0.0, 1.0).tolist()
 
+    @staticmethod
+    def _as_hw1_tensor(value: object, field_name: str, shape_hint: tuple[int, int] | None = None) -> list[list[list[float]]]:
+        arr = np.asarray(value, dtype=np.float32)
+        if arr.ndim == 2:
+            arr = arr[..., None]
+        if arr.ndim != 3:
+            raise ValueError(f"{field_name} must be HxW or HxWx1 tensor")
+        if arr.shape[2] != 1:
+            raise ValueError(f"{field_name} channel count must be 1")
+        if shape_hint is not None and arr.shape[:2] != shape_hint:
+            raise ValueError(f"{field_name} shape {arr.shape[:2]} mismatch expected {shape_hint}")
+        return np.clip(arr, 0.0, 1.0).tolist()
+
     @classmethod
     def synthetic(cls, size: int) -> "TemporalDataset":
         samples: list[TrainingSample] = []
@@ -614,17 +627,34 @@ class TemporalDataset(BaseStageDataset):
             "manifest_path": manifest_path,
             "total_records": len(records),
             "loaded_records": 0,
+            "usable_records": 0,
             "invalid_records": 0,
             "skipped_records": 0,
             "invalid_examples": [],
+            "family_counts": {
+                "frame_refinement": 0,
+                "flicker": 0,
+                "region_stability": 0,
+                "alpha_consistency": 0,
+                "confidence_calibration": 0,
+                "history_conditioning": 0,
+                "memory_conditioning": 0,
+                "transition_conditioning": 0,
+            },
+            "tag_counts": {},
+            "scenario_counts": {},
         }
         for idx, rec in enumerate(records):
             try:
                 if not isinstance(rec, dict):
                     raise ValueError("record must be a json object")
                 prev = cls._as_hw3_tensor(rec["previous_frame"], "previous_frame")
-                cur = cls._as_hw3_tensor(rec["current_composed_frame"], "current_composed_frame")
-                target = cls._as_hw3_tensor(rec.get("target_frame", rec["current_composed_frame"]), "target_frame")
+                cur = cls._as_hw3_tensor(rec.get("current_composed_frame", rec.get("current_frame")), "current_composed_frame")
+                target = cls._as_hw3_tensor(rec.get("target_refined_frame", rec.get("target_frame", rec.get("current_composed_frame", rec.get("current_frame")))), "target_frame")
+                if np.asarray(prev, dtype=np.float32).shape != np.asarray(cur, dtype=np.float32).shape:
+                    raise ValueError("previous_frame and current_composed_frame shape mismatch")
+                if np.asarray(target, dtype=np.float32).shape != np.asarray(cur, dtype=np.float32).shape:
+                    raise ValueError("target_frame shape mismatch")
                 changed_regions_raw = rec.get("changed_regions", [])
                 changed_regions: list[dict[str, object]] = []
                 for ridx, region in enumerate(changed_regions_raw if isinstance(changed_regions_raw, list) else []):
@@ -643,19 +673,67 @@ class TemporalDataset(BaseStageDataset):
                             },
                         }
                     )
+                changed_region_mask = rec.get("changed_region_mask")
+                if changed_region_mask is not None:
+                    mask = cls._as_hw1_tensor(changed_region_mask, "changed_region_mask", shape_hint=np.asarray(cur, dtype=np.float32).shape[:2])
+                    if not changed_regions:
+                        changed_regions = [{"region_id": "scene:mask_region", "reason": "mask_supervision", "bbox": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}}]
                 if not changed_regions:
                     changed_regions = [{"region_id": "scene:region_0", "reason": "temporal_drift", "bbox": {"x": 0.2, "y": 0.2, "w": 0.3, "h": 0.3}}]
+                alpha_hint = rec.get("alpha_hint")
+                if alpha_hint is not None:
+                    alpha_hint = cls._as_hw1_tensor(alpha_hint, "alpha_hint", shape_hint=np.asarray(cur, dtype=np.float32).shape[:2])
+                confidence_hint = rec.get("confidence_hint")
+                if confidence_hint is not None:
+                    confidence_hint = cls._as_hw1_tensor(confidence_hint, "confidence_hint", shape_hint=np.asarray(cur, dtype=np.float32).shape[:2])
+                patch_history = rec.get("patch_history", []) if isinstance(rec.get("patch_history", []), list) else []
+                transition_context = rec.get("transition_context", rec.get("scene_transition_context", {}))
+                if transition_context is not None and not isinstance(transition_context, dict):
+                    raise ValueError("transition_context must be object")
+                memory_context = rec.get("memory_context", rec.get("memory_transition_context", {}))
+                if memory_context is not None and not isinstance(memory_context, dict):
+                    raise ValueError("memory_context must be object")
+                region_meta = rec.get("region_consistency_metadata", {})
+                if region_meta is not None and not isinstance(region_meta, dict):
+                    raise ValueError("region_consistency_metadata must be object")
                 contract = {
                     "previous_frame": prev,
                     "composed_frame": cur,
                     "target_frame": target,
                     "changed_regions": changed_regions,
-                    "region_consistency_metadata": rec.get("region_consistency_metadata", {}),
-                    "scene_transition_context": rec.get("scene_transition_context", {}),
-                    "memory_transition_context": rec.get("memory_transition_context", {}),
+                    "changed_region_mask": changed_region_mask if changed_region_mask is None else mask,
+                    "alpha_hint": alpha_hint,
+                    "confidence_hint": confidence_hint,
+                    "patch_history": patch_history,
+                    "transition_context": transition_context if isinstance(transition_context, dict) else {},
+                    "memory_context": memory_context if isinstance(memory_context, dict) else {},
+                    "region_consistency_metadata": region_meta if isinstance(region_meta, dict) else {},
+                    "scene_transition_context": transition_context if isinstance(transition_context, dict) else {},
+                    "memory_transition_context": memory_context if isinstance(memory_context, dict) else {},
+                    "record_id": str(rec.get("record_id", f"temporal_record_{idx}")),
+                    "scenario": str(rec.get("scenario", rec.get("scenario_id", "unknown"))),
+                    "tags": [str(t) for t in rec.get("tags", [])] if isinstance(rec.get("tags"), list) else [],
+                    "notes": str(rec.get("notes", "")),
                 }
                 samples.append({"frames": [prev, cur, target], "temporal_consistency_contract": contract, "source": rec.get("source", "temporal_manifest")})
                 diagnostics["loaded_records"] = int(diagnostics["loaded_records"]) + 1
+                diagnostics["usable_records"] = int(diagnostics["usable_records"]) + 1
+                diagnostics["family_counts"]["frame_refinement"] = int(diagnostics["family_counts"]["frame_refinement"]) + 1
+                delta_prev_target = float(np.mean(np.abs(np.asarray(target, dtype=np.float32) - np.asarray(prev, dtype=np.float32))))
+                diagnostics["family_counts"]["flicker"] = int(diagnostics["family_counts"]["flicker"]) + (1 if delta_prev_target > 1e-6 else 0)
+                diagnostics["family_counts"]["region_stability"] = int(diagnostics["family_counts"]["region_stability"]) + (1 if changed_regions else 0)
+                diagnostics["family_counts"]["alpha_consistency"] = int(diagnostics["family_counts"]["alpha_consistency"]) + (1 if alpha_hint is not None else 0)
+                diagnostics["family_counts"]["confidence_calibration"] = int(diagnostics["family_counts"]["confidence_calibration"]) + (1 if confidence_hint is not None else 0)
+                diagnostics["family_counts"]["history_conditioning"] = int(diagnostics["family_counts"]["history_conditioning"]) + (1 if patch_history else 0)
+                diagnostics["family_counts"]["memory_conditioning"] = int(diagnostics["family_counts"]["memory_conditioning"]) + (1 if isinstance(memory_context, dict) and memory_context != {} else 0)
+                diagnostics["family_counts"]["transition_conditioning"] = int(diagnostics["family_counts"]["transition_conditioning"]) + (1 if isinstance(transition_context, dict) and transition_context != {} else 0)
+                scenario_key = str(rec.get("scenario", rec.get("scenario_id", "unknown"))).strip().lower() or "unknown"
+                diagnostics["scenario_counts"][scenario_key] = int(diagnostics["scenario_counts"].get(scenario_key, 0)) + 1
+                if isinstance(rec.get("tags"), list):
+                    for tag in rec["tags"]:
+                        tk = str(tag).strip().lower()
+                        if tk:
+                            diagnostics["tag_counts"][tk] = int(diagnostics["tag_counts"].get(tk, 0)) + 1
             except Exception as exc:
                 diagnostics["invalid_records"] = int(diagnostics["invalid_records"]) + 1
                 if len(diagnostics["invalid_examples"]) < 8:

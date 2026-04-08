@@ -57,6 +57,7 @@
 - `RepresentationDataset.from_perception_dataset(...)` / `from_perception_cache(...)` — graph samples.
 - `DynamicsDataset.from_graph_sequence(...)` / `from_transition_manifest(...)` — transition/delta samples.
 - `RendererDataset.from_frame_pairs(...)` / `from_video_manifest(...)` — ROI before/after pairs.
+- `TemporalDataset.from_temporal_manifest(...)` — runtime-aligned temporal sequence samples (previous/current/target + region/hints/history context).
 - `TextActionDataset.from_jsonl(...)` / `from_annotation_manifest(...)` — text-action alignment.
 - `MemoryDataset.from_representation_dataset(...)` / `from_graph_sequence(...)` — memory records from visible regions.
 - `save_graph_cache(...)` / `load_graph_cache(...)` — cache serialization helpers.
@@ -112,6 +113,48 @@ python -m training.cli --eval-dynamics --weights-path artifacts/checkpoints/dyna
 ```
 
 Dynamics eval report считает component MSE по head-группам + `contract_valid_ratio`, `conditioning_sensitivity`, `fallback_free_ratio`, delta-group coverage (`*_group_coverage`), dataset diagnostics (`usable/invalid/skipped`) и regression `summary_score`.
+
+### Temporal manifest-backed dataset (primary path when provided)
+
+`TemporalTrainer` использует `TemporalDataset.from_temporal_manifest(...)` как **primary source**, если задан `TrainingConfig.learned_dataset_path` / `--learned-dataset-path`.
+Synthetic temporal dataset остаётся только bootstrap fallback для empty/invalid manifest.
+
+Минимальный manifest record (`records[]`) для runtime-aligned temporal contract:
+- `previous_frame` (HxWx3)
+- `current_composed_frame` (или `current_frame`) (HxWx3)
+- `target_refined_frame` (или `target_frame`) (HxWx3)
+- `changed_regions[]` (region_id/reason/bbox) **или** `changed_region_mask` (HxW/HxWx1)
+
+Поддерживаемые conditioning/supervision поля:
+- `alpha_hint`, `confidence_hint` (HxW/HxWx1)
+- `patch_history` (список кадров/срезов для history-conditioning)
+- `transition_context` (или `scene_transition_context`)
+- `memory_context` (или `memory_transition_context`)
+- `region_consistency_metadata`
+- `record_id`, `scenario`/`scenario_id`, `tags`, `notes`
+
+Loader diagnostics:
+- `total_records`, `loaded_records`, `usable_records`, `invalid_records`, `skipped_records`
+- `invalid_examples`
+- `family_counts`:
+  `frame_refinement`, `flicker`, `region_stability`, `alpha_consistency`, `confidence_calibration`,
+  `history_conditioning`, `memory_conditioning`, `transition_conditioning`
+- `tag_counts`, `scenario_counts`
+
+Temporal train/eval запуск:
+
+```bash
+python -m training.cli --stage temporal_refinement --epochs 2 --learned-dataset-path /path/to/temporal_manifest.json
+```
+
+`TemporalTrainer` eval summary теперь возвращает:
+- fidelity/reconstruction (`reconstruction_mae`)
+- flicker consistency (`flicker_delta_mae`)
+- changed-region stability (`region_consistency_mae`)
+- seam/alpha proxy (`seam_temporal_mae`)
+- confidence alignment proxy (`confidence_alignment_mae`)
+- contract + dataset diagnostics (`contract_validity`, `usable_sample_count`, `invalid_records`, `skipped_records`, `tag_coverage`, `scenario_coverage`)
+- `score` для regression tracking.
 
 ## Perception parser runtime stack (real backend pass)
 
