@@ -219,6 +219,137 @@ class DynamicsDataset(BaseStageDataset):
 
 
 class RendererDataset(BaseStageDataset):
+    @staticmethod
+    def _as_hw3_tensor(value: object, field_name: str) -> list[list[list[float]]]:
+        arr = np.asarray(value, dtype=np.float32)
+        if arr.ndim == 2:
+            arr = np.repeat(arr[..., None], 3, axis=2)
+        if arr.ndim != 3:
+            raise ValueError(f"{field_name} must be HxWxC tensor")
+        if arr.shape[2] == 1:
+            arr = np.repeat(arr, 3, axis=2)
+        if arr.shape[2] != 3:
+            raise ValueError(f"{field_name} channel count must be 3 or 1")
+        return np.clip(arr, 0.0, 1.0).tolist()
+
+    @staticmethod
+    def _as_hw1_tensor(value: object, field_name: str) -> list[list[list[float]]]:
+        arr = np.asarray(value, dtype=np.float32)
+        if arr.ndim == 2:
+            arr = arr[..., None]
+        if arr.ndim != 3 or arr.shape[2] not in {1, 3}:
+            raise ValueError(f"{field_name} must be HxW or HxWx1/HxWx3 tensor")
+        if arr.shape[2] == 3:
+            arr = np.mean(arr, axis=2, keepdims=True)
+        return np.clip(arr, 0.0, 1.0).tolist()
+
+    @staticmethod
+    def _semantic_embed_from_family(family: str) -> list[float]:
+        family = family.lower().strip()
+        if family == "face_expression":
+            return [1.0, 0.0, 0.0, 0.9, 0.1, 0.2]
+        if family == "torso_reveal":
+            return [0.0, 1.0, 0.0, 0.2, 0.85, 0.4]
+        return [0.0, 0.0, 1.0, 0.15, 0.45, 0.9]
+
+    @classmethod
+    def from_renderer_manifest(cls, manifest_path: str, strict: bool = False) -> "RendererDataset":
+        payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        records = payload.get("records", [])
+        samples: list[TrainingSample] = []
+        diagnostics: dict[str, object] = {
+            "source": "manifest_paired_roi",
+            "manifest_path": manifest_path,
+            "total_records": len(records),
+            "loaded_records": 0,
+            "invalid_records": 0,
+            "skipped_records": 0,
+            "invalid_examples": [],
+            "family_counts": {"face_expression": 0, "torso_reveal": 0, "sleeve_arm_transition": 0},
+        }
+        for idx, rec in enumerate(records):
+            try:
+                if not isinstance(rec, dict):
+                    raise ValueError("record must be a json object")
+                if "roi_before" not in rec or "roi_after" not in rec:
+                    raise ValueError("record requires roi_before and roi_after")
+
+                roi_before = cls._as_hw3_tensor(rec["roi_before"], "roi_before")
+                roi_after = cls._as_hw3_tensor(rec["roi_after"], "roi_after")
+                b = np.asarray(roi_before, dtype=np.float32)
+                a = np.asarray(roi_after, dtype=np.float32)
+                if b.shape != a.shape:
+                    raise ValueError("roi_before and roi_after shape mismatch")
+
+                family = str(rec.get("semantic_family", rec.get("region_family", ""))).strip().lower()
+                region_id = str(rec.get("region_id", rec.get("region", {}).get("region_id", ""))).strip().lower()
+                if not family:
+                    if "face" in region_id or "head" in region_id:
+                        family = "face_expression"
+                    elif "torso" in region_id or "inner" in region_id:
+                        family = "torso_reveal"
+                    elif "arm" in region_id or "sleeve" in region_id or "outer" in region_id:
+                        family = "sleeve_arm_transition"
+                    else:
+                        family = "sleeve_arm_transition"
+                if family not in diagnostics["family_counts"]:
+                    raise ValueError(f"unsupported semantic_family={family!r}")
+                diagnostics["family_counts"][family] = int(diagnostics["family_counts"][family]) + 1
+
+                changed_mask = rec.get("changed_mask")
+                if changed_mask is None:
+                    changed_mask = np.clip(np.mean(np.abs(a - b), axis=2, keepdims=True) * 3.0, 0.0, 1.0).tolist()
+                alpha_target = rec.get("alpha_target")
+                if alpha_target is None:
+                    alpha_target = np.clip(0.15 + 0.85 * np.asarray(changed_mask, dtype=np.float32), 0.0, 1.0).tolist()
+                blend_hint = rec.get("blend_hint")
+                if blend_hint is None:
+                    blend_hint = np.clip(0.2 + 0.75 * np.asarray(changed_mask, dtype=np.float32), 0.0, 1.0).tolist()
+
+                changed_mask = cls._as_hw1_tensor(changed_mask, "changed_mask")
+                alpha_target = cls._as_hw1_tensor(alpha_target, "alpha_target")
+                blend_hint = cls._as_hw1_tensor(blend_hint, "blend_hint")
+
+                renderer_contract = {
+                    "semantic_embed": rec.get("semantic_embed", cls._semantic_embed_from_family(family)),
+                    "delta_cond": rec.get("delta_cond", rec.get("graph_delta_cond", [0.0] * 9)),
+                    "planner_cond": rec.get("planner_cond", rec.get("transition_context", {}).get("planner_cond", [0.0] * 8)),
+                    "graph_cond": rec.get("graph_cond", rec.get("graph_context", [0.0] * 7)),
+                    "memory_cond": rec.get("memory_cond", rec.get("memory_context", [0.0] * 8)),
+                    "appearance_cond": rec.get("appearance_cond", np.concatenate([np.mean(b, axis=(0, 1)), np.std(b, axis=(0, 1))]).tolist()),
+                    "bbox_cond": rec.get("bbox_cond", rec.get("bbox", [0.2, 0.2, 0.4, 0.4])),
+                    "alpha_target": alpha_target,
+                    "blend_hint": blend_hint,
+                    "changed_mask": changed_mask,
+                }
+
+                samples.append(
+                    {
+                        "frames": [roi_before, roi_after],
+                        "roi_pairs": [(roi_before, roi_after)],
+                        "source": str(rec.get("source", "manifest_paired_roi")),
+                        "region_family": family,
+                        "region_id": region_id,
+                        "renderer_batch_contract": renderer_contract,
+                        "delta_contract": rec.get("graph_delta", rec.get("delta_contract", {})),
+                        "graph_transition_contract": rec.get("graph_transition_contract", {}),
+                        "memory_records": rec.get("memory_records", []),
+                        "patch_synthesis_contract": rec.get("patch_synthesis_contract", {}),
+                    }
+                )
+                diagnostics["loaded_records"] = int(diagnostics["loaded_records"]) + 1
+            except Exception as exc:
+                diagnostics["invalid_records"] = int(diagnostics["invalid_records"]) + 1
+                diagnostics["skipped_records"] = int(diagnostics["skipped_records"]) + 1
+                if len(diagnostics["invalid_examples"]) < 8:
+                    diagnostics["invalid_examples"].append({"index": idx, "error": str(exc)})
+                if strict:
+                    raise ValueError(f"renderer manifest record {idx} is invalid: {exc}") from exc
+
+        ds = cls(samples=samples)
+        ds.diagnostics = diagnostics
+        return ds
+
     @classmethod
     def synthetic(cls, size: int) -> "RendererDataset":
         from utils_tensor import zeros
@@ -260,7 +391,21 @@ class RendererDataset(BaseStageDataset):
                     },
                 }
             )
-        return cls(samples=samples)
+        ds = cls(samples=samples)
+        ds.diagnostics = {
+            "source": "synthetic_bootstrap",
+            "total_records": size,
+            "loaded_records": size,
+            "invalid_records": 0,
+            "skipped_records": 0,
+            "family_counts": {
+                "face_expression": sum(1 for s in samples if s["region_family"] == "face_expression"),
+                "torso_reveal": sum(1 for s in samples if s["region_family"] == "torso_reveal"),
+                "sleeve_arm_transition": sum(1 for s in samples if s["region_family"] == "sleeve_arm_transition"),
+            },
+            "invalid_examples": [],
+        }
+        return ds
 
     @classmethod
     def from_frame_pairs(cls, before_frames: list[list], after_frames: list[list]) -> "RendererDataset":

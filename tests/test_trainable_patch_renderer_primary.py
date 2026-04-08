@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -134,3 +135,56 @@ def test_dataset_adapter_and_eval_metrics_are_real_not_hardcoded(tmp_path: Path)
     assert result.val_metrics["alpha_mae"] >= 0.0
     assert result.val_metrics["uncertainty_calibration_mae"] >= 0.0
     assert result.val_metrics["face_family_score"] >= 0.0
+
+
+def test_renderer_manifest_dataset_pipeline_and_diagnostics(tmp_path: Path) -> None:
+    manifest = tmp_path / "renderer_manifest.json"
+    good_before = np.full((10, 10, 3), 0.2, dtype=np.float32).tolist()
+    good_after = np.full((10, 10, 3), 0.2, dtype=np.float32)
+    good_after[2:8, 2:8, :] = [0.7, 0.35, 0.3]
+    payload = {
+        "records": [
+            {
+                "roi_before": good_before,
+                "roi_after": good_after.tolist(),
+                "region_id": "p1:face",
+                "semantic_family": "face_expression",
+                "delta_cond": [0.1] * 9,
+                "planner_cond": [0.2] * 8,
+                "graph_cond": [0.3] * 7,
+                "memory_cond": [0.4] * 8,
+                "appearance_cond": [0.2, 0.2, 0.2, 0.01, 0.01, 0.01],
+                "bbox_cond": [0.2, 0.2, 0.4, 0.4],
+            },
+            {
+                "roi_before": good_before,
+                "roi_after": good_after.tolist(),
+                "region_id": "p1:torso",
+                "semantic_family": "torso_reveal",
+            },
+            {"roi_before": [[1, 2], [3, 4]], "region_id": "p1:left_arm"},
+        ]
+    }
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    ds = RendererDataset.from_renderer_manifest(str(manifest), strict=False)
+    assert len(ds) == 2
+    assert ds.diagnostics["invalid_records"] == 1
+    assert ds.diagnostics["family_counts"]["face_expression"] == 1
+    assert ds.diagnostics["family_counts"]["torso_reveal"] == 1
+
+
+def test_renderer_trainer_uses_manifest_as_primary_source(tmp_path: Path) -> None:
+    manifest = tmp_path / "renderer_manifest.json"
+    records = []
+    for family, rid in [("face_expression", "p1:face"), ("torso_reveal", "p1:torso"), ("sleeve_arm_transition", "p1:left_arm"), ("face_expression", "p1:face")]:
+        before = np.full((8, 8, 3), 0.25, dtype=np.float32)
+        after = before.copy()
+        after[2:6, 2:6, :] = [0.65, 0.45, 0.4]
+        records.append({"roi_before": before.tolist(), "roi_after": after.tolist(), "region_id": rid, "semantic_family": family})
+    manifest.write_text(json.dumps({"records": records}), encoding="utf-8")
+
+    trainer = RendererTrainer()
+    result = trainer.train(TrainingConfig(epochs=1, learned_dataset_path=str(manifest), checkpoint_dir=str(tmp_path / "ckpt")))
+    assert trainer.dataset_source.startswith("manifest_paired_roi_primary")
+    assert result.val_metrics["usable_sample_count"] >= 1.0
+    assert result.val_metrics["invalid_records"] == 0.0
