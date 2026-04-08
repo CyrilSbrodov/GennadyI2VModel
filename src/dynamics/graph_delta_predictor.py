@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from core.schema import BBox, GraphDelta, RegionRef, SceneGraph, VideoMemory
 from core.semantic_roi import SemanticROIHelper
-from dynamics.model import DynamicsInputs, DynamicsModel
+from dynamics.model import DynamicsModel, DynamicsModelContractError, DynamicsModelError, decode_prediction, featurize_runtime
 from dynamics.transition_contracts import (
     ExpressionTransitionIntent,
     GarmentTransitionIntent,
@@ -30,9 +31,12 @@ class DynamicsMetrics:
 class GraphDeltaPredictor:
     """Пошаговый движок эволюции scene-state для single-image сценария."""
 
-    def __init__(self) -> None:
-        self.model = DynamicsModel()
+    def __init__(self, *, strict_mode: bool = False) -> None:
+        weights = Path("artifacts/checkpoints/dynamics/dynamics_weights.json")
+        self.model = DynamicsModel.load(str(weights)) if weights.exists() else DynamicsModel()
         self.roi = SemanticROIHelper()
+        self.legacy_mode = False
+        self.strict_mode = strict_mode
 
     def _serialize_graph(self, scene_graph: SceneGraph) -> str:
         return f"f={scene_graph.frame_index};p={len(scene_graph.persons)};o={len(scene_graph.objects)};" + ";".join(sorted(p.person_id for p in scene_graph.persons))
@@ -49,26 +53,65 @@ class GraphDeltaPredictor:
 
     def predict(self, scene_graph: SceneGraph, target_state: PlannedState, planner_context: dict[str, float] | None = None, memory: VideoMemory | None = None) -> tuple[GraphDelta, DynamicsMetrics]:
         context = planner_context or {}
+        labels = list(target_state.labels)
+        planner = self._parse_planner_context(target_state=target_state, context=context)
+        try:
+            model_out = self.model.forward(featurize_runtime(scene_graph, target_state, context, memory))
+            delta = decode_prediction(
+                model_out,
+                scene_graph=scene_graph,
+                phase=planner.phase,
+                semantic_reasons=labels,
+                planner_context=context,
+            )
+            magnitude = sum(abs(v) for v in delta.pose_deltas.values()) + sum(abs(v) for v in delta.interaction_deltas.values())
+            smoothness = 1.0 / (1.0 + magnitude)
+            delta.transition_diagnostics = {
+                "runtime_path": "learned_primary",
+                "delta_magnitude": magnitude,
+                "temporal_smoothness_proxy": smoothness,
+                "constraint_violations": [],
+                "fallback_usage": [],
+                "family_contribution": {
+                    "pose": sum(abs(v) for v in delta.pose_deltas.values()),
+                    "garment": abs(float(delta.garment_deltas.get("attachment_delta", 0.0))) + abs(float(delta.garment_deltas.get("coverage_delta", 0.0))),
+                    "expression": abs(float(delta.expression_deltas.get("smile_intensity", 0.0))),
+                    "interaction": sum(abs(v) for v in delta.interaction_deltas.values()),
+                    "visibility": float(len(delta.visibility_deltas)),
+                },
+            }
+            return (
+                delta,
+                DynamicsMetrics(
+                    delta_magnitude=magnitude,
+                    constraint_violations=0,
+                    temporal_smoothness_proxy=smoothness,
+                ),
+            )
+        except (DynamicsModelContractError, ValueError) as exc:
+            if self.strict_mode:
+                raise
+            self.legacy_mode = True
+            delta, metrics = self._predict_legacy(scene_graph, target_state, planner_context, memory)
+            delta.transition_diagnostics["fallback_reason"] = type(exc).__name__
+            return delta, metrics
+        except DynamicsModelError:
+            if self.strict_mode:
+                raise
+            self.legacy_mode = True
+            delta, metrics = self._predict_legacy(scene_graph, target_state, planner_context, memory)
+            delta.transition_diagnostics["fallback_reason"] = "DynamicsModelError"
+            return delta, metrics
+
+    def _predict_legacy(self, scene_graph: SceneGraph, target_state: PlannedState, planner_context: dict[str, float] | None = None, memory: VideoMemory | None = None) -> tuple[GraphDelta, DynamicsMetrics]:
+        context = planner_context or {}
         person = scene_graph.persons[0] if scene_graph.persons else None
         labels = set(target_state.labels)
         planner = self._parse_planner_context(target_state=target_state, context=context)
         memory_influence = self._parse_memory_context(memory)
 
-        model_out = self.model.forward(
-            DynamicsInputs(
-                serialized_scene_graph=self._serialize_graph(scene_graph),
-                action_tokens=list(labels),
-                planner_context=[float(planner.step_index), planner.intensity, planner.target_duration],
-                memory_features=[
-                    memory_influence.hidden_reveal_evidence,
-                    memory_influence.garment_memory_strength,
-                    memory_influence.identity_continuity,
-                    memory_influence.visibility_safety,
-                ],
-            )
-        )
-
-        intent = self._build_transition_intent(scene_graph, labels, planner, memory_influence, model_out)
+        fallback_scores = {"pose": 0.5, "garment": 0.5, "expression": 0.5, "interaction": 0.5, "visibility": 0.5}
+        intent = self._build_transition_intent(scene_graph, labels, planner, memory_influence, fallback_scores)
         delta = GraphDelta(transition_phase=planner.phase)
 
         if person:
@@ -76,7 +119,7 @@ class GraphDeltaPredictor:
             delta.state_before = self._build_state_before(scene_graph, person, person.expression_state.label or "neutral")
 
         diagnostics = TransitionDiagnostics()
-        family_deltas = self._compute_family_deltas(intent, model_out)
+        family_deltas = self._compute_family_deltas(intent, fallback_scores)
         self._merge_family_deltas(delta, family_deltas, diagnostics)
         self._derive_visibility_consequences(scene_graph, person, intent, delta, diagnostics)
         self._derive_region_transition_modes(intent, delta)
@@ -86,15 +129,12 @@ class GraphDeltaPredictor:
 
         self._compute_diagnostics(delta, intent, diagnostics)
         delta.transition_diagnostics = {
+            "runtime_path": "legacy_heuristic_fallback",
             "delta_magnitude": diagnostics.delta_magnitude,
             "family_contribution": diagnostics.family_contribution,
             "transition_smoothness_proxy": diagnostics.transition_smoothness_proxy,
             "constraint_violations": diagnostics.constraint_violations,
-            "visibility_uncertainty": diagnostics.visibility_uncertainty,
-            "garment_uncertainty": diagnostics.garment_uncertainty,
-            "interaction_uncertainty": diagnostics.interaction_uncertainty,
-            "hidden_transition_uncertainty": diagnostics.hidden_transition_uncertainty,
-            "fallback_usage": diagnostics.fallback_usage,
+            "fallback_usage": diagnostics.fallback_usage + ["legacy_heuristic"],
             "explainability_summary": diagnostics.explainability_summary,
         }
 
