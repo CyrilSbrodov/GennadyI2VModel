@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 
 from core.schema import (
@@ -658,7 +658,8 @@ class TextEncoderStageRunner(_BaseStageRunner):
         for sample in samples:
             encoded = self.backends.text_encoder.encode(str(sample["text"]))
             actions = sample.get("actions") or [ActionStep(type="micro_adjust", priority=1)]
-            contract = build_text_action_state_contract(str(sample["text"]), actions, vars(encoded))
+            encoding_payload = asdict(encoded) if is_dataclass(encoded) else vars(encoded)
+            contract = build_text_action_state_contract(str(sample["text"]), actions, encoding_payload)
             last_contract = contract
             eval_payload = build_text_eval_payload(contract)
             scores.append(text_action_alignment_eval(eval_payload).metrics["alignment_score"])

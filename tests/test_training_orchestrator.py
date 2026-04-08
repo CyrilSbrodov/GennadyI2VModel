@@ -36,3 +36,19 @@ def test_train_pipeline_runs_all_requested_stages(tmp_path: Path) -> None:
 
     assert [result.stage_name for result in results] == ["perception", "dynamics"]
     assert all(Path(result.checkpoint_path).exists() for result in results)
+
+
+def test_train_pipeline_normalizes_legacy_stage_aliases(tmp_path: Path) -> None:
+    config = TrainingConfig(
+        epochs=1,
+        checkpoint_dir=str(tmp_path),
+        stage_order=["stage3_dynamics", "stage6_temporal", "stage7_instruction"],
+    )
+
+    results = train_pipeline(config)
+
+    assert [result.stage_name for result in results] == [
+        "dynamics_transition",
+        "temporal_refinement",
+        "text_encoder",
+    ]

@@ -4,6 +4,8 @@ import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+import numpy as np
+
 from core.input_layer import InputAssetLayer
 from core.schema import SceneGraph
 from dynamics.state_update import apply_delta
@@ -52,6 +54,54 @@ class GennadyEngine:
         self.backends = backend_bundle or LearnedBackendFactory(self.backend_config).build()
 
     @staticmethod
+    def _normalize_frame_tensor(frame: object, *, field_name: str) -> list[list[list[float]]]:
+        arr = np.asarray(frame, dtype=np.float32)
+        if arr.ndim != 3 or arr.shape[2] != 3:
+            raise ValueError(f"{field_name} must be HxWx3 tensor-like, got shape={list(arr.shape)}")
+        if arr.size == 0:
+            raise ValueError(f"{field_name} must not be empty")
+        max_val = float(np.max(arr))
+        if max_val > 1.0:
+            arr = np.clip(arr / 255.0, 0.0, 1.0)
+        else:
+            arr = np.clip(arr, 0.0, 1.0)
+        return arr.tolist()
+
+    @staticmethod
+    def _validate_patch_output_contract(patch_out: object, *, expected_region_id: str) -> dict[str, object]:
+        issues: list[str] = []
+        path = str(getattr(patch_out, "execution_trace", {}).get("renderer_path", "unknown"))
+        region = getattr(getattr(patch_out, "region", None), "region_id", "")
+        if region != expected_region_id:
+            issues.append(f"region_mismatch:{region}->{expected_region_id}")
+        rgb = np.asarray(getattr(patch_out, "rgb_patch", None), dtype=np.float32)
+        alpha = np.asarray(getattr(patch_out, "alpha_mask", None), dtype=np.float32)
+        uncertainty = getattr(patch_out, "uncertainty_map", None)
+        if rgb.ndim != 3 or rgb.shape[2] != 3:
+            issues.append(f"rgb_patch_invalid_shape:{list(rgb.shape)}")
+        if alpha.ndim != 2:
+            issues.append(f"alpha_mask_invalid_shape:{list(alpha.shape)}")
+        if rgb.ndim == 3 and alpha.ndim == 2 and rgb.shape[:2] != alpha.shape:
+            issues.append(f"rgb_alpha_shape_mismatch:{list(rgb.shape)} vs {list(alpha.shape)}")
+        if isinstance(uncertainty, list):
+            unc = np.asarray(uncertainty, dtype=np.float32)
+            if unc.ndim != 2 or (rgb.ndim == 3 and unc.shape != rgb.shape[:2]):
+                issues.append(f"uncertainty_shape_mismatch:{list(unc.shape)}")
+        return {"issues": issues, "renderer_path": path, "is_learned_primary": path == "learned_primary"}
+
+    @staticmethod
+    def _validate_temporal_output_contract(temporal_out: object, *, expected_shape: tuple[int, int, int]) -> dict[str, object]:
+        issues: list[str] = []
+        refined = np.asarray(getattr(temporal_out, "refined_frame", None), dtype=np.float32)
+        if refined.ndim != 3 or refined.shape[2] != 3:
+            issues.append(f"refined_frame_invalid_shape:{list(refined.shape)}")
+        elif tuple(refined.shape) != expected_shape:
+            issues.append(f"refined_frame_shape_mismatch:{list(refined.shape)} vs {list(expected_shape)}")
+        meta = getattr(temporal_out, "metadata", {}) if isinstance(getattr(temporal_out, "metadata", {}), dict) else {}
+        temporal_path = str(meta.get("temporal_path", "unknown"))
+        return {"issues": issues, "temporal_path": temporal_path, "is_learned_primary": temporal_path == "learned_primary"}
+
+    @staticmethod
     def build_dynamics_memory_channels(memory_channels: dict[str, object]) -> dict[str, object]:
         keep = ("identity", "garments", "hidden_regions", "body_regions")
         return {k: memory_channels.get(k, {}) for k in keep}
@@ -84,7 +134,7 @@ class GennadyEngine:
         )
 
         first_frame = request.unified_asset.frames[0] if request.unified_asset and request.unified_asset.frames else None
-        current_frame = first_frame.tensor if first_frame else self._debug_seed_frame_tensor(profile)
+        current_frame = self._normalize_frame_tensor(first_frame.tensor, field_name="input_frame") if first_frame else self._debug_seed_frame_tensor(profile)
         perception_input = first_frame if first_frame else current_frame
         perception_output = self.perception.analyze(perception_input)
         perception_output.frame_size = (shape(current_frame)[1], shape(current_frame)[0])
@@ -123,7 +173,7 @@ class GennadyEngine:
             policy="insert" if quality_profile == "debug" else "use_existing",
         )
 
-        frames = [current_frame]
+        frames: list[list[list[list[float]]]] = [current_frame]
         graphs = [scene_graph]
         overlay_log: list[str] = []
         dynamics_metrics_log: list[str] = []
@@ -193,6 +243,9 @@ class GennadyEngine:
                     identity_embedding=identity_embedding,
                 )
                 patch_out = self.backends.patch_backend.synthesize_patch(patch_request)
+                patch_contract_validation = self._validate_patch_output_contract(patch_out, expected_region_id=region.region_id)
+                if patch_contract_validation["issues"]:
+                    raise ValueError(f"Patch contract violation at step={planned_state.step_index}, region={region.region_id}: {patch_contract_validation['issues']}")
                 patch_contract = patch_io_to_contract(patch_request, patch_out)
                 patch_parity = build_parity_result(
                     contract=patch_contract,
@@ -253,6 +306,7 @@ class GennadyEngine:
                             "quality_hint": patch_out.execution_trace.get("patch_refinement_strength", 0.0),
                         },
                         "parity": patch_parity,
+                        "contract_validation": patch_contract_validation,
                     }
                 )
                 patches.append(
@@ -312,6 +366,12 @@ class GennadyEngine:
                 memory_channels=temporal_channels,
             )
             temporal_out = self.backends.temporal_backend.refine_temporal(temporal_request)
+            temporal_contract_validation = self._validate_temporal_output_contract(
+                temporal_out,
+                expected_shape=tuple(np.asarray(composed, dtype=np.float32).shape),
+            )
+            if temporal_contract_validation["issues"]:
+                raise ValueError(f"Temporal contract violation at step={planned_state.step_index}: {temporal_contract_validation['issues']}")
             temporal_contract = temporal_io_to_contract(temporal_request, temporal_out)
             temporal_parity = build_parity_result(
                 contract=temporal_contract,
@@ -326,6 +386,7 @@ class GennadyEngine:
             for severity in ("errors", "warnings", "traces"):
                 fallback_log.extend([f"step={planned_state.step_index}:temporal_semantic_{severity}={x}" for x in temporal_parity.get(severity, [])])
             stable_frame = temporal_out.refined_frame if profile.temporal_refinement else composed
+            stable_frame = self._normalize_frame_tensor(stable_frame, field_name="stable_frame")
 
             scene_graph = apply_delta(scene_graph, delta)
             graph_encoding = self.backends.graph_encoder.encode(scene_graph)
@@ -381,6 +442,7 @@ class GennadyEngine:
                             "changed_regions": len(temporal_request.changed_regions),
                             "drift_proxy": 1.0 - (sum(temporal_out.region_consistency_scores.values()) / max(1.0, float(len(temporal_out.region_consistency_scores) or 1))),
                         },
+                        "contract_validation": temporal_contract_validation,
                     },
                     "parity": {
                         "missing_fields": {
