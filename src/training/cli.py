@@ -31,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-dir", default="artifacts/checkpoints")
     parser.add_argument("--eval-dynamics", action="store_true")
     parser.add_argument("--weights-path", default="artifacts/checkpoints/dynamics/dynamics_weights.json")
+    parser.add_argument("--learned-dataset-path", default="", help="Manifest path for learned dataset (primary for dynamics when provided).")
     return parser
 
 
@@ -41,10 +42,11 @@ def main() -> None:
         train_size=args.train_size,
         val_size=args.val_size,
         checkpoint_dir=args.checkpoint_dir,
+        learned_dataset_path=args.learned_dataset_path,
     )
 
     if args.eval_dynamics:
-        payload = [{"stage": "dynamics_eval", "metrics": evaluate_dynamics(args.weights_path, dataset_size=args.val_size)}]
+        payload = [{"stage": "dynamics_eval", "metrics": evaluate_dynamics(args.weights_path, dataset_size=args.val_size, dataset_manifest=args.learned_dataset_path)}]
     elif args.stage == "all":
         results = train_pipeline(config)
         payload = [{"stage": r.stage_name, "val": r.val_metrics, "checkpoint": r.checkpoint_path} for r in results]
