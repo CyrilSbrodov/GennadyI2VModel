@@ -109,3 +109,32 @@ python scripts/parser_stack_smoke.py   --image ./assets/example.png   --out-dir 
 - `facer` (FACER path)
 
 Если backend/веса недоступны, `PerceptionPipeline` остаётся fail-safe: warning + fallback на builtin parser path.
+
+## Unified evaluation / benchmark
+
+Добавлен единый runnable evaluation слой для assembled single-image pipeline.
+
+### Stage-level eval
+
+```bash
+python -m evaluation.cli stage \
+  --image /path/to/ref.ppm \
+  --text "Снимает куртку и улыбается" \
+  --backend-mode learned_primary \
+  --output artifacts/eval/stage_eval.json
+```
+
+### End-to-end scenario benchmark + learned vs legacy comparison
+
+```bash
+python -m evaluation.cli benchmark \
+  --backend-modes learned_primary,legacy \
+  --output artifacts/eval/benchmark_report.json
+```
+
+Benchmark report содержит:
+- scenario-by-scenario metrics,
+- per-stage health,
+- fallback / contract summaries,
+- regression-oriented warnings,
+- comparison deltas между `learned_primary` и `legacy`.
