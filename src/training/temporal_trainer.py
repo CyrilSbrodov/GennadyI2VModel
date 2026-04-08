@@ -43,9 +43,15 @@ class TemporalBatchAdapter:
         target = contract.get("target_frame", frames[2] if len(frames) > 2 else cur)
         changed_regions = self._as_regions(contract.get("changed_regions", []))
 
-        transition = contract.get("scene_transition_context", {}) if isinstance(contract.get("scene_transition_context", {}), dict) else {}
-        memory_ctx = contract.get("memory_transition_context", {}) if isinstance(contract.get("memory_transition_context", {}), dict) else {}
+        transition = contract.get("transition_context", contract.get("scene_transition_context", {}))
+        transition = transition if isinstance(transition, dict) else {}
+        memory_ctx = contract.get("memory_context", contract.get("memory_transition_context", {}))
+        memory_ctx = memory_ctx if isinstance(memory_ctx, dict) else {}
         region_meta = contract.get("region_consistency_metadata", {}) if isinstance(contract.get("region_consistency_metadata", {}), dict) else {}
+        patch_history = contract.get("patch_history", []) if isinstance(contract.get("patch_history", []), list) else []
+        alpha_hint = contract.get("alpha_hint")
+        confidence_hint = contract.get("confidence_hint")
+        changed_region_mask = contract.get("changed_region_mask")
 
         graph = SceneGraph(frame_index=int(transition.get("step_index", 0)))
         memory = MemoryManager().initialize(graph)
@@ -63,16 +69,36 @@ class TemporalBatchAdapter:
                     **(memory_ctx.get("hidden_regions", {}) if isinstance(memory_ctx.get("hidden_regions", {}), dict) else {}),
                 },
                 "patch_alpha": {
-                    "mean_alpha": float(region_meta.get("alpha_mean", 0.45)),
+                    "mean_alpha": float(np.mean(np.asarray(alpha_hint, dtype=np.float32))) if alpha_hint is not None else float(region_meta.get("alpha_mean", 0.45)),
                     "edge_alpha": float(region_meta.get("alpha_edge_mean", region_meta.get("alpha_mean", 0.4))),
                 },
                 "patch_confidence": {
-                    "mean_confidence": float(region_meta.get("confidence_mean", 0.7)),
+                    "mean_confidence": float(np.mean(np.asarray(confidence_hint, dtype=np.float32))) if confidence_hint is not None else float(region_meta.get("confidence_mean", 0.7)),
                     "min_confidence": float(region_meta.get("confidence_min", 0.55)),
                 },
             },
         )
-        return build_temporal_batch(req, target_frame=target)
+        history_frame = patch_history[-1].get("frame") if patch_history and isinstance(patch_history[-1], dict) else None
+        batch = build_temporal_batch(req, target_frame=target, history_frame=history_frame if isinstance(history_frame, list) else None)
+        if changed_region_mask is not None:
+            mask = np.asarray(changed_region_mask, dtype=np.float32)
+            if mask.ndim == 2:
+                mask = mask[..., None]
+            if mask.shape == batch.changed_mask.shape:
+                batch.changed_mask = np.clip(mask, 0.0, 1.0).astype(np.float32)
+        if alpha_hint is not None:
+            ah = np.asarray(alpha_hint, dtype=np.float32)
+            if ah.ndim == 2:
+                ah = ah[..., None]
+            if ah.shape == batch.alpha_hint.shape:
+                batch.alpha_hint = np.clip(ah, 0.0, 1.0).astype(np.float32)
+        if confidence_hint is not None:
+            ch = np.asarray(confidence_hint, dtype=np.float32)
+            if ch.ndim == 2:
+                ch = ch[..., None]
+            if ch.shape == batch.confidence_hint.shape:
+                batch.confidence_hint = np.clip(ch, 0.0, 1.0).astype(np.float32)
+        return batch
 
 
 class TemporalTrainer:
@@ -97,9 +123,9 @@ class TemporalTrainer:
                 self.dataset_diagnostics = getattr(manifest_ds, "diagnostics", {})
                 return train_ds, val_ds
             if len(manifest_ds) == 1:
-                self.dataset_source = "manifest_temporal_primary_with_synthetic_val_fallback"
+                self.dataset_source = "manifest_temporal_primary_single_sample_reused_for_val"
                 self.dataset_diagnostics = getattr(manifest_ds, "diagnostics", {})
-                return manifest_ds, TemporalDataset.synthetic(max(1, config.val_size))
+                return manifest_ds, TemporalDataset(samples=list(manifest_ds.samples))
             self.dataset_source = "synthetic_temporal_fallback_manifest_empty"
             self.dataset_diagnostics = getattr(manifest_ds, "diagnostics", {})
         return TemporalDataset.synthetic(config.train_size), TemporalDataset.synthetic(config.val_size)
@@ -110,34 +136,49 @@ class TemporalTrainer:
 
     @staticmethod
     def evaluate_model(model: TrainableTemporalConsistencyModel, batches: list[TemporalBatch], diagnostics: dict[str, object] | None = None) -> dict[str, float]:
+        diagnostics = diagnostics or {}
         if not batches:
             return {
                 "reconstruction_mae": 1.0,
                 "flicker_delta_mae": 1.0,
                 "region_consistency_mae": 1.0,
+                "seam_temporal_mae": 1.0,
+                "confidence_alignment_mae": 1.0,
                 "contract_validity": 0.0,
                 "fallback_free_happy_path_ratio": 0.0,
                 "usable_sample_count": 0.0,
-                "invalid_records": float((diagnostics or {}).get("invalid_records", 0)),
+                "invalid_records": float(diagnostics.get("invalid_records", 0)),
+                "skipped_records": float(diagnostics.get("skipped_records", 0)),
+                "tag_coverage": 0.0,
+                "scenario_coverage": 0.0,
                 "score": 0.0,
             }
         entries = [model.eval_step(batch) for batch in batches]
         recon_mae = float(sum(e["reconstruction_mae"] for e in entries) / len(entries))
         flicker_mae = float(sum(e["flicker_delta_mae"] for e in entries) / len(entries))
         region_mae = float(sum(e["region_consistency_mae"] for e in entries) / len(entries))
+        seam_mae = float(sum(e["seam_temporal_loss"] for e in entries) / len(entries))
+        conf_align_mae = float(sum(e["confidence_calibration_loss"] for e in entries) / len(entries))
 
         contract_validity = float(
             sum(1.0 for b in batches if b.previous_frame.shape == b.current_frame.shape == b.target_frame.shape and b.changed_mask.shape[:2] == b.previous_frame.shape[:2]) / len(batches)
         )
-        score = float(max(0.0, 1.0 - (recon_mae + 0.7 * flicker_mae + 0.4 * region_mae)))
+        tag_coverage = float(len((diagnostics.get("tag_counts") or {}).keys()))
+        scenario_coverage = float(len((diagnostics.get("scenario_counts") or {}).keys()))
+        score = float(max(0.0, 1.0 - (recon_mae + 0.7 * flicker_mae + 0.4 * region_mae + 0.12 * seam_mae + 0.08 * conf_align_mae)))
         return {
             "reconstruction_mae": recon_mae,
             "flicker_delta_mae": flicker_mae,
             "region_consistency_mae": region_mae,
+            "seam_temporal_mae": seam_mae,
+            "confidence_alignment_mae": conf_align_mae,
             "contract_validity": contract_validity,
             "fallback_free_happy_path_ratio": 1.0,
             "usable_sample_count": float(len(batches)),
-            "invalid_records": float((diagnostics or {}).get("invalid_records", 0)),
+            "invalid_records": float(diagnostics.get("invalid_records", 0)),
+            "skipped_records": float(diagnostics.get("skipped_records", 0)),
+            "tag_coverage": tag_coverage,
+            "scenario_coverage": scenario_coverage,
             "score": score,
         }
 
