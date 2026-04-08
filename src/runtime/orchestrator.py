@@ -273,6 +273,36 @@ class GennadyEngine:
 
             composed = self.compositor.compose(current_frame, patches, delta)
             temporal_channels = self.build_temporal_memory_channels(memory_channels)
+            if patches:
+                patch_conf = [float(p.confidence) for p in patches]
+                patch_alpha_mean = []
+                patch_alpha_edge = []
+                for p in patches:
+                    alpha_vals = [float(v) for row in p.alpha_mask for v in row] if p.alpha_mask else [0.0]
+                    patch_alpha_mean.append(sum(alpha_vals) / max(1, len(alpha_vals)))
+                    edge_vals = []
+                    if p.alpha_mask:
+                        edge_vals.extend([float(v) for v in p.alpha_mask[0]])
+                        edge_vals.extend([float(v) for v in p.alpha_mask[-1]])
+                        edge_vals.extend([float(row[0]) for row in p.alpha_mask])
+                        edge_vals.extend([float(row[-1]) for row in p.alpha_mask])
+                    patch_alpha_edge.append(sum(edge_vals) / max(1, len(edge_vals)))
+                temporal_channels = {
+                    **temporal_channels,
+                    "patch_confidence": {
+                        "mean_confidence": sum(patch_conf) / max(1, len(patch_conf)),
+                        "min_confidence": min(patch_conf),
+                        "max_confidence": max(patch_conf),
+                    },
+                    "patch_alpha": {
+                        "mean_alpha": sum(patch_alpha_mean) / max(1, len(patch_alpha_mean)),
+                        "edge_alpha": sum(patch_alpha_edge) / max(1, len(patch_alpha_edge)),
+                    },
+                    "patch_history": {
+                        "count": len(patches),
+                        "region_ids": [p.region.region_id for p in patches],
+                    },
+                }
             temporal_request = TemporalRefinementRequest(
                 previous_frame=frames[-1],
                 current_composed_frame=composed,
@@ -343,6 +373,8 @@ class GennadyEngine:
                     },
                     "temporal": {
                         "backend": self.backends.backend_names.get("temporal_backend", "unknown"),
+                        "temporal_path": temporal_out.metadata.get("temporal_path", "unknown"),
+                        "fallback_reason": temporal_out.metadata.get("fallback_reason"),
                         "region_consistency_summary": temporal_out.region_consistency_scores,
                         "learned_ready": temporal_out.metadata.get("learned_ready_usage", {}),
                         "drift_consistency": {

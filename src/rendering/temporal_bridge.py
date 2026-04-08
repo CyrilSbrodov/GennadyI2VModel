@@ -2,9 +2,17 @@ from __future__ import annotations
 
 from learned.interfaces import TemporalConsistencyModel, TemporalRefinementOutput, TemporalRefinementRequest
 from rendering.compositor import TemporalStabilizer
+from rendering.trainable_temporal_consistency import (
+    TemporalInferenceError,
+    TemporalInputError,
+    TrainableTemporalConsistencyModel,
+    build_temporal_batch,
+    extract_history_frame,
+    output_from_temporal_prediction,
+)
 
 
-class BaselineTemporalConsistencyModel(TemporalConsistencyModel):
+class LegacyBaselineTemporalConsistencyModel(TemporalConsistencyModel):
     def __init__(self, stabilizer: TemporalStabilizer | None = None) -> None:
         self.stabilizer = stabilizer or TemporalStabilizer()
 
@@ -43,6 +51,7 @@ class BaselineTemporalConsistencyModel(TemporalConsistencyModel):
             region_consistency_scores=scores,
             metadata={
                 "backend": "deterministic_temporal_stabilizer",
+                "temporal_path": "legacy_fallback",
                 "learned_ready_usage": {
                     "memory_channels_used": [k for k, v in request.memory_channels.items() if v],
                     "hidden_regions_signal_used": bool(hidden_signal),
@@ -50,3 +59,59 @@ class BaselineTemporalConsistencyModel(TemporalConsistencyModel):
                 },
             },
         )
+
+
+class TrainableTemporalConsistencyBackend(TemporalConsistencyModel):
+    def __init__(
+        self,
+        model: TrainableTemporalConsistencyModel | None = None,
+        fallback: LegacyBaselineTemporalConsistencyModel | None = None,
+        strict_mode: bool = False,
+    ) -> None:
+        self.model = model or TrainableTemporalConsistencyModel()
+        self.fallback = fallback or LegacyBaselineTemporalConsistencyModel()
+        self.strict_mode = strict_mode
+
+    def refine_temporal(self, request: TemporalRefinementRequest) -> TemporalRefinementOutput:
+        try:
+            history_frame = extract_history_frame(request.memory_state)
+            batch = build_temporal_batch(request, history_frame=history_frame)
+            pred = self.model.infer(batch)
+            return output_from_temporal_prediction(
+                request,
+                pred,
+                temporal_path="learned_primary",
+                metadata={
+                    "fallback_used": False,
+                    "strict_mode": self.strict_mode,
+                    "history_used": history_frame is not None,
+                    "conditioning": {
+                        "transition_cond_mean": float(batch.transition_cond.mean()),
+                        "memory_cond_mean": float(batch.memory_cond.mean()),
+                        "history_cond_mean": float(batch.history_cond.mean()),
+                        "changed_ratio": float(batch.changed_mask.mean()),
+                        "alpha_hint_mean": float(batch.alpha_hint.mean()),
+                        "confidence_hint_mean": float(batch.confidence_hint.mean()),
+                    },
+                },
+            )
+        except (TemporalInputError, TemporalInferenceError, ValueError) as err:
+            if self.strict_mode:
+                raise
+            fb = self.fallback.refine_temporal(request)
+            fb.metadata = dict(fb.metadata)
+            fb.metadata.update(
+                {
+                    "temporal_path": "legacy_fallback",
+                    "fallback_reason": type(err).__name__,
+                    "fallback_message": str(err),
+                    "strict_mode": self.strict_mode,
+                }
+            )
+            usage = dict(fb.metadata.get("learned_ready_usage", {}))
+            usage.update({"fallback_reason": type(err).__name__, "fallback_message": str(err)})
+            fb.metadata["learned_ready_usage"] = usage
+            return fb
+
+
+BaselineTemporalConsistencyModel = LegacyBaselineTemporalConsistencyModel

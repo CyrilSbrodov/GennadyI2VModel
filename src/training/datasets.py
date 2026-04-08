@@ -476,6 +476,114 @@ class RendererDataset(BaseStageDataset):
         return cls(samples=out)
 
 
+class TemporalDataset(BaseStageDataset):
+    @staticmethod
+    def _as_hw3_tensor(value: object, field_name: str) -> list[list[list[float]]]:
+        arr = np.asarray(value, dtype=np.float32)
+        if arr.ndim == 2:
+            arr = np.repeat(arr[..., None], 3, axis=2)
+        if arr.ndim != 3:
+            raise ValueError(f"{field_name} must be HxWxC tensor")
+        if arr.shape[2] == 1:
+            arr = np.repeat(arr, 3, axis=2)
+        if arr.shape[2] != 3:
+            raise ValueError(f"{field_name} channel count must be 3 or 1")
+        return np.clip(arr, 0.0, 1.0).tolist()
+
+    @classmethod
+    def synthetic(cls, size: int) -> "TemporalDataset":
+        samples: list[TrainingSample] = []
+        for idx in range(size):
+            base = 0.22 + 0.04 * (idx % 4)
+            prev = np.full((24, 24, 3), base, dtype=np.float32)
+            cur = prev.copy()
+            cur[5:18, 7:20, :] = np.array([min(1.0, base + 0.2), base + 0.05, base + 0.03], dtype=np.float32)
+            target = cur.copy()
+            target[6:17, 8:19, :] = np.array([min(1.0, base + 0.17), base + 0.04, base + 0.03], dtype=np.float32)
+            rid = RegionRef(region_id=f"p1:region_{idx%3}", bbox=BBox(0.25, 0.2, 0.45, 0.45), reason="temporal_drift")
+            samples.append(
+                {
+                    "frames": [prev.tolist(), cur.tolist(), target.tolist()],
+                    "temporal_consistency_contract": {
+                        "previous_frame": prev.tolist(),
+                        "composed_frame": cur.tolist(),
+                        "target_frame": target.tolist(),
+                        "changed_regions": [{"region_id": rid.region_id, "reason": rid.reason, "bbox": {"x": rid.bbox.x, "y": rid.bbox.y, "w": rid.bbox.w, "h": rid.bbox.h}}],
+                        "region_consistency_metadata": {"alpha_mean": 0.55, "confidence_mean": 0.72},
+                        "scene_transition_context": {"transition_phase": "motion", "step_index": idx + 1},
+                        "memory_transition_context": {"drift": [0.02, 0.05, 0.1][idx % 3]},
+                    },
+                    "source": "synthetic_temporal",
+                }
+            )
+        ds = cls(samples=samples)
+        ds.diagnostics = {"source": "synthetic_temporal", "loaded_records": len(samples), "invalid_records": 0, "skipped_records": 0}
+        return ds
+
+    @classmethod
+    def from_temporal_manifest(cls, manifest_path: str, strict: bool = False) -> "TemporalDataset":
+        payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        records = payload.get("records", [])
+        samples: list[TrainingSample] = []
+        diagnostics: dict[str, object] = {
+            "source": "manifest_temporal_consistency",
+            "manifest_path": manifest_path,
+            "total_records": len(records),
+            "loaded_records": 0,
+            "invalid_records": 0,
+            "skipped_records": 0,
+            "invalid_examples": [],
+        }
+        for idx, rec in enumerate(records):
+            try:
+                if not isinstance(rec, dict):
+                    raise ValueError("record must be a json object")
+                prev = cls._as_hw3_tensor(rec["previous_frame"], "previous_frame")
+                cur = cls._as_hw3_tensor(rec["current_composed_frame"], "current_composed_frame")
+                target = cls._as_hw3_tensor(rec.get("target_frame", rec["current_composed_frame"]), "target_frame")
+                changed_regions_raw = rec.get("changed_regions", [])
+                changed_regions: list[dict[str, object]] = []
+                for ridx, region in enumerate(changed_regions_raw if isinstance(changed_regions_raw, list) else []):
+                    if not isinstance(region, dict):
+                        continue
+                    bb = region.get("bbox", {}) if isinstance(region.get("bbox", {}), dict) else {}
+                    changed_regions.append(
+                        {
+                            "region_id": str(region.get("region_id", f"scene:region_{ridx}")),
+                            "reason": str(region.get("reason", "temporal_drift")),
+                            "bbox": {
+                                "x": float(bb.get("x", 0.2)),
+                                "y": float(bb.get("y", 0.2)),
+                                "w": float(bb.get("w", 0.3)),
+                                "h": float(bb.get("h", 0.3)),
+                            },
+                        }
+                    )
+                if not changed_regions:
+                    changed_regions = [{"region_id": "scene:region_0", "reason": "temporal_drift", "bbox": {"x": 0.2, "y": 0.2, "w": 0.3, "h": 0.3}}]
+                contract = {
+                    "previous_frame": prev,
+                    "composed_frame": cur,
+                    "target_frame": target,
+                    "changed_regions": changed_regions,
+                    "region_consistency_metadata": rec.get("region_consistency_metadata", {}),
+                    "scene_transition_context": rec.get("scene_transition_context", {}),
+                    "memory_transition_context": rec.get("memory_transition_context", {}),
+                }
+                samples.append({"frames": [prev, cur, target], "temporal_consistency_contract": contract, "source": rec.get("source", "temporal_manifest")})
+                diagnostics["loaded_records"] = int(diagnostics["loaded_records"]) + 1
+            except Exception as exc:
+                diagnostics["invalid_records"] = int(diagnostics["invalid_records"]) + 1
+                if len(diagnostics["invalid_examples"]) < 8:
+                    diagnostics["invalid_examples"].append({"index": idx, "reason": str(exc)})
+                if strict:
+                    raise
+        ds = cls(samples=samples)
+        ds.diagnostics = diagnostics
+        return ds
+
+
+
 class TextActionDataset(BaseStageDataset):
     @classmethod
     def from_jsonl(cls, path: str) -> "TextActionDataset":
