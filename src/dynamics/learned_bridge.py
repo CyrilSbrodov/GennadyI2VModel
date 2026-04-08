@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from core.schema import ActionStep, GraphDelta, SceneGraph, VideoMemory
+from core.schema import GraphDelta, SceneGraph, VideoMemory
 from dynamics.graph_delta_predictor import DynamicsMetrics, GraphDeltaPredictor
 from learned.interfaces import DynamicsTransitionModel, DynamicsTransitionOutput, DynamicsTransitionRequest
 from text.encoder_contracts import TextEncodingDiagnostics
@@ -15,78 +15,68 @@ class TransitionPrediction:
     backend: str
 
 
-class BaselineDynamicsTransitionModel(DynamicsTransitionModel):
-    """Fallback deterministic backend implementing learned transition contract."""
+class LearnedDynamicsTransitionModel(DynamicsTransitionModel):
+    """Primary runtime dynamics backend: learned graph-delta predictor."""
 
-    def __init__(self) -> None:
-        self.predictor = GraphDeltaPredictor()
+    def __init__(self, *, strict_mode: bool = False) -> None:
+        self.predictor = GraphDeltaPredictor(strict_mode=strict_mode)
 
     def predict_transition(self, request: DynamicsTransitionRequest) -> DynamicsTransitionOutput:
         labels = request.text_action_summary.structured_action_tokens or ["micro_adjust"]
         step_index = int(request.step_context.get("step_index", 1))
         planned_state = type("_PS", (), {"labels": labels, "step_index": step_index})()
+        strict = bool(request.step_context.get("strict_dynamics", False))
+        if strict and not self.predictor.strict_mode:
+            self.predictor = GraphDeltaPredictor(strict_mode=True)
         delta, metrics = self.predictor.predict(
+            scene_graph=request.graph_state,
+            target_state=planned_state,
+            planner_context={"step_index": float(step_index), "total_steps": float(max(step_index + 1, 2))},
+            memory=request.step_context.get("memory") if isinstance(request.step_context.get("memory"), VideoMemory) else None,
+        )
+        used_channels = [name for name, payload in request.memory_channels.items() if payload]
+        return DynamicsTransitionOutput(
+            delta=delta,
+            confidence=max(0.0, min(1.0, 1.0 - 0.05 * metrics.constraint_violations)),
+            diagnostics={
+                "delta_magnitude": metrics.delta_magnitude,
+                "temporal_smoothness_proxy": metrics.temporal_smoothness_proxy,
+                "constraint_violations": float(metrics.constraint_violations),
+            },
+            metadata={
+                "backend": "learned_graph_delta_predictor",
+                "runtime_path": delta.transition_diagnostics.get("runtime_path", "learned_primary"),
+                "learned_ready_usage": {
+                    "memory_channels_used": used_channels,
+                    "graph_encoding_used": bool(request.graph_encoding and request.graph_encoding.graph_embedding),
+                    "identity_embeddings_used": bool(request.identity_embeddings),
+                },
+            },
+        )
+
+
+class LegacyHeuristicDynamicsTransitionModel(DynamicsTransitionModel):
+    """Explicit legacy fallback backend for debug only."""
+
+    def __init__(self, *, strict_mode: bool = False) -> None:
+        self.predictor = GraphDeltaPredictor(strict_mode=strict_mode)
+
+    def predict_transition(self, request: DynamicsTransitionRequest) -> DynamicsTransitionOutput:
+        labels = request.text_action_summary.structured_action_tokens or ["micro_adjust"]
+        step_index = int(request.step_context.get("step_index", 1))
+        planned_state = type("_PS", (), {"labels": labels, "step_index": step_index})()
+        delta, metrics = self.predictor._predict_legacy(
             scene_graph=request.graph_state,
             target_state=planned_state,
             planner_context={"step_index": float(step_index)},
             memory=request.step_context.get("memory") if isinstance(request.step_context.get("memory"), VideoMemory) else None,
         )
-        graph_dim = len(request.graph_encoding.graph_embedding) if request.graph_encoding else 0
-        identity_dim = sum(len(v) for v in request.identity_embeddings.values())
-        memory_signal = float(sum(1 for v in request.memory_channels.values() if v))
-        phase_bias = "settle" if memory_signal > 1 else ("motion" if graph_dim > 0 else delta.transition_phase)
-        if request.graph_encoding and request.graph_encoding.graph_embedding:
-            relation_signal = request.graph_encoding.graph_embedding[2] if len(request.graph_encoding.graph_embedding) > 2 else 0.0
-            if relation_signal > 0.35:
-                delta.region_transition_mode = {
-                    region: ("deform_relation_aware" if "arm" in region or "torso" in region else mode)
-                    for region, mode in delta.region_transition_mode.items()
-                }
-        if identity_dim:
-            smooth = max(0.85, 1.0 - min(0.15, identity_dim * 0.002))
-            delta.pose_deltas = {k: float(v) * smooth for k, v in delta.pose_deltas.items()}
-        if memory_signal and delta.affected_regions:
-            delta.state_after = dict(delta.state_after)
-            delta.state_after.setdefault("transition_bias", "memory_smoothed")
-            emphasis = delta.affected_regions[0]
-            delta.state_after.setdefault("region_emphasis", emphasis)
-        delta.transition_phase = phase_bias
-        confidence_boost = min(0.15, 0.01 * graph_dim + 0.005 * identity_dim + 0.03 * memory_signal)
-        used_channels = [name for name, payload in request.memory_channels.items() if payload]
-        return DynamicsTransitionOutput(
-            delta=delta,
-            confidence=max(0.0, min(1.0, 1.0 - 0.1 * metrics.constraint_violations + confidence_boost)),
-            diagnostics={
-                "delta_magnitude": metrics.delta_magnitude,
-                "temporal_smoothness_proxy": metrics.temporal_smoothness_proxy,
-                "constraint_violations": float(metrics.constraint_violations),
-                "graph_encoding_signal": float(graph_dim),
-                "identity_signal": float(identity_dim),
-                "memory_channel_signal": memory_signal,
-                "transition_diagnostics": delta.transition_diagnostics,
-            },
-            metadata={
-                "backend": "deterministic_graph_delta_predictor",
-                "delta_magnitude": metrics.delta_magnitude,
-                "smoothness": metrics.temporal_smoothness_proxy,
-                "learned_ready_usage": {
-                    "graph_encoding_used": bool(request.graph_encoding and request.graph_encoding.graph_embedding),
-                    "identity_embeddings_used": bool(request.identity_embeddings),
-                    "memory_channels_used": used_channels,
-                    "ignored_fields": [name for name, payload in request.memory_channels.items() if not payload],
-                },
-                "delta_postprocess": {
-                    "phase_bias": phase_bias,
-                    "identity_smoothing_applied": bool(identity_dim),
-                    "region_emphasis": delta.state_after.get("region_emphasis"),
-                },
-            },
-        )
+        return DynamicsTransitionOutput(delta=delta, confidence=0.5, diagnostics={"delta_magnitude": metrics.delta_magnitude}, metadata={"backend": "legacy_heuristic_fallback"})
 
 
 class LearnedReadyTransitionEngine:
     def __init__(self, model: DynamicsTransitionModel | None = None) -> None:
-        self.model = model or BaselineDynamicsTransitionModel()
+        self.model = model or LearnedDynamicsTransitionModel()
 
     def predict(
         self,

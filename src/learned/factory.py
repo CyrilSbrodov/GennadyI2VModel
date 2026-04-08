@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from dynamics.learned_bridge import BaselineDynamicsTransitionModel
+from dynamics.learned_bridge import LegacyHeuristicDynamicsTransitionModel, LearnedDynamicsTransitionModel
 from learned.interfaces import (
     DynamicsTransitionModel,
     GraphEncoder,
@@ -22,7 +22,7 @@ class BackendConfig:
     text_encoder: str = "baseline"
     graph_encoder: str = "baseline"
     identity_encoder: str = "baseline"
-    dynamics_backend: str = "baseline"
+    dynamics_backend: str = "learned_graph_delta"
     patch_backend: str = "baseline"
     temporal_backend: str = "baseline"
 
@@ -76,8 +76,10 @@ class LearnedBackendFactory:
         raise ValueError(f"Unknown identity encoder backend: {name}")
 
     def _build_dynamics(self, name: str) -> DynamicsTransitionModel:
-        if name == "baseline":
-            return BaselineDynamicsTransitionModel()
+        if name in {"learned_graph_delta", "baseline"}:
+            return LearnedDynamicsTransitionModel()
+        if name in {"legacy_heuristic", "legacy"}:
+            return LegacyHeuristicDynamicsTransitionModel()
         raise ValueError(f"Unknown dynamics backend: {name}")
 
     def _build_patch(self, name: str) -> PatchSynthesisModel:
