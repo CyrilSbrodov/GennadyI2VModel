@@ -1,0 +1,91 @@
+{
+  "dataset_id": "single_image_curated_v1",
+  "name": "Curated single-image benchmark pack",
+  "version": "1.0.0",
+  "records": [
+    {
+      "record_id": "face_expression_001",
+      "asset_id": "face_closeup_smile_ref",
+      "asset_path": "images/face_closeup_smile_ref.ppm",
+      "scenario_id": "face_expression_change",
+      "canonical_prompt": "Смотрит в камеру, постепенно улыбается и смягчает взгляд.",
+      "action_family": "expression_change",
+      "transition_family": "face_emotion",
+      "expected_region_families": ["face"],
+      "expected_runtime_conditions": {"require_contract_validity": true, "max_fallbacks": 4},
+      "tags": ["face", "expression", "closeup"],
+      "notes": "Frontal face reference with stable illumination.",
+      "weak_expectations": {"expect_face_region_activity": true}
+    },
+    {
+      "record_id": "torso_reveal_001",
+      "asset_id": "torso_outerwear_front_ref",
+      "asset_path": "images/torso_outerwear_front_ref.ppm",
+      "scenario_id": "torso_garment_reveal",
+      "canonical_prompt": "Расстегивает куртку и приоткрывает верхнюю одежду.",
+      "action_family": "garment_transition",
+      "transition_family": "torso_reveal",
+      "expected_region_families": ["torso", "outerwear"],
+      "expected_runtime_conditions": {"require_contract_validity": true, "max_fallbacks": 5},
+      "tags": ["torso", "outerwear", "frontal"],
+      "notes": "Front torso with visible outerwear boundaries.",
+      "weak_expectations": {"expect_outerwear_visibility_change": true}
+    },
+    {
+      "record_id": "sleeve_outerwear_001",
+      "asset_id": "arm_sleeve_halfroll_ref",
+      "asset_path": "images/arm_sleeve_halfroll_ref.ppm",
+      "scenario_id": "sleeve_arm_outerwear",
+      "canonical_prompt": "Закатывает рукав и освобождает руку от внешнего слоя одежды.",
+      "action_family": "arm_outerwear_transition",
+      "transition_family": "sleeve_change",
+      "expected_region_families": ["arm", "sleeve", "outerwear"],
+      "expected_runtime_conditions": {"require_contract_validity": true, "max_fallbacks": 5},
+      "tags": ["arm", "sleeve", "outerwear"],
+      "notes": "Arm and sleeve composition for local garment transitions.",
+      "weak_expectations": {"expect_arm_region_activity": true}
+    },
+    {
+      "record_id": "posture_sit_stand_001",
+      "asset_id": "posture_chair_side_ref",
+      "asset_path": "images/posture_chair_side_ref.ppm",
+      "scenario_id": "posture_sit_stand",
+      "canonical_prompt": "Сначала встает, затем плавно садится на стул.",
+      "action_family": "posture_change",
+      "transition_family": "sit_stand",
+      "expected_region_families": ["torso", "legs"],
+      "expected_runtime_conditions": {"require_contract_validity": true, "max_fallbacks": 6},
+      "tags": ["posture", "chair", "side"],
+      "notes": "Pose-friendly side framing for sit/stand transitions.",
+      "weak_expectations": {"expect_torso_leg_interaction": true}
+    },
+    {
+      "record_id": "mixed_multi_step_001",
+      "asset_id": "multi_step_room_turn_ref",
+      "asset_path": "images/multi_step_room_turn_ref.ppm",
+      "scenario_id": "mixed_multi_step",
+      "canonical_prompt": "Снимает легкую куртку, поворачивается, садится и улыбается.",
+      "action_family": "multi_step_mixed",
+      "transition_family": "mixed",
+      "expected_region_families": ["face", "torso", "arm", "outerwear"],
+      "expected_runtime_conditions": {"require_contract_validity": true, "max_fallbacks": 8},
+      "tags": ["multi-step", "turn", "posture"],
+      "notes": "Multi-region reference used for mixed scenario runs.",
+      "weak_expectations": {"expect_multi_region_activity": true}
+    },
+    {
+      "record_id": "torso_reveal_002",
+      "asset_id": "torso_outerwear_side_ref",
+      "asset_path": "images/torso_outerwear_side_ref.ppm",
+      "scenario_id": "torso_garment_reveal",
+      "canonical_prompt": "Расстегивает куртку и приоткрывает верхнюю одежду.",
+      "action_family": "garment_transition",
+      "transition_family": "torso_reveal",
+      "expected_region_families": ["torso", "outerwear"],
+      "expected_runtime_conditions": {"require_contract_validity": true, "max_fallbacks": 5},
+      "tags": ["torso", "outerwear", "side"],
+      "notes": "Secondary torso perspective to avoid one-image bias.",
+      "weak_expectations": {"expect_outerwear_visibility_change": true}
+    }
+  ]
+}

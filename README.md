@@ -126,15 +126,40 @@ python -m evaluation.cli stage \
 
 ### End-to-end scenario benchmark + learned vs legacy comparison
 
+По умолчанию benchmark теперь использует curated dataset manifest:
+- `benchmark_assets/single_image_curated/manifest.json`
+- `benchmark_assets/single_image_curated/images/*.ppm`
+
 ```bash
-python -m evaluation.cli benchmark \
-  --backend-modes learned_primary,legacy \
-  --output artifacts/eval/benchmark_report.json
+python -m evaluation.cli benchmark   --backend-modes learned_primary,legacy   --output artifacts/eval/benchmark_report.json
 ```
 
-Benchmark report содержит:
-- scenario-by-scenario metrics,
-- per-stage health,
-- fallback / contract summaries,
-- regression-oriented warnings,
-- comparison deltas между `learned_primary` и `legacy`.
+Фильтрация по subset сценариев/ассетов:
+
+```bash
+python -m evaluation.cli benchmark   --scenario-filter torso_garment_reveal,mixed_multi_step   --asset-filter torso_outerwear_front_ref   --output artifacts/eval/benchmark_subset.json
+```
+
+Явный manifest path (если нужен альтернативный curated pack):
+
+```bash
+python -m evaluation.cli benchmark   --dataset-manifest benchmark_assets/single_image_curated/manifest.json   --output artifacts/eval/benchmark_report.json
+```
+
+Legacy-режим с одним seed image сохранился через `--image`.
+
+Manifest record contract (обязательные поля):
+- `record_id`, `asset_id`, `asset_path`
+- `scenario_id`, `canonical_prompt`
+- `action_family`, `transition_family`
+- `expected_region_families`, `expected_runtime_conditions`
+
+Опционально: `tags`, `notes`, `weak_expectations`.
+
+Benchmark report теперь содержит:
+- dataset diagnostics (`total/valid/invalid/missing assets`),
+- scenario + asset-level results,
+- coverage по scenario families,
+- missing/invalid dataset diagnostics,
+- regression-oriented warnings и comparison deltas между `learned_primary` и `legacy`.
+
