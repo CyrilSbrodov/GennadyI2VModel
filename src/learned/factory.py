@@ -11,7 +11,7 @@ from learned.interfaces import (
     TemporalConsistencyModel,
     TextEncoder,
 )
-from rendering.learned_bridge import BaselinePatchSynthesisModel
+from rendering.learned_bridge import LegacyDeterministicPatchSynthesisModel, TrainablePatchSynthesisModel
 from rendering.temporal_bridge import BaselineTemporalConsistencyModel
 from representation.learned_bridge import BaselineGraphEncoder, BaselineIdentityAppearanceEncoder
 from text.learned_bridge import BaselineTextEncoderAdapter
@@ -23,7 +23,7 @@ class BackendConfig:
     graph_encoder: str = "baseline"
     identity_encoder: str = "baseline"
     dynamics_backend: str = "learned_graph_delta"
-    patch_backend: str = "baseline"
+    patch_backend: str = "trainable_local"
     temporal_backend: str = "baseline"
 
 
@@ -83,8 +83,10 @@ class LearnedBackendFactory:
         raise ValueError(f"Unknown dynamics backend: {name}")
 
     def _build_patch(self, name: str) -> PatchSynthesisModel:
-        if name == "baseline":
-            return BaselinePatchSynthesisModel()
+        if name in {"trainable_local", "baseline"}:
+            return TrainablePatchSynthesisModel()
+        if name in {"legacy", "legacy_deterministic"}:
+            return LegacyDeterministicPatchSynthesisModel()
         raise ValueError(f"Unknown patch backend: {name}")
 
     def _build_temporal(self, name: str) -> TemporalConsistencyModel:

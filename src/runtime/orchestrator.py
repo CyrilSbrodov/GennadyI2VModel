@@ -186,7 +186,7 @@ class GennadyEngine:
                     scene_state=scene_graph,
                     memory_summary=memory_summary,
                     transition_context={"graph_delta": delta, "video_memory": memory},
-                    retrieval_summary={"backend": "deterministic", "identity_entity": entity_id},
+                    retrieval_summary={"backend": "learned_primary", "identity_entity": entity_id},
                     current_frame=current_frame,
                     memory_channels=patch_channels,
                     graph_encoding=graph_encoding,

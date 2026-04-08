@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict
@@ -222,7 +223,44 @@ class RendererDataset(BaseStageDataset):
     def synthetic(cls, size: int) -> "RendererDataset":
         from utils_tensor import zeros
 
-        return cls(samples=[{"frames": [zeros(64, 64, 3), [[[1.0, 1.0, 1.0] for _ in range(64)] for _ in range(64)]], "roi_pairs": [(zeros(16, 16, 3), [[[1.0, 1.0, 1.0] for _ in range(16)] for _ in range(16)])], "source": "synthetic"} for _ in range(size)])
+        samples: list[TrainingSample] = []
+        families = ["face_expression", "torso_reveal", "sleeve_arm_transition"]
+        for idx in range(size):
+            family = families[idx % len(families)]
+            before = zeros(16, 16, 3, value=0.25)
+            after = zeros(16, 16, 3, value=0.25)
+            for y in range(16):
+                for x in range(16):
+                    if family == "face_expression" and 6 <= y <= 11 and 4 <= x <= 11:
+                        after[y][x] = [0.6, 0.35, 0.35]
+                    elif family == "torso_reveal" and x in {7, 8}:
+                        after[y][x] = [0.8, 0.78, 0.75]
+                    elif family == "sleeve_arm_transition" and 3 <= x <= 10 and y >= 6:
+                        after[y][x] = [0.45, 0.5, 0.7]
+            yy, xx = np.meshgrid(np.linspace(0.0, 1.0, 16), np.linspace(0.0, 1.0, 16), indexing="ij")
+            changed = np.clip(np.mean(np.abs(np.asarray(after) - np.asarray(before)), axis=2, keepdims=True) * 3.0, 0.0, 1.0)
+            blend_hint = np.clip(0.2 + 0.75 * changed + 0.05 * (1.0 - np.abs(xx - 0.5))[..., None], 0.0, 1.0)
+            semantic = [1.0, 0.0, 0.0, 0.9, 0.1, 0.2] if family == "face_expression" else ([0.0, 1.0, 0.0, 0.2, 0.85, 0.4] if family == "torso_reveal" else [0.0, 0.0, 1.0, 0.15, 0.45, 0.9])
+            samples.append(
+                {
+                    "frames": [zeros(64, 64, 3), zeros(64, 64, 3)],
+                    "roi_pairs": [(before, after)],
+                    "source": "synthetic",
+                    "region_family": family,
+                    "renderer_batch_contract": {
+                        "semantic_embed": semantic,
+                        "delta_cond": [0.2 + 0.1 * idx, 0.1, 0.2 if family != "face_expression" else 0.05, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                        "planner_cond": [min(1.0, idx / max(1, size)), 0.0, 1.0, 0.0, 1.0 if family == "torso_reveal" else 0.0, 1.0 if family == "sleeve_arm_transition" else 0.0, 1.0 if family == "face_expression" else 0.0, 0.0],
+                        "graph_cond": [1.0, 0.2, 0.1, 0.53, 0.5, 0.5, 0.15],
+                        "memory_cond": [0.6, 0.4, 0.3, 0.5, 0.2, 0.35, 0.5, 1.0 if family == "torso_reveal" else 0.0],
+                        "appearance_cond": [0.25, 0.25, 0.25, 0.02, 0.02, 0.02],
+                        "bbox_cond": [0.2, 0.2, 0.4, 0.4],
+                        "alpha_target": np.clip(0.15 + 0.85 * changed, 0.0, 1.0).tolist(),
+                        "blend_hint": blend_hint.tolist(),
+                    },
+                }
+            )
+        return cls(samples=samples)
 
     @classmethod
     def from_frame_pairs(cls, before_frames: list[list], after_frames: list[list]) -> "RendererDataset":
@@ -278,6 +316,15 @@ class RendererDataset(BaseStageDataset):
                     "roi_pairs": roi_pairs,
                     "patch_synthesis_contract": patch_contract,
                     "temporal_consistency_contract": temporal_contract,
+                    "renderer_batch_contract": {
+                        "semantic_embed": rec.get("semantic_embed", [0.0, 1.0, 0.0, 0.25, 0.8, 0.35]),
+                        "delta_cond": rec.get("delta_cond", [0.3, 0.1, 0.2, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0]),
+                        "planner_cond": rec.get("planner_cond", [0.2, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+                        "graph_cond": rec.get("graph_cond", [1.0, 0.2, 0.15, 0.5, 0.5, 0.5, 0.2]),
+                        "memory_cond": rec.get("memory_cond", [0.5, 0.4, 0.2, 0.6, 0.3, 0.2, 0.4, 0.0]),
+                        "appearance_cond": rec.get("appearance_cond", [0.3, 0.3, 0.3, 0.05, 0.05, 0.05]),
+                        "bbox_cond": rec.get("bbox_cond", [0.2, 0.2, 0.4, 0.4]),
+                    },
                     "source": rec.get("source", "video_manifest"),
                 }
             )
