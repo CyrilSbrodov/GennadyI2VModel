@@ -25,6 +25,86 @@ class MemoryManager:
     def __init__(self) -> None:
         self.roi = SemanticROIHelper()
 
+    def _is_body_like_region(self, region_type: str) -> bool:
+        return region_type in {
+            "face",
+            "head",
+            "torso",
+            "pelvis",
+            "legs",
+            "left_arm",
+            "right_arm",
+            "arm",
+            "left_hand",
+            "right_hand",
+            "hand",
+        }
+
+    def _is_limb_region(self, region_type: str) -> bool:
+        return region_type in {
+            "legs",
+            "pelvis",
+            "left_arm",
+            "right_arm",
+            "arm",
+            "left_hand",
+            "right_hand",
+            "hand",
+        }
+
+    def _candidate_body_compatibility(self, query_region: str, candidate_region: str, semantic_family: str) -> float:
+        """
+        Более жёсткая совместимость для body-like retrieval.
+        Если query — ноги/таз/руки, torso допустим только как слабый fallback,
+        а garment-патчи должны почти всегда проигрывать.
+        """
+        if query_region == candidate_region:
+            return 1.0
+
+        if query_region in {"legs", "pelvis"}:
+            if candidate_region in {"legs", "pelvis"}:
+                return 0.9
+            if candidate_region == "torso":
+                return -0.55
+            if semantic_family in {"garment", "outerwear", "innerwear"}:
+                return -1.0
+            if candidate_region in {"inner_garment", "outer_garment", "garments", "sleeves"}:
+                return -1.0
+            return -0.35
+
+        if query_region in {"left_arm", "right_arm", "arm", "left_hand", "right_hand", "hand"}:
+            if candidate_region in {"left_arm", "right_arm", "arm", "left_hand", "right_hand", "hand"}:
+                return 0.9
+            if candidate_region == "torso":
+                return -0.45
+            if semantic_family in {"garment", "outerwear", "innerwear"}:
+                return -1.0
+            if candidate_region in {"inner_garment", "outer_garment", "garments", "sleeves"}:
+                return -0.9
+            return -0.3
+
+        if query_region in {"face", "head"}:
+            if candidate_region in {"face", "head"}:
+                return 0.95
+            return -0.8
+
+        if query_region == "torso":
+            if candidate_region == "torso":
+                return 0.95
+            if candidate_region in {"pelvis", "legs"}:
+                return -0.35
+            if semantic_family in {"garment", "outerwear", "innerwear"}:
+                return -0.5
+            return -0.2
+
+        if self._is_body_like_region(query_region):
+            if semantic_family in {"garment", "outerwear", "innerwear"}:
+                return -0.8
+            if candidate_region in {"inner_garment", "outer_garment", "garments"}:
+                return -0.9
+
+        return -0.15
+
     def _encode_visual(self, token: str, dim: int = 8) -> list[float]:
         seed = abs(hash(token)) % (2**32)
         rng = random.Random(seed)
@@ -308,42 +388,106 @@ class MemoryManager:
         return max(candidates, key=lambda c: (c.confidence, c.evidence_score))
 
     def route_region_retrieval(
-        self,
-        memory: VideoMemory,
-        region_id: str,
-        region_type: str,
-        entity_id: str,
-        query_descriptor: dict[str, float | list[float]] | None = None,
-        garment_semantics: GarmentSemanticProfile | None = None,
-        transition_context: dict[str, str] | None = None,
-        hidden_mode: str = "not_hidden",
+            self,
+            memory: VideoMemory,
+            region_id: str,
+            region_type: str,
+            entity_id: str,
+            query_descriptor: dict[str, float | list[float]] | None = None,
+            garment_semantics: GarmentSemanticProfile | None = None,
+            transition_context: dict[str, str] | None = None,
+            hidden_mode: str = "not_hidden",
     ) -> dict[str, object]:
         slot = self.retrieve_hidden_region(memory, region_id)
-        phase = (transition_context or {}).get("transition_phase", "single")
-        visibility_phase = (transition_context or {}).get("visibility_phase", "stable")
-        region_mode = (transition_context or {}).get("region_transition_mode", "")
-        hidden_bias = 0.24 if hidden_mode == "known_hidden" and slot else (-0.1 if hidden_mode == "unknown_hidden" else 0.0)
-        recency_weight = 0.18 if phase in {"lower_pelvis", "contact_chair", "garment_opening"} else 0.1
-        transition_bias = 0.12 if region_mode.startswith("garment_") or region_mode in {"pose_exposure", "expression_refine"} else 0.0
+        ctx = transition_context or {}
+        phase = ctx.get("transition_phase", "single")
+        visibility_phase = ctx.get("visibility_phase", "stable")
+        region_mode = ctx.get("region_transition_mode", "")
         hint = self._strategy_hint(region_type, visibility_phase, region_mode)
 
-        patches = [p for p in memory.texture_patches.values() if p.entity_id == entity_id and (p.region_type == region_type or hint == "visibility_transition_patch")]
-        if not patches:
-            patches = [p for p in memory.texture_patches.values() if p.entity_id == entity_id]
-        most_recent = max((p.source_frame for p in patches), default=0)
+        hidden_bias = 0.24 if hidden_mode == "known_hidden" and slot else (
+            -0.10 if hidden_mode == "unknown_hidden" else 0.0)
+        recency_weight = 0.18 if phase in {"lower_pelvis", "contact_chair", "garment_opening"} else 0.10
+        transition_bias = 0.12 if region_mode.startswith("garment_") or region_mode in {"pose_exposure",
+                                                                                        "expression_refine"} else 0.0
+
+        candidate_patches = [p for p in memory.texture_patches.values() if p.entity_id == entity_id]
+
+        # Жёсткая фильтрация для limb/body регионов.
+        if self._is_limb_region(region_type):
+            strict_limb = [
+                p
+                for p in candidate_patches
+                if
+                p.region_type in {"legs", "pelvis", "left_arm", "right_arm", "arm", "left_hand", "right_hand", "hand"}
+                or getattr(p, "semantic_family", "") in {"body", "limb", "pose", "limb_pose"}
+            ]
+            if strict_limb:
+                candidate_patches = strict_limb
+
+        elif self._is_body_like_region(region_type):
+            strict_body = [
+                p
+                for p in candidate_patches
+                if self._is_body_like_region(p.region_type)
+                   or getattr(p, "semantic_family", "") in {"face", "torso", "body", "limb", "pose", "limb_pose"}
+            ]
+            if strict_body:
+                candidate_patches = strict_body
+
+        narrowed = [
+            p
+            for p in candidate_patches
+            if p.region_type == region_type
+               or (hint == "visibility_transition_patch" and p.suitable_for_reveal)
+        ]
+        if narrowed:
+            candidate_patches = narrowed
+
+        if not candidate_patches:
+            candidate_patches = [p for p in memory.texture_patches.values() if p.entity_id == entity_id]
+
+        most_recent = max((p.source_frame for p in candidate_patches), default=0)
         scored: list[tuple[float, TexturePatchMemory, dict[str, float]]] = []
-        for patch in patches:
+
+        for patch in candidate_patches:
             recency = 1.0 / (1.0 + max(0, most_recent - patch.source_frame))
             descriptor_sim = self._descriptor_similarity(query_descriptor, patch.descriptor)
+
             hidden_slot_contrib = 0.15 if slot and patch.patch_id in slot.candidate_patch_ids else 0.0
             same_entity_bonus = 0.16 if patch.entity_id == entity_id else 0.0
             semantic_family_bonus = 0.14 if patch.semantic_family == self._semantic_family(region_type) else 0.0
             region_compat = 0.12 if patch.region_type == region_type else 0.0
-            transition_compat = 0.07 if (region_mode.startswith("garment_") and patch.semantic_family == "garment") or (region_mode == "expression_refine" and patch.semantic_family == "face") else 0.0
-            reveal_compat = 0.1 if visibility_phase == "revealing" and patch.suitable_for_reveal else 0.0
+
+            transition_compat = 0.0
+            if region_mode.startswith("garment_") and patch.semantic_family == "garment":
+                transition_compat = 0.07
+            elif region_mode == "expression_refine" and patch.semantic_family in {"face"}:
+                transition_compat = 0.07
+            elif region_mode in {"visibility_occlusion", "pose_exposure", "pose_deform"} and patch.semantic_family in {
+                "limb_pose", "torso", "body"}:
+                transition_compat = 0.06
+
+            reveal_compat = 0.10 if visibility_phase == "revealing" and patch.suitable_for_reveal else 0.0
             garment_cov_compat = self._garment_coverage_compatibility(patch, garment_semantics)
             garment_attach_compat = self._garment_attachment_compatibility(patch, garment_semantics)
-            lifecycle_compat = 0.08 if hidden_mode == "known_hidden" and hidden_slot_contrib > 0 else (0.03 if hidden_mode == "not_hidden" else -0.04)
+
+            lifecycle_compat = 0.0
+            if hidden_mode == "known_hidden":
+                lifecycle_compat = 0.08 if hidden_slot_contrib > 0 else -0.03
+            elif hidden_mode == "unknown_hidden":
+                lifecycle_compat = 0.03 if hidden_slot_contrib > 0 else -0.04
+            else:
+                lifecycle_compat = 0.03
+
+            body_region_bias = 0.0
+            if self._is_body_like_region(region_type):
+                body_region_bias = 0.35 * self._candidate_body_compatibility(
+                    query_region=region_type,
+                    candidate_region=patch.region_type,
+                    semantic_family=getattr(patch, "semantic_family", "") or "",
+                )
+
             contributions = {
                 "base_confidence": patch.confidence,
                 "evidence": 0.2 * patch.evidence_score,
@@ -359,13 +503,47 @@ class MemoryManager:
                 "attachment_compatibility": garment_attach_compat,
                 "visibility_lifecycle_compatibility": lifecycle_compat,
                 "reveal_compatibility": reveal_compat,
+                "body_region_bias": body_region_bias,
             }
+
             score = sum(contributions.values())
+
+            # Дополнительный жёсткий штраф: limb query не должна выбирать torso как хороший retrieval.
+            if region_type in {"legs", "pelvis"} and patch.region_type == "torso":
+                score -= 0.35
+                contributions["limb_torso_penalty"] = -0.35
+
+            if region_type in {"left_arm", "right_arm", "arm", "left_hand", "right_hand",
+                               "hand"} and patch.region_type == "torso":
+                score -= 0.25
+                contributions["limb_torso_penalty"] = -0.25
+
+            # Garment patch почти запрещён для body/limb query.
+            if self._is_body_like_region(region_type) and patch.region_type in {"inner_garment", "outer_garment",
+                                                                                "garments", "sleeves"}:
+                score -= 0.45
+                contributions["body_garment_penalty"] = -0.45
+
             scored.append((score, patch, contributions))
+
         scored.sort(key=lambda item: item[0], reverse=True)
+
+        # Отрезаем кандидатов с явно плохим match.
+        filtered_scored: list[tuple[float, TexturePatchMemory, dict[str, float]]] = []
+        for score, patch, contrib in scored:
+            if self._is_limb_region(region_type):
+                if patch.region_type not in {"legs", "pelvis", "left_arm", "right_arm", "arm", "left_hand",
+                                             "right_hand", "hand"}:
+                    continue
+            filtered_scored.append((score, patch, contrib))
+
+        if filtered_scored:
+            scored = filtered_scored
+
         candidates = [patch for _, patch, _ in scored[:5]]
         top_contrib = scored[0][2] if scored else {}
         top_patch = scored[0][1].patch_id if scored else "none"
+
         explanation = {
             "hint": hint,
             "slot_type": slot.hidden_type if slot else "none",
@@ -376,12 +554,15 @@ class MemoryManager:
             "region_transition_mode": region_mode,
             "candidate_count": len(candidates),
             "top_candidate": top_patch,
-            "top_candidate_why": " + ".join(f"{k}:{round(v, 3)}" for k, v in top_contrib.items()) if top_contrib else "none",
+            "top_candidate_why": " + ".join(
+                f"{k}:{round(v, 3)}" for k, v in top_contrib.items()) if top_contrib else "none",
             "similarity_contribution": round(top_contrib.get("similarity", 0.0), 4),
             "recency_contribution": round(top_contrib.get("recency", 0.0), 4),
             "hidden_slot_contribution": round(top_contrib.get("hidden_slot", 0.0), 4),
             "transition_bias_contribution": round(top_contrib.get("transition_bias", 0.0), 4),
+            "body_region_bias": round(top_contrib.get("body_region_bias", 0.0), 4),
         }
+
         return {
             "candidates": candidates,
             "strategy_hint": hint,

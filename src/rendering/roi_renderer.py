@@ -69,14 +69,12 @@ class ROISelector:
         entity = delta.affected_entities[0] if delta.affected_entities else (scene_graph.persons[0].person_id if scene_graph.persons else "scene")
         requested: list[str] = list(delta.affected_regions)
 
-        if "expression_change" in delta.semantic_reasons or delta.expression_deltas:
+        if delta.expression_deltas:
             requested.append("face")
-        if "garment_change" in delta.semantic_reasons or delta.garment_deltas:
-            requested.append("garments")
-        if "raise_arm" in delta.semantic_reasons:
-            requested.extend(["left_arm", "right_arm", "sleeves"])
-        if "sit_down" in delta.semantic_reasons:
-            requested.extend(["pelvis", "legs"])
+        if delta.garment_deltas:
+            requested.append("outer_garment")
+        if "pose_transition" in delta.semantic_reasons:
+            requested.extend(["legs", "pelvis"])
 
         for region_type in requested:
             resolved = self._resolve_region(scene_graph, entity, region_type)
@@ -99,6 +97,13 @@ class ROISelector:
             if fallback is not None:
                 dedup[fallback.region_id] = fallback
         return list(dedup.values())
+
+
+def _is_empty_roi(value) -> bool:
+    if value is None:
+        return True
+    dims = shape(value)
+    return len(dims) < 3 or dims[0] <= 0 or dims[1] <= 0 or dims[2] <= 0
 
 
 class PatchRenderer:
@@ -132,18 +137,32 @@ class PatchRenderer:
     def _normalize_semantics(self, scene_graph: SceneGraph, entity_id: str, region_type: str) -> GarmentSemanticProfile:
         return SceneGraphQueries.normalize_garment_semantics(scene_graph, entity_id, region_type)
 
-    def _select_family(self, region_type: str, delta: GraphDelta, hidden_mode: str, garment: GarmentSemanticProfile) -> tuple[str, str]:
+    def _select_family(self, region_type: str, delta: GraphDelta, hidden_mode: str, garment: GarmentSemanticProfile) -> \
+    tuple[str, str]:
         mode = delta.region_transition_mode.get(region_type, "")
+        has_garment_delta = bool(delta.garment_deltas)
+        has_reveal_signal = mode == "garment_reveal" or region_type in {"inner_garment", "outer_garment"}
         if region_type in {"face", "head"}:
             return "identity_preserving_face_refinement", "face_refine"
+        # Не загоняем torso в hidden reconstruction, если нет реального reveal/remove сигнала.
         if hidden_mode in {"known_hidden", "unknown_hidden"}:
+            if region_type == "torso" and not has_garment_delta and not has_reveal_signal and mode in {"", "stable"}:
+                return "conservative_body_update", "body_direct_update"
             return "hidden_region_reconstruction", f"hidden_{hidden_mode}"
-        if mode in {"pose_exposure", "pose_deform"} or region_type in {"left_arm", "right_arm", "legs", "pelvis"}:
-            return "pose_driven_body_garment_local_deformation", "pose_local_deform"
-        if garment.entity_class == "garment" and garment.semantic_confidence >= 0.25:
-            if garment.exposure_behavior == "revealing" or mode in {"reveal_inner", "open_front", "remove_outer"}:
-                return "inner_region_reveal_synthesis", "garment_reveal"
+        if mode == "garment_reveal" and region_type in {"inner_garment", "torso"}:
+            return "inner_region_reveal_synthesis", "garment_reveal"
+        if region_type in {"outer_garment", "garments"}:
             return "garment_surface_transition", "garment_surface_update"
+        if garment.entity_class == "garment":
+            if mode in {"garment_surface", "open_front", "remove_outer"}:
+                return "garment_surface_transition", "garment_surface_update"
+            if garment.semantic_confidence >= 0.18:
+                return "garment_surface_transition", "garment_surface_update"
+        if mode in {"pose_exposure", "pose_deform", "visibility_occlusion"} or region_type in {"left_arm", "right_arm",
+                                                                                               "legs", "pelvis"}:
+            return "pose_driven_body_garment_local_deformation", "pose_local_deform"
+        if region_type in {"torso", "pelvis", "legs", "left_arm", "right_arm", "arm"}:
+            return "conservative_body_update", "body_direct_update"
         return "conservative_fallback_repair", "fallback_repair"
 
     def _pre_hidden_mode(self, memory: VideoMemory, region_id: str) -> str:
@@ -208,7 +227,14 @@ class PatchRenderer:
             return "unknown_hidden", evidence
         return "not_hidden", evidence
 
-    def _build_plan(self, scene_graph: SceneGraph, delta: GraphDelta, memory: VideoMemory, region: RegionRef, roi: list[list[list[float]]]) -> PatchSynthesisPlan:
+    def _build_plan(
+            self,
+            scene_graph: SceneGraph,
+            delta: GraphDelta,
+            memory: VideoMemory,
+            region: RegionRef,
+            roi: list[list[list[float]]],
+    ) -> PatchSynthesisPlan:
         entity_id, region_type = parse_region_id(region.region_id)
         garment = self._normalize_semantics(scene_graph, entity_id, region_type)
         query_desc = self.memory_manager._patch_descriptor(roi)
@@ -245,9 +271,18 @@ class PatchRenderer:
         )
         family, strategy = self._select_family(region_type, delta, hidden_mode, garment)
 
-        retrieval_mode = "retrieval_first" if hidden_mode == "known_hidden" else ("hypothesis_first" if hidden_mode == "unknown_hidden" else "evidence_aware")
+        # Если стратегия уже не hidden, не тащим hidden mode дальше в plan.
+        effective_hidden_mode = hidden_mode
+        if strategy in {"body_direct_update", "pose_local_deform", "face_refine"}:
+            effective_hidden_mode = "not_hidden"
+
+        retrieval_mode = "retrieval_first" if effective_hidden_mode == "known_hidden" else (
+            "hypothesis_first" if effective_hidden_mode == "unknown_hidden" else "evidence_aware"
+        )
+
         candidate_count = int((retrieval.get("summary") or {}).get("candidate_count", 0))
         top_score = float(retrieval.get("top_score", 0.0))
+
         proposal_mode = "deterministic"
         if strategy == "face_refine":
             proposal_mode = "identity_expression_refine"
@@ -261,7 +296,10 @@ class PatchRenderer:
             proposal_mode = "semantic_surface_transition"
         elif strategy == "pose_local_deform":
             proposal_mode = "pose_guided_deformation"
-        if candidate_count > 0 and top_score > 0.7 and hidden_mode == "known_hidden":
+        elif strategy == "body_direct_update":
+            proposal_mode = "body_region_update"
+
+        if candidate_count > 0 and top_score > 0.7 and effective_hidden_mode == "known_hidden":
             proposal_mode = "retrieval_guided_recall"
 
         return PatchSynthesisPlan(
@@ -273,17 +311,20 @@ class PatchRenderer:
             selected_strategy=strategy,
             retrieval_mode=retrieval_mode,
             retrieval_summary=retrieval,
-            hidden_reconstruction_mode=hidden_mode,
+            hidden_reconstruction_mode=effective_hidden_mode,
             transition_mode=delta.region_transition_mode.get(region_type, "stable"),
             garment_semantics=garment,
             risk_profile={
                 "seam_sensitivity": 0.55 if region_type in {"face", "torso"} else 0.42,
-                "retrieval_dependency": 0.75 if hidden_mode == "known_hidden" else 0.45,
+                "retrieval_dependency": 0.75 if effective_hidden_mode == "known_hidden" else 0.25,
             },
             confidence_prior=0.58 if strategy not in {"fallback_repair", "hidden_unknown_hidden"} else 0.34,
-            seam_sensitivity=0.64 if region_type in {"face", "head"} else (0.52 if region_type in {"torso", "pelvis"} else 0.43),
+            seam_sensitivity=0.64 if region_type in {"face", "head"} else (
+                0.52 if region_type in {"torso", "pelvis"} else 0.43),
             proposal_mode=proposal_mode,
-            refinement_mode="identity_safe" if strategy == "face_refine" else ("seam_preserving" if hidden_mode in {"known_hidden", "unknown_hidden"} else "conservative"),
+            refinement_mode="identity_safe" if strategy == "face_refine" else (
+                "seam_preserving" if effective_hidden_mode in {"known_hidden", "unknown_hidden"} else "conservative"
+            ),
             explainability={"hidden_evidence": hidden_evidence, "reason": region.reason},
         )
 
@@ -332,46 +373,122 @@ class PatchRenderer:
         return {"inner_reveal_strength": reveal_strength, "coverage_targets": gs.coverage_targets}
 
     def _apply_pose_deform(self, proposal: list[list[list[float]]], region_type: str) -> dict[str, object]:
-        h, w, _ = shape(proposal)
-        region_scale = {
-            "left_arm": 0.018,
-            "right_arm": 0.018,
-            "sleeves": 0.017,
-            "torso": 0.012,
-            "pelvis": 0.014,
-            "legs": 0.016,
-        }.get(region_type, 0.01)
+        h, w, c = shape(proposal)
+        out = zeros(h, w, c)
+
+        bend_strength = {
+            "left_arm": 0.04,
+            "right_arm": 0.04,
+            "sleeves": 0.035,
+            "torso": 0.025,
+            "pelvis": 0.05,
+            "legs": 0.07,
+        }.get(region_type, 0.02)
+
         for y in range(h):
             yn = y / max(1, h - 1)
-            for x in range(w):
-                xn = x / max(1, w - 1)
-                lateral = 1.0 - abs(xn - 0.5)
-                proposal[y][x][2] = max(0.0, min(1.0, proposal[y][x][2] + region_scale * lateral * yn))
-        return {"pose_region_scale": region_scale, "region_type": region_type}
 
-    def _build_proposal(self, roi: list[list[list[float]]], memory: VideoMemory, plan: PatchSynthesisPlan, delta: GraphDelta) -> tuple[list[list[list[float]]], dict[str, object]]:
+            if region_type == "legs":
+                shift_x = int(round((0.5 - abs(yn - 0.55)) * bend_strength * w))
+                shift_y = int(round(yn * bend_strength * h * 0.35))
+            elif region_type == "pelvis":
+                shift_x = int(round((0.5 - abs(yn - 0.5)) * bend_strength * w * 0.6))
+                shift_y = int(round(yn * bend_strength * h * 0.2))
+            else:
+                shift_x = int(round((0.5 - abs(yn - 0.5)) * bend_strength * w * 0.4))
+                shift_y = 0
+
+            for x in range(w):
+                src_x = min(w - 1, max(0, x - shift_x))
+                src_y = min(h - 1, max(0, y - shift_y))
+                for k in range(c):
+                    out[y][x][k] = proposal[src_y][src_x][k]
+
+        return {
+            "pose_region_scale": bend_strength,
+            "region_type": region_type,
+            "warp_like_deform": True,
+            "proposal": out,
+        }
+
+    def _build_proposal(
+            self,
+            roi: list[list[list[float]]],
+            memory: VideoMemory,
+            plan: PatchSynthesisPlan,
+            delta: GraphDelta,
+    ) -> tuple[list[list[list[float]]], dict[str, object]]:
         proposal = [[px[:] for px in row] for row in roi]
         retrieval_candidates = plan.retrieval_summary.get("candidates") or []
         top = retrieval_candidates[0] if retrieval_candidates else None
         trace: dict[str, object] = {"proposal_mode": plan.proposal_mode}
 
-        if top:
+        allow_retrieval = True
+
+        # Для pose регионов запрещаем retrieval, если region mismatch.
+        if plan.selected_strategy == "pose_local_deform" and top is not None:
+            if plan.region_type in {"legs", "pelvis"} and top.region_type not in {"legs", "pelvis"}:
+                allow_retrieval = False
+                trace["retrieval_rejected"] = f"pose_region_mismatch:{top.region_type}"
+            elif plan.region_type in {"left_arm", "right_arm", "arm", "left_hand", "right_hand",
+                                      "hand"} and top.region_type not in {
+                "left_arm",
+                "right_arm",
+                "arm",
+                "left_hand",
+                "right_hand",
+                "hand",
+            }:
+                allow_retrieval = False
+                trace["retrieval_rejected"] = f"pose_region_mismatch:{top.region_type}"
+
+        # Для body direct update тоже не даём грязный retrieval с чужого региона.
+        if plan.selected_strategy == "body_direct_update" and top is not None:
+            if plan.region_type == "torso" and top.region_type != "torso":
+                allow_retrieval = False
+                trace["retrieval_rejected"] = f"body_region_mismatch:{top.region_type}"
+
+        if top and allow_retrieval:
             mem_patch = memory.patch_cache.get(top.patch_id)
             if mem_patch:
-                blend = 0.56 if plan.hidden_reconstruction_mode == "known_hidden" else (0.36 if plan.selected_strategy in {"garment_reveal", "garment_surface_update"} else 0.25)
-                proposal = self._blend_memory_patch(proposal, mem_patch, blend)
-                trace["retrieval_patch"] = top.patch_id
-                trace["retrieval_blend"] = blend
+                if plan.selected_strategy == "face_refine":
+                    blend = 0.18
+                elif plan.selected_strategy == "garment_surface_update":
+                    blend = 0.24
+                elif plan.selected_strategy == "garment_reveal":
+                    blend = 0.18
+                elif plan.selected_strategy == "body_direct_update":
+                    blend = 0.12
+                elif plan.selected_strategy == "pose_local_deform":
+                    blend = 0.0
+                elif plan.hidden_reconstruction_mode == "known_hidden":
+                    blend = 0.40
+                elif plan.hidden_reconstruction_mode == "unknown_hidden":
+                    blend = 0.14
+                else:
+                    blend = 0.10
+
+                if blend > 0.0:
+                    proposal = self._blend_memory_patch(proposal, mem_patch, blend)
+                    trace["retrieval_patch"] = top.patch_id
+                    trace["retrieval_blend"] = blend
+                else:
+                    trace["retrieval_patch_skipped"] = top.patch_id
+                    trace["retrieval_blend"] = 0.0
 
         if plan.selected_strategy == "face_refine":
             expr = float(delta.expression_deltas.get("smile_intensity", 0.0) if delta.expression_deltas else 0.0)
             trace.update(self._apply_face_refinement(proposal, expr))
+
         elif plan.selected_strategy == "garment_surface_update":
             trace.update(self._apply_garment_surface(proposal, plan))
+
         elif plan.selected_strategy == "garment_reveal":
             trace.update(self._apply_inner_reveal(proposal, plan))
+
         elif plan.selected_strategy == "hidden_known_hidden":
             trace["known_hidden_recall"] = True
+
         elif plan.selected_strategy == "hidden_unknown_hidden":
             h, w, c = shape(proposal)
             mc = mean_color(roi)
@@ -382,10 +499,31 @@ class PatchRenderer:
                         jitter = (spatial - 0.5) * 0.04
                         proposal[y][x][k] = max(0.0, min(1.0, proposal[y][x][k] * 0.82 + mc[k] * 0.18 + jitter))
             trace["hypothesis_based"] = True
+
         elif plan.selected_strategy == "pose_local_deform":
-            trace.update(self._apply_pose_deform(proposal, plan.region_type))
+            deform_trace = self._apply_pose_deform(proposal, plan.region_type)
+            if "proposal" in deform_trace:
+                proposal = deform_trace.pop("proposal")
+            trace.update(deform_trace)
+
+        elif plan.selected_strategy == "body_direct_update":
+            h, w, c = shape(proposal)
+            out = zeros(h, w, c)
+            for y in range(h):
+                yn = y / max(1, h - 1)
+                for x in range(w):
+                    xn = x / max(1, w - 1)
+                    center = 1.0 - abs(xn - 0.5)
+                    vertical = 1.0 - yn
+                    scale = 1.0 + 0.006 * center * vertical
+                    for k in range(c):
+                        out[y][x][k] = max(0.0, min(1.0, proposal[y][x][k] * scale))
+            proposal = out
+            trace["body_direct_update"] = True
+
         else:
             trace["fallback_reason"] = "strategy_default"
+
         return proposal, trace
 
     def _refine_proposal(self, proposal: list[list[list[float]]], plan: PatchSynthesisPlan) -> tuple[list[list[list[float]]], dict[str, object]]:
@@ -408,22 +546,50 @@ class PatchRenderer:
         top_score = float(plan.retrieval_summary.get("top_score", 0.0))
         top_breakdown = plan.retrieval_summary.get("top_score_breakdown", {})
         garment = plan.garment_semantics
-        semantic_completeness = 0.35 + 0.15 * bool(garment.coverage_targets) + 0.15 * bool(garment.attachment_targets) + 0.15 * bool(garment.deformation_mode != "unknown")
-        semantic_compatibility = float(plan.retrieval_summary.get("top_semantic_compatibility", 0.0)) + 0.25 * float(top_breakdown.get("similarity", 0.0))
-        hidden_prior = 0.86 if plan.hidden_reconstruction_mode == "known_hidden" else (0.22 if plan.hidden_reconstruction_mode == "unknown_hidden" else 0.5)
+
+        semantic_completeness = (
+                0.35
+                + 0.15 * bool(garment.coverage_targets)
+                + 0.15 * bool(garment.attachment_targets)
+                + 0.15 * bool(garment.deformation_mode != "unknown")
+        )
+
+        semantic_compatibility = float(plan.retrieval_summary.get("top_semantic_compatibility", 0.0)) + 0.25 * float(
+            top_breakdown.get("similarity", 0.0)
+        )
+
+        if plan.selected_strategy in {"pose_local_deform", "body_direct_update", "face_refine"}:
+            hidden_prior = 0.5
+            hallucination_risk = 0.18 if plan.selected_strategy != "face_refine" else 0.12
+        else:
+            hidden_prior = 0.86 if plan.hidden_reconstruction_mode == "known_hidden" else (
+                0.22 if plan.hidden_reconstruction_mode == "unknown_hidden" else 0.5
+            )
+            hallucination_risk = 0.82 if plan.hidden_reconstruction_mode == "unknown_hidden" else 0.24
+
+        missing_evidence_penalty = 0.34 if not plan.retrieval_summary.get("candidates") else 0.0
+
+        # Если у pose/body retrieval слабый или region-mismatch, уменьшаем влияние retrieval.
+        if plan.selected_strategy in {"pose_local_deform", "body_direct_update"}:
+            retrieval_evidence = min(0.35, max(0.0, min(1.0, top_score)))
+        else:
+            retrieval_evidence = max(0.0, min(1.0, top_score))
+
         return self.confidence_estimator.estimate(
             {
                 "strategy_prior": plan.confidence_prior,
-                "retrieval_evidence": max(0.0, min(1.0, top_score)),
+                "retrieval_evidence": retrieval_evidence,
                 "semantic_compatibility": max(0.0, min(1.0, semantic_compatibility)),
                 "garment_semantics_completeness": max(0.0, min(1.0, semantic_completeness)),
                 "hidden_prior": hidden_prior,
-                "transition_difficulty": 0.67 if plan.transition_mode in {"remove_outer", "open_front", "pose_exposure"} else 0.42,
-                "region_difficulty": 0.76 if plan.region_type in {"face", "head"} else (0.54 if plan.region_type in {"torso", "pelvis"} else 0.45),
+                "transition_difficulty": 0.67 if plan.transition_mode in {"remove_outer", "open_front",
+                                                                          "pose_exposure"} else 0.42,
+                "region_difficulty": 0.76 if plan.region_type in {"face", "head"} else (
+                    0.54 if plan.region_type in {"torso", "pelvis"} else 0.45),
                 "seam_risk": plan.seam_sensitivity,
-                "hallucination_risk": 0.82 if plan.hidden_reconstruction_mode == "unknown_hidden" else 0.24,
+                "hallucination_risk": hallucination_risk,
                 "fallback_penalty": 0.28 if plan.selected_strategy == "fallback_repair" else 0.0,
-                "missing_evidence_penalty": 0.34 if not plan.retrieval_summary.get("candidates") else 0.0,
+                "missing_evidence_penalty": missing_evidence_penalty,
             },
             strategy=plan.selected_strategy,
         )
@@ -441,7 +607,7 @@ class PatchRenderer:
         _ = (image_tensor, crop_tensor)
         x0, y0, x1, y1 = self._bbox_to_pixels(region.bbox, current_frame)
         roi = crop(current_frame, x0, y0, x1, y1)
-        if not roi or not roi[0]:
+        if _is_empty_roi(roi):
             roi = zeros(32, 32, 3)
 
         plan = self._build_plan(scene_graph, delta, memory, region, roi)

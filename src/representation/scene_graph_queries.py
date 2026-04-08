@@ -120,6 +120,25 @@ class SceneGraphQueries:
 
         Важно: token hints здесь только слабый сигнал, основной приоритет у graph/coverage/attachment.
         """
+        body_regions = {"face", "head", "torso", "left_arm", "right_arm", "arm", "legs", "pelvis", "sleeves"}
+        if region_type in body_regions:
+            return GarmentSemanticProfile(
+                entity_class="body",
+                raw_label=region_type,
+                layer_role="unknown",
+                coverage_targets=[region_type],
+                attachment_targets=[region_type],
+                front_openable=None,
+                removable=False,
+                sleeve_presence="unknown",
+                sleeve_length_hint="unknown",
+                fit_hint="unknown",
+                deformation_mode="body_driven",
+                occlusion_priority=0.4,
+                exposure_behavior="stable",
+                semantic_confidence=0.6,
+            )
+
         person = cls._person(scene_graph, person_id)
         if person is None:
             return GarmentSemanticProfile(raw_label=raw_label or "unknown", semantic_confidence=0.0)

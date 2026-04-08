@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: gennady-i2v
+Version: 0.1.0
+Summary: Modular scene-graph driven image-to-video engine prototype
+Requires-Python: <3.12,>=3.10
+Requires-Dist: numpy>=2.2.6
+Requires-Dist: pillow<12.2.0,>=12.1.0
+Provides-Extra: perception-real
+Requires-Dist: numpy>=1.24; extra == "perception-real"
+Requires-Dist: ultralytics>=8.2; extra == "perception-real"
+Requires-Dist: mediapipe>=0.10; extra == "perception-real"
+Requires-Dist: transformers>=4.40; extra == "perception-real"
+Requires-Dist: torch>=2.2; extra == "perception-real"
+Requires-Dist: torchvision>=0.17; extra == "perception-real"
+Requires-Dist: pillow>=10.0; extra == "perception-real"

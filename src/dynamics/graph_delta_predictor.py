@@ -73,12 +73,12 @@ class GraphDeltaPredictor:
 
         if person:
             delta.affected_entities.append(person.person_id)
-            delta.state_before = self._build_state_before(scene_graph, person.person_id, person.expression_state.label or "neutral")
+            delta.state_before = self._build_state_before(scene_graph, person, person.expression_state.label or "neutral")
 
         diagnostics = TransitionDiagnostics()
         family_deltas = self._compute_family_deltas(intent, model_out)
         self._merge_family_deltas(delta, family_deltas, diagnostics)
-        self._derive_visibility_consequences(scene_graph, person, intent, delta)
+        self._derive_visibility_consequences(scene_graph, person, intent, delta, diagnostics)
         self._derive_region_transition_modes(intent, delta)
 
         if person:
@@ -303,12 +303,6 @@ class GraphDeltaPredictor:
                 "weight_transfer": intent.pose.weight_shift,
             }
 
-        if "visibility" in intent.action_families:
-            out["visibility"] = {
-                region: "visible" for region in intent.visibility.reveal_regions
-            }
-            for region in intent.visibility.occlude_regions:
-                out["visibility"][region] = "partially_visible"
         return out
 
     def _merge_family_deltas(self, delta: GraphDelta, family_deltas: dict[str, dict[str, float | str]], diagnostics: TransitionDiagnostics) -> None:
@@ -317,7 +311,6 @@ class GraphDeltaPredictor:
         delta.garment_deltas.update(family_deltas["garment"])
         delta.expression_deltas.update(family_deltas["expression"])
         delta.interaction_deltas.update({k: float(v) for k, v in family_deltas["interaction"].items()})
-        delta.visibility_deltas.update(family_deltas["visibility"])
 
         delta.semantic_reasons.extend(
             reason for reason, payload in (
@@ -340,29 +333,55 @@ class GraphDeltaPredictor:
         }
 
     def _derive_visibility_consequences(
-        self,
-        scene_graph: SceneGraph,
-        person,
-        intent: TransitionIntent,
-        delta: GraphDelta,
+            self,
+            scene_graph: SceneGraph,
+            person,
+            intent: TransitionIntent,
+            delta: GraphDelta,
+            diagnostics: TransitionDiagnostics,
     ) -> None:
         """Отдельный шаг вычисления visibility/occlusion последствий."""
+
         reveal_state = "visible" if intent.memory.visibility_safety >= 0.45 else "partially_visible"
+
         for region in intent.visibility.reveal_regions:
             delta.predicted_visibility_changes[region] = reveal_state
+            delta.visibility_deltas[region] = reveal_state
+
         for region in intent.visibility.occlude_regions:
             delta.predicted_visibility_changes[region] = "partially_visible"
+            delta.visibility_deltas[region] = "partially_visible"
+
         for region in intent.visibility.stable_regions:
             delta.predicted_visibility_changes.setdefault(region, "visible")
+            delta.visibility_deltas.setdefault(region, "visible")
+
+        if delta.visibility_deltas and "visibility_transition" not in delta.semantic_reasons:
+            delta.semantic_reasons.append("visibility_transition")
+
+        delta.affected_regions = sorted(set(delta.affected_regions + list(delta.visibility_deltas.keys())))
+        diagnostics.family_contribution["visibility"] = float(len(delta.visibility_deltas))
 
         if person:
             for region in intent.visibility.reveal_regions:
                 delta.newly_revealed_regions.append(
-                    self._region_from_person(scene_graph, person.person_id, person.bbox, region, f"visibility_reveal:{intent.planner.phase}")
+                    self._region_from_person(
+                        scene_graph,
+                        person.person_id,
+                        person.bbox,
+                        region,
+                        f"visibility_reveal:{intent.planner.phase}",
+                    )
                 )
             for region in intent.visibility.occlude_regions:
                 delta.newly_occluded_regions.append(
-                    self._region_from_person(scene_graph, person.person_id, person.bbox, region, f"visibility_occlude:{intent.planner.phase}")
+                    self._region_from_person(
+                        scene_graph,
+                        person.person_id,
+                        person.bbox,
+                        region,
+                        f"visibility_occlude:{intent.planner.phase}",
+                    )
                 )
 
     def _derive_region_transition_modes(self, intent: TransitionIntent, delta: GraphDelta) -> None:
@@ -379,21 +398,26 @@ class GraphDeltaPredictor:
         if "expression" in intent.action_families:
             delta.region_transition_mode["face"] = "expression_refine"
 
-    def _build_state_before(self, scene_graph: SceneGraph, person_id: str, expression_label: str) -> dict[str, str]:
-        support_targets = SceneGraphQueries.get_supported_by(scene_graph, person_id)
-        visible = SceneGraphQueries.get_visible_regions(scene_graph, person_id)
-        occluded = SceneGraphQueries.get_occluded_regions(scene_graph, person_id)
-        attached_garments = SceneGraphQueries.get_attached_garments(scene_graph, person_id)
+    def _build_state_before(self, scene_graph: SceneGraph, person, expression_label: str) -> dict[str, str]:
+        support_targets = SceneGraphQueries.get_supported_by(scene_graph, person.person_id)
+        visible = SceneGraphQueries.get_visible_regions(scene_graph, person.person_id)
+        occluded = SceneGraphQueries.get_occluded_regions(scene_graph, person.person_id)
+        attached_garments = SceneGraphQueries.get_attached_garments(scene_graph, person.person_id)
+
+        pose_state = person.pose_state.coarse_pose or "standing"
+
         return {
-            "pose_state": "standing" if support_targets else "free",
+            "pose_state": pose_state,
             "garment_state": "worn" if attached_garments else "removed",
             "visibility_state": "hidden" if len(occluded) > len(visible) else "visible",
             "interaction_state": "support" if support_targets else "free_contact",
             "expression_state": expression_label,
         }
 
-    def _derive_state_after(self, delta: GraphDelta, before: dict[str, str], intent: TransitionIntent) -> dict[str, str]:
+    def _derive_state_after(self, delta: GraphDelta, before: dict[str, str], intent: TransitionIntent) -> dict[
+        str, str]:
         """Агрегирует state_after из intent + sub-deltas."""
+
         pose_state = before.get("pose_state", "stable")
         if intent.pose.target_pose in {"sitting", "standing", "arm_raised", "head_turned"}:
             pose_state = intent.pose.target_pose
@@ -402,12 +426,28 @@ class GraphDeltaPredictor:
         if garment_state == "half_removed" and intent.planner.phase == "stabilize":
             garment_state = "stabilized_removed"
 
-        visibility_state = "revealing" if delta.newly_revealed_regions else before.get("visibility_state", "visible")
-        if delta.newly_occluded_regions and not delta.newly_revealed_regions:
+        visibility_state = before.get("visibility_state", "visible")
+        if delta.newly_revealed_regions:
+            visibility_state = "revealing"
+        elif delta.newly_occluded_regions:
             visibility_state = "occluding"
 
-        interaction_state = intent.interaction.support_progression if intent.interaction.support_progression != "free" else before.get("interaction_state", "free_contact")
-        expression_state = str(delta.expression_deltas.get("expression_progression", before.get("expression_state", "neutral")))
+        support_contact = float(delta.interaction_deltas.get("support_contact", 0.0))
+        if support_contact >= 0.85:
+            interaction_state = "weight_transfer"
+        elif support_contact >= 0.65:
+            interaction_state = "contact_established"
+        elif support_contact >= 0.35:
+            interaction_state = "approach_contact"
+        else:
+            interaction_state = (
+                intent.interaction.support_progression
+                if intent.interaction.support_progression != "free"
+                else before.get("interaction_state", "free_contact")
+            )
+
+        expression_state = str(
+            delta.expression_deltas.get("expression_progression", before.get("expression_state", "neutral")))
 
         return {
             "pose_state": pose_state,

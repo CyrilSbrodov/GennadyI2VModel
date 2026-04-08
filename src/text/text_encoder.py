@@ -64,11 +64,14 @@ class BaselineStructuredTextEncoder(TextConditioningEncoder):
             confidence_embedding=confidence_embedding,
         )
 
+        resolved_target_count = sum(1 for t in target_block.grounded_targets if not t.unresolved)
+
         diagnostics = self._build_diagnostics(
             parsed_intent=parsed_intent,
             action_count=len(action_block.structured_action_tokens),
             family_distribution=action_block.family_distribution,
-            grounded_target_count=len(target_block.grounded_targets),
+            target_count=len(target_block.grounded_targets),
+            resolved_target_count=resolved_target_count,
             unresolved_target_count=target_block.unresolved_target_count,
             weak_grounding_count=target_block.weak_grounding_count,
             constraint_count=len(constraints),
@@ -188,7 +191,8 @@ class BaselineStructuredTextEncoder(TextConditioningEncoder):
         parsed_intent: ParsedIntent,
         action_count: int,
         family_distribution: dict[str, int],
-        grounded_target_count: int,
+        target_count: int,
+        resolved_target_count: int,
         unresolved_target_count: int,
         weak_grounding_count: int,
         constraint_count: int,
@@ -200,7 +204,8 @@ class BaselineStructuredTextEncoder(TextConditioningEncoder):
         return TextEncodingDiagnostics(
             action_count=action_count,
             family_distribution=family_distribution,
-            grounded_target_count=grounded_target_count,
+            target_count=target_count,
+            resolved_target_count=resolved_target_count,
             unresolved_target_count=unresolved_target_count,
             weak_grounding_count=weak_grounding_count,
             temporal_relation_count=len(parsed_intent.temporal_relations),
@@ -228,6 +233,11 @@ class BaselineStructuredTextEncoder(TextConditioningEncoder):
     ) -> dict[str, object]:
         """Формирует прямые hints для planner/dynamics/renderer/memory."""
 
+        has_unresolved = any(getattr(t, "unresolved", False) for t in grounded_targets)
+        has_weak_grounding = any(float(getattr(t, "grounding_confidence", 1.0)) < 0.6 for t in grounded_targets)
+        critical_constraints = any(c in {"requires:chair", "requires:outer_garment"} for c in constraints)
+        requires_conservative_routing = has_unresolved or has_weak_grounding or critical_constraints
+
         return {
             "planner": {
                 "action_families": [fam for fam, flag in family_presence.items() if flag > 0.0],
@@ -252,7 +262,9 @@ class BaselineStructuredTextEncoder(TextConditioningEncoder):
                 },
             },
             "renderer": {
-                "reveal_hints": any(tok in {"reveal", "show", "uncover", "reveal_inner"} for tok in action_tokens),
+                "reveal_hints": any(
+                    tok in {"reveal", "show", "uncover", "reveal_inner", "remove", "remove_garment"} for tok in
+                    action_tokens),
                 "face_refinement_hints": family_presence.get("expression", 0.0) > 0,
                 "garment_transition_hints": family_presence.get("garment", 0.0) > 0,
                 "visibility_hints": family_presence.get("visibility", 0.0) > 0,
@@ -261,8 +273,8 @@ class BaselineStructuredTextEncoder(TextConditioningEncoder):
                 "target_family_hints": [getattr(t, "target_entity_class", "") for t in grounded_targets],
                 "scene_grounding_hints": [getattr(t, "resolution_reason", "") for t in grounded_targets],
                 "ambiguity_safety_hints": {
-                    "has_unresolved": any(getattr(t, "unresolved", False) for t in grounded_targets),
-                    "requires_conservative_routing": any(c.startswith("requires:") for c in constraints),
+                    "has_unresolved": has_unresolved,
+                    "requires_conservative_routing": requires_conservative_routing,
                 },
             },
         }

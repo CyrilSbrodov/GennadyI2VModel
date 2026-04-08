@@ -23,7 +23,9 @@ class TextEncodingDiagnostics:
 
     action_count: int = 0
     family_distribution: dict[str, int] = field(default_factory=dict)
+    target_count: int = 0
     grounded_target_count: int = 0
+    resolved_target_count: int = 0
     unresolved_target_count: int = 0
     weak_grounding_count: int = 0
     temporal_relation_count: int = 0

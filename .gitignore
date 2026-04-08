@@ -2,3 +2,5 @@ out/
 .venv/
 .idea/
 validation/
+input/
+output/

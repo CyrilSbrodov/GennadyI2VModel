@@ -2,10 +2,10 @@
 name = "gennady-i2v"
 version = "0.1.0"
 description = "Modular scene-graph driven image-to-video engine prototype"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.12"
 dependencies = [
     "numpy>=2.2.6",
-    "pillow>=12.2.0",
+    "pillow>=12.1.0,<12.2.0",
 ]
 
 [tool.pytest.ini_options]
@@ -19,6 +19,15 @@ perception-real = [
   "mediapipe>=0.10",
   "transformers>=4.40",
   "torch>=2.2",
+  "torchvision>=0.17",
   "pillow>=10.0",
-  #"facer>=0.0.7",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
+torchvision = { index = "pytorch-cu121" }
