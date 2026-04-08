@@ -4,19 +4,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from core.schema import ActionPlan, GraphDelta, RegionRef, SceneGraph, VideoMemory
-
-
-@dataclass(slots=True)
-class TextEncodingOutput:
-    action_embedding: list[float]
-    structured_action_tokens: list[str]
-    target_hints: dict[str, list[str]] = field(default_factory=dict)
-    temporal_hints: dict[str, object] = field(default_factory=dict)
-    decomposition_hints: list[dict[str, object]] = field(default_factory=list)
-    constraints: list[str] = field(default_factory=list)
-    confidence: float = 0.0
-    alignment: dict[str, object] = field(default_factory=dict)
-    trace: list[str] = field(default_factory=list)
+from text.encoder_contracts import TextEncodingOutput
 
 
 @dataclass(slots=True)

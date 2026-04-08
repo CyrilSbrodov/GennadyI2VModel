@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from core.schema import ActionStep, GraphDelta, SceneGraph, VideoMemory
 from dynamics.graph_delta_predictor import DynamicsMetrics, GraphDeltaPredictor
 from learned.interfaces import DynamicsTransitionModel, DynamicsTransitionOutput, DynamicsTransitionRequest
+from text.encoder_contracts import TextEncodingDiagnostics
 
 
 @dataclass(slots=True)
@@ -108,7 +109,21 @@ class LearnedReadyTransitionEngine:
 def request_text_summary(tokens: list[str]):
     from learned.interfaces import TextEncodingOutput
 
-    return TextEncodingOutput(action_embedding=[float(len(tokens))], structured_action_tokens=tokens, confidence=0.5)
+    return TextEncodingOutput(
+        global_text_embedding=[1.0],
+        action_embedding=[float(len(tokens))],
+        target_embedding=[0.0],
+        modifier_embedding=[0.0],
+        temporal_embedding=[0.0],
+        constraint_embedding=[0.0],
+        grounding_embedding=[0.0],
+        structured_action_tokens=tokens,
+        grounded_targets=[],
+        parser_confidence=0.5,
+        encoder_confidence=0.5,
+        diagnostics=TextEncodingDiagnostics(action_count=len(tokens), parser_confidence=0.5, encoder_confidence=0.5),
+        confidence=0.5,
+    )
 
 
 def _metrics_from_delta(delta: GraphDelta) -> DynamicsMetrics:

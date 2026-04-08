@@ -138,6 +138,11 @@ class IntentParser:
         parsed_intent = self._parse_to_structured_intent(text, scene_graph=scene_graph)
         return self._build_action_plan(parsed_intent)
 
+    def parse_to_structured_intent(self, text: str, scene_graph: SceneGraph | None = None) -> ParsedIntent:
+        """Публичный API для structured intent без сборки ActionPlan."""
+
+        return self._parse_to_structured_intent(text, scene_graph=scene_graph)
+
     def _parse_to_structured_intent(self, text: str, scene_graph: SceneGraph | None) -> ParsedIntent:
         """Основной пайплайн: normalize -> clauses -> candidates -> grounding -> temporal."""
 
