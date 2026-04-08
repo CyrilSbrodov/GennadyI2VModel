@@ -7,6 +7,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean
 
+from evaluation.dataset import (
+    BenchmarkRecord,
+    dataset_diagnostics_to_dict,
+    load_benchmark_dataset,
+)
 from learned.factory import BackendConfig
 from runtime.orchestrator import GennadyEngine
 
@@ -182,7 +187,7 @@ def _stage_health_from_debug(debug: dict[str, object]) -> dict[str, object]:
     }
 
 
-def _scenario_metrics(spec: ScenarioSpec, artifacts: object) -> dict[str, object]:
+def _scenario_metrics(spec: ScenarioSpec, artifacts: object, *, record: BenchmarkRecord | None = None) -> dict[str, object]:
     state_plan = getattr(artifacts, "state_plan", None)
     steps = getattr(state_plan, "steps", []) if state_plan is not None else []
     labels = [label.lower() for s in steps if hasattr(s, "labels") for label in (s.labels or [])]
@@ -235,7 +240,7 @@ def _scenario_metrics(spec: ScenarioSpec, artifacts: object) -> dict[str, object
         6,
     )
 
-    return {
+    payload: dict[str, object] = {
         "scenario_id": spec.scenario_id,
         "prompt": spec.prompt,
         "expected": {
@@ -262,12 +267,22 @@ def _scenario_metrics(spec: ScenarioSpec, artifacts: object) -> dict[str, object
         },
         "stage_health": stage_health,
     }
+    if record is not None:
+        payload["dataset_record"] = {
+            "record_id": record.record_id,
+            "asset_id": record.asset_id,
+            "asset_path": record.asset_path,
+            "tags": record.tags,
+            "notes": record.notes,
+            "weak_expectations": record.weak_expectations,
+        }
+    return payload
 
 
-def _run_single_scenario(image_path: str, scenario: ScenarioSpec, backend_mode: str) -> dict[str, object]:
+def _run_single_scenario(image_path: str, scenario: ScenarioSpec, backend_mode: str, *, record: BenchmarkRecord | None = None) -> dict[str, object]:
     engine = GennadyEngine(backend_config=_backend_config_for_mode(backend_mode))
     artifacts = engine.run([image_path], scenario.prompt, quality_profile="debug", duration=2.5)
-    return _scenario_metrics(scenario, artifacts)
+    return _scenario_metrics(scenario, artifacts, record=record)
 
 
 def run_stage_eval(image_path: str, text: str, backend_mode: str = "learned_primary") -> dict[str, object]:
@@ -289,25 +304,100 @@ def run_stage_eval(image_path: str, text: str, backend_mode: str = "learned_prim
     }
 
 
+def _record_to_scenario(record: BenchmarkRecord) -> ScenarioSpec:
+    return ScenarioSpec(
+        scenario_id=record.scenario_id,
+        prompt=record.canonical_prompt,
+        action_family=record.action_family,
+        transition_family=record.transition_family,
+        expected_region_families=record.expected_region_families,
+        expected_runtime_conditions=record.expected_runtime_conditions,
+    )
+
+
+def _synthetic_records_for_image(seed_image: str, scenario_specs: list[ScenarioSpec]) -> list[BenchmarkRecord]:
+    records: list[BenchmarkRecord] = []
+    for spec in scenario_specs:
+        records.append(
+            BenchmarkRecord(
+                record_id=f"synthetic_{spec.scenario_id}",
+                asset_id="synthetic_seed",
+                asset_path=seed_image,
+                scenario_id=spec.scenario_id,
+                canonical_prompt=spec.prompt,
+                action_family=spec.action_family,
+                transition_family=spec.transition_family,
+                expected_region_families=spec.expected_region_families,
+                expected_runtime_conditions=spec.expected_runtime_conditions,
+                tags=["synthetic_seed"],
+                notes="Generated from single user-provided or internal synthetic image.",
+                weak_expectations={},
+            )
+        )
+    return records
+
+
 def run_benchmark_suite(
     backend_modes: list[str] | None = None,
     scenarios: list[ScenarioSpec] | None = None,
     image_path: str | None = None,
+    dataset_manifest: str | None = None,
+    scenario_filter: list[str] | None = None,
+    asset_filter: list[str] | None = None,
 ) -> dict[str, object]:
     scenario_specs = scenarios or DEFAULT_SCENARIOS
     modes = backend_modes or ["learned_primary", "legacy"]
 
-    seed_image = image_path
     temp_dir: Path | None = None
-    if seed_image is None:
-        temp_dir = Path(tempfile.mkdtemp(prefix="gennady_eval_"))
-        img = temp_dir / "seed.ppm"
-        _write_seed_ppm(img)
-        seed_image = str(img)
+    dataset_info: dict[str, object]
+    dataset_records: list[BenchmarkRecord]
+
+    if image_path:
+        seed_image = image_path
+        dataset_records = _synthetic_records_for_image(seed_image, scenario_specs)
+        dataset_info = {
+            "dataset_id": "synthetic_seed",
+            "name": "synthetic_seed_from_image",
+            "version": "1",
+            "manifest_path": None,
+            "diagnostics": {
+                "total_records": len(dataset_records),
+                "valid_records": len(dataset_records),
+                "invalid_records": 0,
+                "missing_assets": 0,
+                "invalid_record_ids": [],
+                "missing_asset_record_ids": [],
+            },
+            "used_curated_pack": False,
+            "source": "explicit_image",
+        }
+    else:
+        dataset, diagnostics = load_benchmark_dataset(dataset_manifest)
+        dataset_records = dataset.records
+        dataset_info = {
+            "dataset_id": dataset.dataset_id,
+            "name": dataset.name,
+            "version": dataset.version,
+            "manifest_path": dataset.manifest_path,
+            "diagnostics": dataset_diagnostics_to_dict(diagnostics),
+            "used_curated_pack": True,
+            "source": "manifest",
+        }
+
+    scenario_allow = {s.strip().lower() for s in scenario_filter or [] if s.strip()}
+    asset_allow = {a.strip().lower() for a in asset_filter or [] if a.strip()}
+    records = [
+        r
+        for r in dataset_records
+        if (not scenario_allow or r.scenario_id.lower() in scenario_allow)
+        and (not asset_allow or r.asset_id.lower() in asset_allow)
+    ]
+    if not records:
+        raise ValueError("Benchmark selection resulted in zero dataset records. Adjust scenario/asset filters.")
 
     runs: dict[str, object] = {}
     for mode in modes:
-        scenario_results = [_run_single_scenario(seed_image, s, mode) for s in scenario_specs]
+        scenario_results = [_run_single_scenario(r.asset_path, _record_to_scenario(r), mode, record=r) for r in records]
         success_ratio = _safe_mean([float(r["metrics"]["scenario_success"]) for r in scenario_results])
         fallback_free_ratio = _safe_mean([float(r["metrics"]["fallback_free"]) for r in scenario_results])
         contract_valid_ratio = _safe_mean([float(r["metrics"]["contract_validity"]) for r in scenario_results])
@@ -318,6 +408,38 @@ def run_benchmark_suite(
             "patch": _safe_mean([float(r["stage_health"]["patch"]["avg_patch_confidence"]) for r in scenario_results]),
             "temporal": _safe_mean([float(r["stage_health"]["temporal"]["avg_temporal_consistency_proxy"]) for r in scenario_results]),
         }
+
+        asset_results: dict[str, dict[str, object]] = {}
+        scenario_family_coverage: dict[str, int] = {}
+        for item in scenario_results:
+            rec = item.get("dataset_record", {}) if isinstance(item.get("dataset_record", {}), dict) else {}
+            aid = str(rec.get("asset_id", "unknown"))
+            sid = str(item.get("scenario_id", "unknown"))
+            scenario_family_coverage[sid] = scenario_family_coverage.get(sid, 0) + 1
+
+            slot = asset_results.setdefault(
+                aid,
+                {
+                    "asset_path": rec.get("asset_path", ""),
+                    "record_count": 0,
+                    "scenario_success_ratio": 0.0,
+                    "contract_valid_ratio": 0.0,
+                    "fallback_free_ratio": 0.0,
+                    "scenarios": [],
+                },
+            )
+            slot["record_count"] = int(slot["record_count"]) + 1
+            slot["scenarios"].append(sid)
+
+        for aid, slot in asset_results.items():
+            items = [
+                item
+                for item in scenario_results
+                if isinstance(item.get("dataset_record", {}), dict) and str(item.get("dataset_record", {}).get("asset_id", "")) == aid
+            ]
+            slot["scenario_success_ratio"] = round(_safe_mean([float(i["metrics"]["scenario_success"]) for i in items]), 6)
+            slot["contract_valid_ratio"] = round(_safe_mean([float(i["metrics"]["contract_validity"]) for i in items]), 6)
+            slot["fallback_free_ratio"] = round(_safe_mean([float(i["metrics"]["fallback_free"]) for i in items]), 6)
 
         warnings: list[str] = []
         if contract_valid_ratio < 1.0:
@@ -338,6 +460,8 @@ def run_benchmark_suite(
                 "stage_health_score": {k: round(v, 6) for k, v in stage_scores.items()},
             },
             "warnings": warnings,
+            "scenario_family_coverage": scenario_family_coverage,
+            "assets": asset_results,
             "scenarios": scenario_results,
         }
 
@@ -358,8 +482,23 @@ def run_benchmark_suite(
     report = {
         "kind": "single_image_pipeline_benchmark",
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "seed_image": seed_image,
-        "scenario_catalog": [asdict(s) for s in scenario_specs],
+        "dataset": {
+            **dataset_info,
+            "selected_record_count": len(records),
+            "selected_scenario_ids": sorted({r.scenario_id for r in records}),
+            "selected_asset_ids": sorted({r.asset_id for r in records}),
+        },
+        "scenario_catalog": sorted(
+            [
+                {
+                    "scenario_id": r.scenario_id,
+                    "action_family": r.action_family,
+                    "transition_family": r.transition_family,
+                }
+                for r in records
+            ],
+            key=lambda x: (str(x["scenario_id"]), str(x["action_family"])),
+        ),
         "runs": runs,
         "comparison": comparison,
         "regression_summary": {
@@ -367,7 +506,19 @@ def run_benchmark_suite(
                 mode: payload.get("warnings", []) for mode, payload in runs.items()
             },
             "failing_scenarios": {
-                mode: [s["scenario_id"] for s in payload.get("scenarios", []) if float(s.get("metrics", {}).get("scenario_success", 0.0)) < 1.0]
+                mode: [
+                    s["scenario_id"]
+                    for s in payload.get("scenarios", [])
+                    if float(s.get("metrics", {}).get("scenario_success", 0.0)) < 1.0
+                ]
+                for mode, payload in runs.items()
+            },
+            "failing_assets": {
+                mode: [
+                    aid
+                    for aid, asset_payload in payload.get("assets", {}).items()
+                    if float(asset_payload.get("scenario_success_ratio", 0.0)) < 1.0
+                ]
                 for mode, payload in runs.items()
             },
         },
