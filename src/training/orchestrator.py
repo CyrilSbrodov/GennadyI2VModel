@@ -110,11 +110,11 @@ def train_pipeline(config: TrainingConfig) -> list[StageResult]:
     stage_map = {
         "stage1_perception": "perception",
         "stage2_representation": "representation",
-        "stage3_dynamics": "dynamics",
+        "stage3_dynamics": "dynamics_transition",
         "stage4_renderer": "renderer",
         "stage5_memory": "representation",
-        "stage6_temporal": "dynamics",
-        "stage7_instruction": "perception",
+        "stage6_temporal": "temporal_refinement",
+        "stage7_instruction": "text_encoder",
         "stage8_joint_tuning": "renderer",
     }
     replay = ReplayBuffer()

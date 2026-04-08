@@ -20,6 +20,7 @@ from core.schema import (
     PersonNode,
     PoseState,
     RelationEdge,
+    RegionRef,
     SceneGraph,
     SceneObjectNode,
 )

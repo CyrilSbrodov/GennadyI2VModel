@@ -43,22 +43,38 @@ class LearnedBackendFactory:
         self.config = config or BackendConfig()
 
     def build(self) -> BackendBundle:
+        resolved_names = {
+            "text_encoder": self._resolve_alias("text_encoder", self.config.text_encoder),
+            "graph_encoder": self._resolve_alias("graph_encoder", self.config.graph_encoder),
+            "identity_encoder": self._resolve_alias("identity_encoder", self.config.identity_encoder),
+            "dynamics_backend": self._resolve_alias("dynamics_backend", self.config.dynamics_backend),
+            "patch_backend": self._resolve_alias("patch_backend", self.config.patch_backend),
+            "temporal_backend": self._resolve_alias("temporal_backend", self.config.temporal_backend),
+        }
         return BackendBundle(
-            text_encoder=self._build_text_encoder(self.config.text_encoder),
-            graph_encoder=self._build_graph_encoder(self.config.graph_encoder),
-            identity_encoder=self._build_identity_encoder(self.config.identity_encoder),
-            dynamics_backend=self._build_dynamics(self.config.dynamics_backend),
-            patch_backend=self._build_patch(self.config.patch_backend),
-            temporal_backend=self._build_temporal(self.config.temporal_backend),
+            text_encoder=self._build_text_encoder(resolved_names["text_encoder"]),
+            graph_encoder=self._build_graph_encoder(resolved_names["graph_encoder"]),
+            identity_encoder=self._build_identity_encoder(resolved_names["identity_encoder"]),
+            dynamics_backend=self._build_dynamics(resolved_names["dynamics_backend"]),
+            patch_backend=self._build_patch(resolved_names["patch_backend"]),
+            temporal_backend=self._build_temporal(resolved_names["temporal_backend"]),
             backend_names={
-                "text_encoder": self.config.text_encoder,
-                "graph_encoder": self.config.graph_encoder,
-                "identity_encoder": self.config.identity_encoder,
-                "dynamics_backend": self.config.dynamics_backend,
-                "patch_backend": self.config.patch_backend,
-                "temporal_backend": self.config.temporal_backend,
+                **resolved_names,
+                "requested_dynamics_backend": self.config.dynamics_backend,
+                "requested_patch_backend": self.config.patch_backend,
+                "requested_temporal_backend": self.config.temporal_backend,
             },
         )
+
+    @staticmethod
+    def _resolve_alias(stage: str, name: str) -> str:
+        normalized = str(name).strip()
+        alias_map = {
+            ("dynamics_backend", "baseline"): "legacy_heuristic",
+            ("patch_backend", "baseline"): "legacy_deterministic",
+            ("temporal_backend", "baseline"): "legacy_baseline",
+        }
+        return alias_map.get((stage, normalized), normalized)
 
     def _build_text_encoder(self, name: str) -> TextEncoder:
         if name == "baseline":
@@ -76,21 +92,21 @@ class LearnedBackendFactory:
         raise ValueError(f"Unknown identity encoder backend: {name}")
 
     def _build_dynamics(self, name: str) -> DynamicsTransitionModel:
-        if name in {"learned_graph_delta", "baseline"}:
+        if name in {"learned_graph_delta", "learned_primary"}:
             return LearnedDynamicsTransitionModel()
         if name in {"legacy_heuristic", "legacy"}:
             return LegacyHeuristicDynamicsTransitionModel()
         raise ValueError(f"Unknown dynamics backend: {name}")
 
     def _build_patch(self, name: str) -> PatchSynthesisModel:
-        if name in {"trainable_local", "baseline"}:
+        if name in {"trainable_local", "learned_primary"}:
             return TrainablePatchSynthesisModel()
         if name in {"legacy", "legacy_deterministic"}:
             return LegacyDeterministicPatchSynthesisModel()
         raise ValueError(f"Unknown patch backend: {name}")
 
     def _build_temporal(self, name: str) -> TemporalConsistencyModel:
-        if name in {"trainable_temporal", "learned_primary", "baseline"}:
+        if name in {"trainable_temporal", "learned_primary"}:
             return TrainableTemporalConsistencyBackend()
         if name in {"legacy", "legacy_baseline"}:
             return LegacyBaselineTemporalConsistencyModel()
