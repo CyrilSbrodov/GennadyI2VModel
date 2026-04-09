@@ -12,12 +12,14 @@ from training.datasets import DynamicsDataset
 def evaluate_dynamics(weights_path: str, dataset_size: int = 8, dataset_manifest: str = "") -> dict[str, float | str]:
     model = DynamicsModel.load(weights_path)
     if dataset_manifest:
-        dataset = DynamicsDataset.from_transition_manifest(dataset_manifest, strict=False)
+        payload = json.loads(Path(dataset_manifest).read_text(encoding="utf-8"))
+        is_video_manifest = payload.get("manifest_type") == "video_transition_manifest"
+        dataset = DynamicsDataset.from_video_transition_manifest(dataset_manifest, strict=False) if is_video_manifest else DynamicsDataset.from_transition_manifest(dataset_manifest, strict=False)
         if len(dataset.samples) == 0:
             dataset = DynamicsDataset.synthetic(dataset_size)
             dataset_source = "synthetic_dynamics_bootstrap_fallback_manifest_empty"
         else:
-            dataset_source = "manifest_dynamics_primary_eval"
+            dataset_source = "manifest_video_dynamics_primary_eval" if is_video_manifest else "manifest_dynamics_primary_eval"
     else:
         dataset = DynamicsDataset.synthetic(dataset_size)
         dataset_source = "synthetic_dynamics_bootstrap_eval"
