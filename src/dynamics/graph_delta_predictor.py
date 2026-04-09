@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from core.schema import BBox, GraphDelta, RegionRef, SceneGraph, VideoMemory
+from core.schema import BBox, GraphDelta, RegionRef, RuntimeSemanticTransition, SceneGraph, TransitionTargetProfile, VideoMemory
 from core.semantic_roi import SemanticROIHelper
 from dynamics.model import DynamicsModel, DynamicsModelContractError, DynamicsModelError, decode_prediction, featurize_runtime
 from dynamics.transition_contracts import (
@@ -106,12 +106,19 @@ class GraphDeltaPredictor:
     def _predict_legacy(self, scene_graph: SceneGraph, target_state: PlannedState, planner_context: dict[str, float] | None = None, memory: VideoMemory | None = None) -> tuple[GraphDelta, DynamicsMetrics]:
         context = planner_context or {}
         person = scene_graph.persons[0] if scene_graph.persons else None
-        labels = set(target_state.labels)
+        semantic_hints = self._extract_semantic_hints(target_state)
         planner = self._parse_planner_context(target_state=target_state, context=context)
         memory_influence = self._parse_memory_context(memory)
 
         fallback_scores = {"pose": 0.5, "garment": 0.5, "expression": 0.5, "interaction": 0.5, "visibility": 0.5}
-        intent = self._build_transition_intent(scene_graph, labels, planner, memory_influence, fallback_scores)
+        intent = self._build_transition_intent(
+            scene_graph,
+            semantic_hints,
+            planner,
+            memory_influence,
+            fallback_scores,
+            runtime_transition=target_state.semantic_transition,
+        )
         delta = GraphDelta(transition_phase=planner.phase)
 
         if person:
@@ -120,7 +127,7 @@ class GraphDeltaPredictor:
 
         diagnostics = TransitionDiagnostics()
         family_deltas = self._compute_family_deltas(intent, fallback_scores)
-        self._merge_family_deltas(delta, family_deltas, diagnostics)
+        self._merge_family_deltas(delta, intent, family_deltas, diagnostics)
         self._derive_visibility_consequences(scene_graph, person, intent, delta, diagnostics)
         self._derive_region_transition_modes(intent, delta)
 
@@ -136,6 +143,42 @@ class GraphDeltaPredictor:
             "constraint_violations": diagnostics.constraint_violations,
             "fallback_usage": diagnostics.fallback_usage + ["legacy_heuristic"],
             "explainability_summary": diagnostics.explainability_summary,
+            "semantic_families": intent.active_families,
+            "canonical_goals": intent.goals,
+            "target_regions": intent.target_regions,
+            "phase": intent.planner.phase,
+            "family_subphases": {
+                "pose": intent.pose.progression,
+                "garment": intent.garment.progression_state,
+                "interaction": intent.interaction.support_progression,
+                "expression": intent.expression.progression,
+            },
+            "region_modes": delta.region_transition_mode,
+            "visibility_consequences": {
+                "revealed": [r for r in intent.visibility.reveal_regions if r in delta.predicted_visibility_changes],
+                "occluded": [r for r in intent.visibility.occlude_regions if r in delta.predicted_visibility_changes],
+            },
+            "target_profile": {
+                "primary_regions": intent.target_profile.primary_regions,
+                "secondary_regions": intent.target_profile.secondary_regions,
+                "context_regions": intent.target_profile.context_regions,
+                "entity": intent.target_profile.entity,
+                "entity_id": intent.target_profile.entity_id,
+                "object_role": intent.target_profile.object_role,
+                "support_target": intent.target_profile.support_target,
+            },
+            "region_selection_rationale": self._region_selection_rationale(intent),
+            "reveal_occlusion_rationale": self._reveal_rationale(intent),
+            "lexical_bootstrap_influence": self._lexical_bootstrap_influence(target_state),
+            "phase_sequence": {
+                "global": ["prepare", "transition", "contact_or_reveal", "stabilize"],
+                "family_subphases": {
+                    "pose": intent.pose.phase_sequence,
+                    "garment": intent.garment.phase_sequence,
+                    "interaction": intent.interaction.phase_sequence,
+                    "expression": ["subtle_rise", "forming_expression", "stable_expression", "relaxed_expression"],
+                },
+            },
         }
 
         metrics = DynamicsMetrics(
@@ -150,7 +193,7 @@ class GraphDeltaPredictor:
         step_index = int(context.get("step_index", target_state.step_index))
         total_steps = max(1, int(context.get("total_steps", context.get("plan_length", 4))))
         progress = step_index / float(total_steps)
-        phase = "early" if progress <= 0.25 else ("mid" if progress <= 0.75 else "late")
+        phase = "prepare" if progress <= 0.25 else ("transition" if progress <= 0.75 else "contact_or_reveal")
         if step_index >= total_steps:
             phase = "stabilize"
         stage = str(context.get("sequencing_stage", phase))
@@ -185,159 +228,222 @@ class GraphDeltaPredictor:
     def _build_transition_intent(
         self,
         scene_graph: SceneGraph,
-        labels: set[str],
+        semantic_hints: dict[str, str],
         planner: PlannerTransitionContext,
         memory: MemoryInfluence,
         model_out: dict[str, float],
+        runtime_transition: RuntimeSemanticTransition | None = None,
     ) -> TransitionIntent:
         """Собирает transition intent до вычисления GraphDelta."""
         person = scene_graph.persons[0] if scene_graph.persons else None
         target_entity = person.person_id if person else "scene"
-        families = self._derive_families(labels)
+        families = self._derive_families(semantic_hints)
+        target_profile = self._derive_target_profile(semantic_hints, target_state_semantic=runtime_transition)
         intent = TransitionIntent(
-            action_families=families,
+            active_families=families,
+            goals={family: semantic_hints.get(family, "unknown") for family in families},
             target_entity=target_entity,
-            target_regions=self._derive_target_regions(families),
+            target_regions=sorted(
+                set(
+                    target_profile.primary_regions
+                    + target_profile.secondary_regions
+                    + target_profile.context_regions
+                )
+            ),
+            target_profile=target_profile,
             planner=planner,
             memory=memory,
-            pose=self._pose_intent(labels, planner),
-            garment=self._garment_intent(labels, planner, memory),
+            pose=self._pose_intent(semantic_hints, planner),
+            garment=self._garment_intent(semantic_hints, planner, memory),
             visibility=VisibilityTransitionIntent(),
-            interaction=self._interaction_intent(labels, planner),
-            expression=self._expression_intent(labels, planner, model_out),
+            interaction=self._interaction_intent(semantic_hints, planner),
+            expression=self._expression_intent(semantic_hints, planner, model_out),
         )
-        intent.visibility = self._visibility_intent(intent, labels)
+        if runtime_transition is not None:
+            if runtime_transition.phase.pose_subphase != "steady":
+                intent.pose.progression = runtime_transition.phase.pose_subphase
+            if runtime_transition.phase.garment_subphase != "stable":
+                intent.garment.progression_state = runtime_transition.phase.garment_subphase
+            if runtime_transition.phase.interaction_subphase != "free":
+                intent.interaction.support_progression = runtime_transition.phase.interaction_subphase
+            if runtime_transition.phase.expression_subphase != "neutral":
+                intent.expression.progression = runtime_transition.phase.expression_subphase
+        intent.visibility = self._visibility_intent(intent)
         return intent
 
-    def _derive_families(self, labels: set[str]) -> list[str]:
+    def _extract_semantic_hints(self, target_state: PlannedState) -> dict[str, str]:
+        hints: dict[str, str] = {}
+        transition = target_state.semantic_transition
+        if transition is not None:
+            hints[transition.family] = transition.goal
+            if transition.family == "garment_transition":
+                hints["visibility_transition"] = "reveal_region"
+            if transition.family == "pose_transition" and transition.goal == "seated_pose":
+                hints["interaction_transition"] = "support_contact"
+            if transition.family == "pose_transition" and transition.goal == "upright_pose":
+                hints["interaction_transition"] = "support_release"
+            return hints
+
+        joined = " ".join(label for label in target_state.labels if not label.startswith("intensity="))
+        coarse_bootstrap = {
+            "sit_down": ("pose_transition", "seated_pose"),
+            "stand_up": ("pose_transition", "upright_pose"),
+            "raise_arm": ("pose_transition", "arm_elevation"),
+            "turn_head": ("pose_transition", "head_rotation"),
+            "remove_garment": ("garment_transition", "outer_layer_removal"),
+            "open_garment": ("garment_transition", "outer_layer_opening"),
+            "smile": ("expression_transition", "smile_like"),
+        }
+        for marker, (family, goal) in coarse_bootstrap.items():
+            if marker in joined:
+                hints[family] = goal
+        if "visibility_transition" not in hints and hints:
+            hints["visibility_transition"] = "preserve_identity_region"
+        if hints.get("pose_transition") == "seated_pose":
+            hints.setdefault("interaction_transition", "support_contact")
+        if hints.get("pose_transition") == "upright_pose":
+            hints.setdefault("interaction_transition", "support_release")
+        return hints
+
+    def _derive_families(self, hints: dict[str, str]) -> list[str]:
         families: list[str] = []
-        if labels & {"raise_arm", "turn_head", "sit_down", "stand_up", "weight_shift", "posture_change"}:
-            families.append("pose")
-        if labels & {"remove_garment", "open_garment"}:
-            families.append("garment")
-        if labels & {"smile", "expression_change"}:
-            families.append("expression")
-        if labels & {"sit_down", "stand_up", "support", "touch"}:
-            families.append("interaction")
-        if families:
-            families.append("visibility")
+        for family in ("pose_transition", "garment_transition", "expression_transition", "interaction_transition", "visibility_transition"):
+            if family in hints:
+                families.append(family)
         return sorted(set(families))
 
-    def _derive_target_regions(self, families: list[str]) -> list[str]:
-        region_map = {
-            "pose": ["torso", "arms", "legs"],
-            "garment": ["garments", "torso"],
-            "expression": ["face"],
-            "interaction": ["pelvis", "legs", "support_zone"],
-            "visibility": ["face", "torso", "arms", "legs", "garments"],
-        }
-        out: list[str] = []
-        for family in families:
-            out.extend(region_map.get(family, []))
-        return sorted(set(out))
+    def _derive_target_profile(
+        self,
+        hints: dict[str, str],
+        target_state_semantic: RuntimeSemanticTransition | None = None,
+    ) -> TransitionTargetProfile:
+        if target_state_semantic is not None:
+            return target_state_semantic.target_profile
+        pose_goal = hints.get("pose_transition")
+        if pose_goal == "seated_pose":
+            return TransitionTargetProfile(primary_regions=["legs", "pelvis"], secondary_regions=["torso"], context_regions=["support_zone"])
+        if pose_goal == "arm_elevation":
+            return TransitionTargetProfile(primary_regions=["left_arm", "right_arm"], secondary_regions=["upper_torso", "shoulders"])
+        if pose_goal == "head_rotation" or hints.get("expression_transition") in {"smile_like", "gaze_shift"}:
+            return TransitionTargetProfile(primary_regions=["face", "head", "neck"], secondary_regions=["upper_torso"])
+        if hints.get("garment_transition") in {"outer_layer_removal", "outer_layer_opening"}:
+            context = ["support_zone"] if "interaction_transition" in hints else []
+            return TransitionTargetProfile(primary_regions=["garments", "sleeves"], secondary_regions=["torso", "inner_garment"], context_regions=context)
+        return TransitionTargetProfile(primary_regions=["torso"])
 
-    def _pose_intent(self, labels: set[str], planner: PlannerTransitionContext) -> PoseTransitionIntent:
-        if "sit_down" in labels:
-            progression = "weight_shift" if planner.phase == "early" else ("lowering" if planner.phase == "mid" else "seated_stabilization")
-            return PoseTransitionIntent(target_pose="sitting", progression=progression, weight_shift=0.35 + 0.4 * planner.intensity)
-        if "stand_up" in labels:
+    def _pose_intent(self, hints: dict[str, str], planner: PlannerTransitionContext) -> PoseTransitionIntent:
+        goal = hints.get("pose_transition")
+        if goal == "seated_pose":
+            progression = "weight_shift" if planner.phase == "prepare" else ("lowering" if planner.phase == "transition" else "contact_settle")
+            return PoseTransitionIntent(goal=goal, progression=progression, phase_sequence=["weight_shift", "lowering", "contact_settle", "seated_stabilization"], weight_shift=0.35 + 0.4 * planner.intensity)
+        if goal == "upright_pose":
             progression = "lift_off_support" if planner.phase != "stabilize" else "standing_stabilization"
-            return PoseTransitionIntent(target_pose="standing", progression=progression, weight_shift=0.25)
-        if "raise_arm" in labels:
-            return PoseTransitionIntent(target_pose="arm_raised", progression="shoulder_lift", weight_shift=0.1)
-        if "turn_head" in labels:
-            return PoseTransitionIntent(target_pose="head_turned", progression="head_rotation", weight_shift=0.0)
+            return PoseTransitionIntent(goal=goal, progression=progression, phase_sequence=["pre_lift", "lift_off_support", "support_release", "standing_stabilization"], weight_shift=0.25)
+        if goal == "arm_elevation":
+            return PoseTransitionIntent(goal=goal, progression="shoulder_lift", weight_shift=0.1)
+        if goal == "head_rotation":
+            return PoseTransitionIntent(goal=goal, progression="head_rotation", weight_shift=0.0)
         return PoseTransitionIntent()
 
-    def _garment_intent(self, labels: set[str], planner: PlannerTransitionContext, memory: MemoryInfluence) -> GarmentTransitionIntent:
-        if "remove_garment" not in labels and "open_garment" not in labels:
+    def _garment_intent(self, hints: dict[str, str], planner: PlannerTransitionContext, memory: MemoryInfluence) -> GarmentTransitionIntent:
+        goal = hints.get("garment_transition")
+        if goal not in {"outer_layer_removal", "outer_layer_opening"}:
             return GarmentTransitionIntent()
         progression = {
-            "early": "tensioned",
-            "mid": "opening",
-            "late": "partially_detached",
+            "prepare": "tensioned",
+            "transition": "opening",
+            "contact_or_reveal": "partially_detached",
             "stabilize": "half_removed",
         }.get(planner.phase, "opening")
         if planner.phase == "stabilize" and planner.intensity > 0.65:
             progression = "removed"
         attachment_delta = -0.15 - 0.35 * planner.intensity
         reveal_bias = 0.4 * memory.hidden_reveal_evidence + 0.6 * memory.garment_memory_strength
-        return GarmentTransitionIntent(progression_state=progression, attachment_delta=attachment_delta, reveal_bias=reveal_bias)
+        return GarmentTransitionIntent(goal=goal, progression_state=progression, attachment_delta=attachment_delta, reveal_bias=reveal_bias)
 
-    def _interaction_intent(self, labels: set[str], planner: PlannerTransitionContext) -> InteractionTransitionIntent:
-        if "sit_down" in labels:
+    def _interaction_intent(self, hints: dict[str, str], planner: PlannerTransitionContext) -> InteractionTransitionIntent:
+        goal = hints.get("interaction_transition")
+        if goal == "support_contact":
             stage = {
-                "early": "near_support",
-                "mid": "approach_contact",
-                "late": "weight_transfer",
+                "prepare": "near_support",
+                "transition": "approach_contact",
+                "contact_or_reveal": "weight_transfer",
                 "stabilize": "stabilized_seated",
             }.get(planner.phase, "contact_established")
-            return InteractionTransitionIntent(support_progression=stage, support_target="chair", contact_bias=0.3 + 0.6 * planner.intensity)
-        if "stand_up" in labels:
-            return InteractionTransitionIntent(support_progression="support_release", support_target="chair", contact_bias=0.2)
+            return InteractionTransitionIntent(goal=goal, support_progression=stage, support_target="chair", contact_bias=0.3 + 0.6 * planner.intensity)
+        if goal == "support_release":
+            return InteractionTransitionIntent(goal=goal, support_progression="support_release", support_target="chair", contact_bias=0.2)
         return InteractionTransitionIntent()
 
-    def _expression_intent(self, labels: set[str], planner: PlannerTransitionContext, model_out: dict[str, float]) -> ExpressionTransitionIntent:
-        if "smile" not in labels:
+    def _expression_intent(self, hints: dict[str, str], planner: PlannerTransitionContext, model_out: dict[str, float]) -> ExpressionTransitionIntent:
+        goal = hints.get("expression_transition")
+        if goal != "smile_like":
             return ExpressionTransitionIntent()
         progression = {
-            "early": "subtle_rise",
-            "mid": "forming_expression",
-            "late": "stable_expression",
+            "prepare": "subtle_rise",
+            "transition": "forming_expression",
+            "contact_or_reveal": "stable_expression",
             "stabilize": "relaxed_expression",
         }.get(planner.phase, "forming_expression")
-        return ExpressionTransitionIntent(expression_label="smile", progression=progression, intensity_delta=0.1 + 0.35 * model_out["expression"])
+        return ExpressionTransitionIntent(goal=goal, expression_label="smile", progression=progression, intensity_delta=0.1 + 0.35 * model_out["expression"])
 
-    def _visibility_intent(self, intent: TransitionIntent, labels: set[str]) -> VisibilityTransitionIntent:
+    def _visibility_intent(self, intent: TransitionIntent) -> VisibilityTransitionIntent:
         reveal: list[str] = []
         occlude: list[str] = []
-        stable: list[str] = ["torso"]
-        if "raise_arm" in labels:
-            reveal.extend(["left_arm", "sleeves"])
-        if "remove_garment" in labels:
+        stable: list[str] = ["torso", "preserve_identity_region"]
+        if intent.pose.goal == "arm_elevation":
+            reveal.extend(["left_arm", "right_arm", "sleeves"])
+        if intent.garment.goal in {"outer_layer_removal", "outer_layer_opening"}:
             reveal.extend(["torso", "inner_garment"])
             occlude.append("outer_garment")
-        if "sit_down" in labels:
+        if intent.pose.goal == "seated_pose":
             occlude.append("legs")
             stable.append("face")
-        if "smile" in labels:
+        if intent.expression.goal == "smile_like":
             reveal.append("face")
-        return VisibilityTransitionIntent(reveal_regions=sorted(set(reveal)), occlude_regions=sorted(set(occlude)), stable_regions=sorted(set(stable)))
+        return VisibilityTransitionIntent(
+            goal="reveal_region" if reveal else "preserve_identity_region",
+            reveal_regions=sorted(set(reveal)),
+            occlude_regions=sorted(set(occlude)),
+            stable_regions=sorted(set(stable)),
+        )
 
     def _compute_family_deltas(self, intent: TransitionIntent, model_out: dict[str, float]) -> dict[str, dict[str, float | str]]:
         """Вычисляет sub-deltas по семействам переходов."""
         out: dict[str, dict[str, float | str]] = {"pose": {}, "garment": {}, "expression": {}, "interaction": {}, "visibility": {}}
 
-        if "pose" in intent.action_families:
-            if intent.pose.target_pose == "sitting":
+        if "pose_transition" in intent.active_families:
+            if intent.pose.goal == "seated_pose":
                 out["pose"] = {
                     "left_knee": self._clamp_pose(20.0 * model_out["pose"]),
                     "right_knee": self._clamp_pose(20.0 * model_out["pose"]),
                     "torso_pitch": self._clamp_pose(10.0 * model_out["pose"]),
                 }
-            elif intent.pose.target_pose == "arm_raised":
+            elif intent.pose.goal == "arm_elevation":
                 out["pose"] = {
                     "left_shoulder": self._clamp_pose(18.0 * model_out["pose"]),
                     "left_elbow": self._clamp_pose(13.0 * model_out["pose"]),
                 }
-            elif intent.pose.target_pose == "head_turned":
+            elif intent.pose.goal == "head_rotation":
                 out["pose"] = {"head_yaw": self._clamp_pose(14.0 * model_out["pose"])}
+            elif intent.pose.goal == "upright_pose":
+                out["pose"] = {"torso_pitch": self._clamp_pose(-8.0 * model_out["pose"])}
 
-        if "garment" in intent.action_families:
+        if "garment_transition" in intent.active_families:
             out["garment"] = {
                 "outer_attachment": intent.garment.attachment_delta,
                 "garment_progression": intent.garment.progression_state,
                 "coverage_expectation": max(0.0, min(1.0, 0.8 - intent.garment.reveal_bias)),
             }
 
-        if "expression" in intent.action_families:
+        if "expression_transition" in intent.active_families:
             out["expression"] = {
                 "smile_intensity": intent.expression.intensity_delta,
                 "expression_progression": intent.expression.progression,
                 "expression_label": intent.expression.expression_label,
             }
 
-        if "interaction" in intent.action_families:
+        if "interaction_transition" in intent.active_families:
             out["interaction"] = {
                 "support_contact": min(1.0, max(0.0, intent.interaction.contact_bias * (0.8 + 0.4 * model_out["interaction"]))),
                 "weight_transfer": intent.pose.weight_shift,
@@ -345,7 +451,13 @@ class GraphDeltaPredictor:
 
         return out
 
-    def _merge_family_deltas(self, delta: GraphDelta, family_deltas: dict[str, dict[str, float | str]], diagnostics: TransitionDiagnostics) -> None:
+    def _merge_family_deltas(
+        self,
+        delta: GraphDelta,
+        intent: TransitionIntent,
+        family_deltas: dict[str, dict[str, float | str]],
+        diagnostics: TransitionDiagnostics,
+    ) -> None:
         """Сливает sub-deltas в финальный GraphDelta с учетом вкладов."""
         delta.pose_deltas.update({k: float(v) for k, v in family_deltas["pose"].items()})
         delta.garment_deltas.update(family_deltas["garment"])
@@ -362,7 +474,12 @@ class GraphDeltaPredictor:
             )
             if payload
         )
-        delta.affected_regions = sorted(set(delta.affected_regions + list(delta.visibility_deltas.keys())))
+        profile_regions = (
+            intent.target_profile.primary_regions
+            + intent.target_profile.secondary_regions
+            + intent.target_profile.context_regions
+        )
+        delta.affected_regions = sorted(set(delta.affected_regions + list(delta.visibility_deltas.keys()) + profile_regions))
 
         diagnostics.family_contribution = {
             "pose": float(len(delta.pose_deltas)),
@@ -426,16 +543,21 @@ class GraphDeltaPredictor:
 
     def _derive_region_transition_modes(self, intent: TransitionIntent, delta: GraphDelta) -> None:
         """Формирует режимы переходов регионов по семействам."""
+        for region in intent.target_profile.primary_regions + intent.target_profile.secondary_regions + intent.target_profile.context_regions:
+            delta.region_transition_mode.setdefault(region, "stable")
+        if "garment_transition" in intent.active_families:
+            for region in {"garments", "sleeves"} & set(intent.target_profile.primary_regions):
+                delta.region_transition_mode[region] = "garment_surface"
         for region in intent.visibility.reveal_regions:
             mode = "visibility_reveal"
-            if "garment" in intent.action_families and region in {"torso", "inner_garment"}:
+            if "garment_transition" in intent.active_families and region in {"torso", "inner_garment"}:
                 mode = "garment_reveal"
-            elif "pose" in intent.action_families and "arm" in region:
+            elif "pose_transition" in intent.active_families and "arm" in region:
                 mode = "pose_exposure"
             delta.region_transition_mode[region] = mode
         for region in intent.visibility.occlude_regions:
             delta.region_transition_mode[region] = "visibility_occlusion"
-        if "expression" in intent.action_families:
+        if "expression_transition" in intent.active_families:
             delta.region_transition_mode["face"] = "expression_refine"
 
     def _build_state_before(self, scene_graph: SceneGraph, person, expression_label: str) -> dict[str, str]:
@@ -452,6 +574,7 @@ class GraphDeltaPredictor:
             "visibility_state": "hidden" if len(occluded) > len(visible) else "visible",
             "interaction_state": "support" if support_targets else "free_contact",
             "expression_state": expression_label,
+            "phase_state": "prepare",
         }
 
     def _derive_state_after(self, delta: GraphDelta, before: dict[str, str], intent: TransitionIntent) -> dict[
@@ -459,8 +582,8 @@ class GraphDeltaPredictor:
         """Агрегирует state_after из intent + sub-deltas."""
 
         pose_state = before.get("pose_state", "stable")
-        if intent.pose.target_pose in {"sitting", "standing", "arm_raised", "head_turned"}:
-            pose_state = intent.pose.target_pose
+        if intent.pose.goal in {"seated_pose", "upright_pose", "arm_elevation", "head_rotation"}:
+            pose_state = intent.pose.goal
 
         garment_state = str(delta.garment_deltas.get("garment_progression", before.get("garment_state", "worn")))
         if garment_state == "half_removed" and intent.planner.phase == "stabilize":
@@ -496,6 +619,11 @@ class GraphDeltaPredictor:
             "interaction_state": interaction_state,
             "expression_state": expression_state,
             "transition_phase": intent.planner.phase,
+            "phase_state": intent.planner.phase,
+            "pose_subphase": intent.pose.progression,
+            "garment_subphase": intent.garment.progression_state,
+            "interaction_subphase": intent.interaction.support_progression,
+            "expression_subphase": intent.expression.progression,
         }
 
     def _compute_diagnostics(self, delta: GraphDelta, intent: TransitionIntent, diagnostics: TransitionDiagnostics) -> None:
@@ -505,14 +633,14 @@ class GraphDeltaPredictor:
         diagnostics.delta_magnitude = magnitude
         diagnostics.transition_smoothness_proxy = 1.0 / (1.0 + magnitude)
 
-        if "interaction" in intent.action_families and delta.interaction_deltas.get("support_contact", 0.0) < 0.2:
+        if "interaction_transition" in intent.active_families and delta.interaction_deltas.get("support_contact", 0.0) < 0.2:
             diagnostics.constraint_violations.append("weak_support_contact")
-        if "garment" in intent.action_families and float(delta.garment_deltas.get("coverage_expectation", 1.0)) > 0.85:
+        if "garment_transition" in intent.active_families and float(delta.garment_deltas.get("coverage_expectation", 1.0)) > 0.85:
             diagnostics.constraint_violations.append("garment_progress_low")
 
         diagnostics.visibility_uncertainty = 1.0 - intent.memory.visibility_safety
         diagnostics.garment_uncertainty = max(0.0, 1.0 - intent.memory.garment_memory_strength)
-        diagnostics.interaction_uncertainty = 0.1 if "interaction" in intent.action_families else 0.0
+        diagnostics.interaction_uncertainty = 0.1 if "interaction_transition" in intent.active_families else 0.0
         diagnostics.hidden_transition_uncertainty = max(0.0, 1.0 - intent.memory.hidden_reveal_evidence)
 
         if not delta.pose_deltas:
@@ -524,8 +652,39 @@ class GraphDeltaPredictor:
         diagnostics.explainability_summary = (
             f"phase={intent.planner.phase};dominant_family={dominant};"
             f"visibility_safety={intent.memory.visibility_safety:.2f};"
-            f"families={','.join(intent.action_families)}"
+            f"families={','.join(intent.active_families)};"
+            f"goals={intent.goals}"
         )
+
+    def _region_selection_rationale(self, intent: TransitionIntent) -> dict[str, str]:
+        rationale: dict[str, str] = {}
+        for region in intent.target_profile.primary_regions:
+            rationale[region] = "primary_goal_region"
+        for region in intent.target_profile.secondary_regions:
+            rationale[region] = "secondary_influence_region"
+        for region in intent.target_profile.context_regions:
+            rationale[region] = "context_support_region"
+        return rationale
+
+    def _reveal_rationale(self, intent: TransitionIntent) -> str:
+        if intent.garment.goal in {"outer_layer_removal", "outer_layer_opening"}:
+            return "garment_transition_drives_reveal"
+        if intent.pose.goal == "arm_elevation":
+            return "pose_exposure_drives_reveal"
+        if intent.expression.goal == "smile_like":
+            return "expression_focus_face_reveal"
+        return "identity_preservation"
+
+    def _lexical_bootstrap_influence(self, target_state: PlannedState) -> dict[str, float | bool]:
+        if target_state.semantic_transition is not None:
+            return {
+                "used_runtime_semantic_contract": True,
+                "semantic_origin": "runtime_typed_contract",
+                "bootstrap_score": float(target_state.semantic_transition.lexical_bootstrap_score),
+            }
+        lexical_tokens = [label for label in target_state.labels if not label.startswith("intensity=")]
+        token_density = min(1.0, len(lexical_tokens) / 4.0)
+        return {"used_runtime_semantic_contract": False, "semantic_origin": "coarse_lexical_fallback", "bootstrap_score": token_density}
 
     def _extract_intensity(self, labels: list[str]) -> float:
         for label in labels:

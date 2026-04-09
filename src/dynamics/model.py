@@ -32,7 +32,7 @@ ACTION_VOCAB = [
     "wave",
     "look_away",
 ]
-PHASES = ["early", "mid", "late", "stabilize"]
+PHASES = ["prepare", "transition", "contact_or_reveal", "stabilize"]
 VISIBILITY_STATES = ["visible", "partially_visible", "hidden", "unknown"]
 
 
@@ -212,7 +212,7 @@ class DynamicsModel:
 
 
 def _phase_onehot(phase: str) -> list[float]:
-    p = phase if phase in PHASES else "mid"
+    p = phase if phase in PHASES else "transition"
     return [1.0 if p == v else 0.0 for v in PHASES]
 
 
@@ -278,7 +278,7 @@ def featurize_runtime(
     total_steps = max(1.0, float(context.get("total_steps", context.get("plan_length", 4.0))))
     progress = step_idx / total_steps
     duration = float(context.get("target_duration", context.get("duration", 1.0)))
-    phase = str(context.get("sequencing_stage", context.get("phase", "mid")))
+    phase = str(context.get("phase", context.get("sequencing_stage", "transition")))
     planner_features = [step_idx / 16.0, total_steps / 16.0, progress, duration / 8.0] + _phase_onehot(phase)
 
     if memory:
@@ -296,6 +296,7 @@ def featurize_runtime(
     else:
         memory_features = [0.0] * 8
 
+    semantic = target_state.semantic_transition
     target_features = [
         1.0 if any("target_pose=" in str(v) for v in target_state.labels) else 0.0,
         1.0 if any("target_visibility=" in str(v) for v in target_state.labels) else 0.0,
@@ -303,8 +304,8 @@ def featurize_runtime(
         float(sum(1 for x in labels if x in {"sit_down", "stand_up", "posture_change"})) / 3.0,
         float(sum(1 for x in labels if x in {"remove_garment", "open_garment"})) / 2.0,
         float(sum(1 for x in labels if x in {"smile", "look_away"})) / 2.0,
-        1.0 if "chair" in labels else 0.0,
-        1.0 if "support" in labels else 0.0,
+        1.0 if "chair" in labels or (semantic and semantic.target_profile.support_target == "chair") else 0.0,
+        1.0 if "support" in labels or (semantic and "support_zone" in semantic.target_profile.context_regions) else 0.0,
     ]
 
     # 27 + 8 + 16 + 8 + 8 = 67 -> pad to model input dim for forward compatibility.
@@ -349,7 +350,7 @@ def targets_from_delta(delta: GraphDelta) -> DynamicsTargets:
         1.0 if delta.newly_revealed_regions else 0.0,
         1.0 if delta.newly_occluded_regions else 0.0,
         1.0 if any(v in {"deform", "deform_relation_aware"} for v in delta.region_transition_mode.values()) else 0.0,
-        1.0 if delta.transition_phase in {"late", "stabilize"} else 0.0,
+        1.0 if delta.transition_phase in {"contact_or_reveal", "stabilize"} else 0.0,
     ]
     return DynamicsTargets(
         pose=pose,
@@ -435,7 +436,7 @@ def decode_prediction(
                 occluded.append(RegionRef(region_id=f"{person.person_id}:{region}:occlude", bbox=person.bbox, reason="learned_occlude"))
 
     phase_out = str(context.get("phase", phase))
-    if prediction.region[3] > 0.75 and phase_out not in {"late", "stabilize"}:
+    if prediction.region[3] > 0.75 and phase_out not in {"contact_or_reveal", "stabilize"}:
         phase_out = "stabilize"
 
     return GraphDelta(

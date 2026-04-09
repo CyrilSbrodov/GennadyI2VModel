@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from core.schema import TransitionTargetProfile
+
 
 @dataclass(slots=True)
 class PlannerTransitionContext:
@@ -9,8 +11,8 @@ class PlannerTransitionContext:
 
     step_index: int = 0
     total_steps: int = 1
-    phase: str = "single"
-    sequencing_stage: str = "mid"
+    phase: str = "transition"
+    sequencing_stage: str = "transition"
     target_duration: float = 1.0
     intensity: float = 0.5
 
@@ -28,20 +30,24 @@ class MemoryInfluence:
 
 @dataclass(slots=True)
 class PoseTransitionIntent:
-    target_pose: str = "stable"
-    progression: str = "steady"
+    goal: str = "pose_hold"
+    progression: str = "stabilize"
+    phase_sequence: list[str] = field(default_factory=lambda: ["steady"])
     weight_shift: float = 0.0
 
 
 @dataclass(slots=True)
 class GarmentTransitionIntent:
+    goal: str = "garment_static"
     progression_state: str = "worn"
+    phase_sequence: list[str] = field(default_factory=lambda: ["tensioned", "opening", "partially_detached", "garment_settle"])
     attachment_delta: float = 0.0
     reveal_bias: float = 0.0
 
 
 @dataclass(slots=True)
 class VisibilityTransitionIntent:
+    goal: str = "preserve_identity_region"
     reveal_regions: list[str] = field(default_factory=list)
     occlude_regions: list[str] = field(default_factory=list)
     stable_regions: list[str] = field(default_factory=list)
@@ -49,13 +55,16 @@ class VisibilityTransitionIntent:
 
 @dataclass(slots=True)
 class InteractionTransitionIntent:
+    goal: str = "free"
     support_progression: str = "free"
+    phase_sequence: list[str] = field(default_factory=lambda: ["near_support", "approach_contact", "weight_transfer", "stabilized_contact"])
     support_target: str = ""
     contact_bias: float = 0.0
 
 
 @dataclass(slots=True)
 class ExpressionTransitionIntent:
+    goal: str = "expression_relax"
     expression_label: str = "neutral"
     progression: str = "neutral"
     intensity_delta: float = 0.0
@@ -65,9 +74,11 @@ class ExpressionTransitionIntent:
 class TransitionIntent:
     """Промежуточный контракт намерения перехода состояния."""
 
-    action_families: list[str] = field(default_factory=list)
+    active_families: list[str] = field(default_factory=list)
+    goals: dict[str, str] = field(default_factory=dict)
     target_entity: str = ""
     target_regions: list[str] = field(default_factory=list)
+    target_profile: TransitionTargetProfile = field(default_factory=TransitionTargetProfile)
     planner: PlannerTransitionContext = field(default_factory=PlannerTransitionContext)
     memory: MemoryInfluence = field(default_factory=MemoryInfluence)
     pose: PoseTransitionIntent = field(default_factory=PoseTransitionIntent)

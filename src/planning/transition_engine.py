@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from core.schema import ActionPlan, BBox, PlannerDiagnostics, SceneGraph, SceneObjectNode
+from core.schema import ActionPlan, BBox, PlannerDiagnostics, RuntimeSemanticTransition, SceneGraph, SceneObjectNode
 
 
 @dataclass(slots=True)
@@ -11,6 +11,7 @@ class PlannedState:
     labels: list[str] = field(default_factory=list)
     start_frame: int = 0
     end_frame: int = 0
+    semantic_transition: RuntimeSemanticTransition | None = None
 
 
 @dataclass(slots=True)
@@ -98,6 +99,7 @@ class TransitionPlanner:
                         labels=[action.type, label, f"intensity={intensity:.2f}"],
                         start_frame=current_frame,
                         end_frame=current_frame + step_duration,
+                        semantic_transition=action.semantic_transition,
                     )
                 )
                 current_frame += step_duration

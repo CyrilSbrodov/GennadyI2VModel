@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 
-from core.schema import ActionPlan, ActionStep, SceneGraph
+from core.schema import ActionPlan, ActionStep, RuntimeSemanticTransition, SceneGraph, TransitionPhaseContract, TransitionTargetProfile
 from text.contracts import (
     ActionCandidate,
     ConstraintHint,
@@ -21,76 +21,68 @@ class IntentParser:
     """Многоступенчатый scene-aware parser для построения ActionPlan через structured intent."""
 
     _semantic_families: dict[str, list[tuple[str, str]]] = {
-        "pose": [
-            ("sit", "сад"),
-            ("stand", "вста"),
-            ("raise_arm", "поднима"),
-            ("lower_arm", "опуска"),
-            ("turn_head", "поворач"),
-            ("bend", "наклон"),
-            ("step", "шаг"),
-            ("shift_weight", "вес"),
-            ("hold_pose", "замр"),
+        "pose_transition": [
+            ("seated_pose", "сад"),
+            ("upright_pose", "вста"),
+            ("arm_elevation", "поднима"),
+            ("arm_lowering", "опуска"),
+            ("head_rotation", "поворач"),
+            ("body_reorientation", "наклон"),
+            ("weight_shift", "вес"),
+            ("pose_hold", "замр"),
         ],
-        "garment": [
-            ("remove", "снима"),
-            ("open", "расстег"),
-            ("loosen", "ослаб"),
-            ("adjust", "поправ"),
-            ("reveal_inner", "оголя"),
-            ("cover", "прикры"),
-            ("uncover", "откры"),
+        "garment_transition": [
+            ("outer_layer_removal", "снима"),
+            ("outer_layer_opening", "расстег"),
+            ("garment_reposition", "ослаб"),
+            ("garment_reposition", "поправ"),
+            ("inner_layer_reveal", "оголя"),
+            ("occlude_region", "прикры"),
+            ("reveal_region", "откры"),
         ],
-        "expression": [
-            ("smile", "улыба"),
-            ("frown", "хмур"),
-            ("look", "смотр"),
-            ("relax_expression", "расслаб"),
+        "expression_transition": [
+            ("smile_like", "улыба"),
+            ("frown_like", "хмур"),
+            ("gaze_shift", "смотр"),
+            ("expression_relax", "расслаб"),
         ],
-        "interaction": [
-            ("touch", "каса"),
-            ("hold", "держ"),
-            ("lean_on", "опира"),
-            ("approach_contact", "подход"),
+        "interaction_transition": [
+            ("touch_contact", "каса"),
+            ("touch_contact", "держ"),
+            ("lean_support", "опира"),
+            ("support_contact", "подход"),
         ],
-        "visibility": [
-            ("reveal", "показы"),
-            ("hide", "скрыва"),
-            ("show", "демонстр"),
-            ("uncover", "откры"),
+        "visibility_transition": [
+            ("reveal_region", "показы"),
+            ("occlude_region", "скрыва"),
+            ("reveal_region", "демонстр"),
+            ("reveal_region", "откры"),
         ],
     }
 
-    _legacy_action_map: dict[tuple[str, str], str] = {
-        ("pose", "sit"): "sit_down",
-        ("pose", "stand"): "stand_up",
-        ("pose", "raise_arm"): "raise_arm",
-        ("pose", "lower_arm"): "lower_arm",
-        ("pose", "turn_head"): "turn_head",
-        ("pose", "bend"): "bend",
-        ("pose", "step"): "walk_step",
-        ("pose", "shift_weight"): "shift_weight",
-        ("pose", "hold_pose"): "hold_pose",
-        ("garment", "remove"): "remove_garment",
-        ("garment", "open"): "open_garment",
-        ("garment", "loosen"): "loosen_garment",
-        ("garment", "adjust"): "adjust_garment",
-        ("garment", "reveal_inner"): "reveal_inner_layer",
-        ("garment", "cover"): "cover",
-        ("garment", "uncover"): "uncover",
-        ("expression", "smile"): "smile",
-        ("expression", "frown"): "frown",
-        ("expression", "look"): "look",
-        ("expression", "relax_expression"): "relax_expression",
-        ("interaction", "touch"): "touch",
-        ("interaction", "hold"): "hold",
-        ("interaction", "sit_on_support"): "sit_down",
-        ("interaction", "lean_on"): "lean_on_object",
-        ("interaction", "approach_contact"): "approach_contact",
-        ("visibility", "reveal"): "reveal",
-        ("visibility", "hide"): "hide",
-        ("visibility", "show"): "show",
-        ("visibility", "uncover"): "uncover",
+    _goal_to_legacy_action_map: dict[str, str] = {
+        "seated_pose": "sit_down",
+        "upright_pose": "stand_up",
+        "arm_elevation": "raise_arm",
+        "arm_lowering": "lower_arm",
+        "head_rotation": "turn_head",
+        "body_reorientation": "bend",
+        "weight_shift": "shift_weight",
+        "pose_hold": "hold_pose",
+        "outer_layer_removal": "remove_garment",
+        "outer_layer_opening": "open_garment",
+        "garment_reposition": "adjust_garment",
+        "inner_layer_reveal": "reveal_inner_layer",
+        "smile_like": "smile",
+        "frown_like": "frown",
+        "gaze_shift": "look",
+        "expression_relax": "relax_expression",
+        "touch_contact": "touch",
+        "lean_support": "lean_on_object",
+        "support_contact": "approach_contact",
+        "support_release": "stand_up",
+        "reveal_region": "reveal",
+        "occlude_region": "hide",
     }
 
     _garment_reference_hints = {
@@ -200,8 +192,8 @@ class IntentParser:
                 ActionCandidate(
                     clause_index=clause.index,
                     trigger_text="fallback",
-                    semantic_family="pose",
-                    semantic_action="hold_pose",
+                    semantic_family="pose_transition",
+                    semantic_action="pose_hold",
                     confidence=0.3,
                     lexical_reason="fallback_generic",
                 )
@@ -304,17 +296,17 @@ class IntentParser:
         constraints: list[ConstraintHint] = []
         actions = {(a.semantic_family, a.semantic_action) for a in clause.action_candidates}
 
-        if ("pose", "sit") in actions or ("interaction", "sit_on_support") in actions:
+        if ("pose_transition", "seated_pose") in actions:
             constraints.append(ConstraintHint(clause_index=clause.index, requirement="requires:support_object", reason="sit_action"))
             if not scene_index.has_support_object:
                 constraints.append(ConstraintHint(clause_index=clause.index, requirement="requires:chair", reason="support_missing"))
-        if any(fam == "garment" and act in {"remove", "open", "loosen"} for fam, act in actions):
+        if any(fam == "garment_transition" and act in {"outer_layer_removal", "outer_layer_opening", "garment_reposition"} for fam, act in actions):
             constraints.append(ConstraintHint(clause_index=clause.index, requirement="requires:garment_like_entity", reason="garment_action"))
             if not scene_index.has_outer_garment:
                 constraints.append(ConstraintHint(clause_index=clause.index, requirement="requires:outer_garment", reason="outerwear_missing"))
-        if any(fam == "expression" for fam, _ in actions):
+        if any(fam == "expression_transition" for fam, _ in actions):
             constraints.append(ConstraintHint(clause_index=clause.index, requirement="requires:visible_face", reason="expression_action"))
-        if any((fam, act) in {("pose", "raise_arm"), ("interaction", "touch"), ("interaction", "hold")} for fam, act in actions):
+        if any((fam, act) in {("pose_transition", "arm_elevation"), ("interaction_transition", "touch_contact")} for fam, act in actions):
             constraints.append(ConstraintHint(clause_index=clause.index, requirement="requires:usable_arm", reason="arm_action"))
 
         return constraints
@@ -367,8 +359,9 @@ class IntentParser:
                 global_style = "sharp"
 
             for cand in clause.action_candidates:
-                action_type = self._legacy_action_map.get((cand.semantic_family, cand.semantic_action), "hold_pose")
-                resolved = clause.resolved_targets[0] if clause.resolved_targets else None
+                resolved = self._select_resolved_target_for_candidate(cand, clause.resolved_targets)
+                transition = self._build_runtime_semantic_transition(cand, clause, resolved)
+                action_type = self._goal_to_legacy_action_map.get(transition.goal, "hold_pose")
                 intensity = clause.modifiers.intensity if clause.modifiers.intensity is not None else 0.6
                 duration = self._estimate_duration(clause.modifiers.speed)
                 step = ActionStep(
@@ -385,7 +378,8 @@ class IntentParser:
                         **clause.modifiers.as_dict(),
                         "parser_confidence": round(max(0.0, cand.confidence - 0.1 * len(clause.ambiguities)), 3),
                         "semantic_family": cand.semantic_family,
-                        "semantic_action": cand.semantic_action,
+                        "semantic_goal": transition.goal,
+                        "semantic_transition": self._runtime_semantic_transition_to_dict(transition),
                         "ambiguities": clause.ambiguities[:],
                         "trace": {
                             "trigger": cand.trigger_text,
@@ -393,6 +387,7 @@ class IntentParser:
                             "resolution": [r.resolution_reason for r in clause.resolved_targets],
                         },
                     },
+                    semantic_transition=transition,
                 )
                 action_idx = len(actions)
                 clause_to_actions.setdefault(clause.index, []).append(action_idx)
@@ -427,6 +422,155 @@ class IntentParser:
             parallel_groups=parallel_groups,
             global_style=global_style if global_style != "neutral" else ("slow" if global_speed == "slow" else "neutral"),
         )
+
+    def _select_resolved_target_for_candidate(self, candidate: ActionCandidate, resolved_targets: list[ResolvedTarget]) -> ResolvedTarget | None:
+        if not resolved_targets:
+            return None
+        preferred_by_family = {
+            "pose_transition": {"body", "self"},
+            "expression_transition": {"body", "self"},
+            "garment_transition": {"garment", "self"},
+            "interaction_transition": {"object", "self"},
+            "visibility_transition": {"body", "garment", "self"},
+        }
+        preferred = preferred_by_family.get(candidate.semantic_family, {"self"})
+        for resolved in resolved_targets:
+            if resolved.target_entity_class in preferred:
+                return resolved
+        return resolved_targets[0]
+
+    def _build_runtime_semantic_transition(
+        self,
+        candidate: ActionCandidate,
+        clause: ParsedClause,
+        resolved: ResolvedTarget | None,
+    ) -> RuntimeSemanticTransition:
+        primary, secondary, context = self._structured_target_regions(candidate.semantic_family, candidate.semantic_action, resolved)
+        target_profile = TransitionTargetProfile(
+            primary_regions=primary,
+            secondary_regions=secondary,
+            context_regions=context,
+            entity=resolved.target_entity_class if resolved else "self",
+            entity_id=resolved.target_entity_id if resolved else None,
+            object_role=resolved.target_object if resolved else None,
+            support_target="chair" if resolved and resolved.target_region == "support" else None,
+        )
+        sequencing = "parallel" if clause.modifiers.simultaneity_hint else ("sequential" if clause.modifiers.sequencing_hint else "single")
+        global_phase_sequence = self._global_phase_sequence()
+        family_subphase_sequence = self._family_subphase_sequence(candidate.semantic_family, candidate.semantic_action)
+        phase = TransitionPhaseContract(global_phase="prepare", global_phase_sequence=global_phase_sequence)
+        if candidate.semantic_family == "pose_transition":
+            phase.pose_subphase = family_subphase_sequence[0] if family_subphase_sequence else "steady"
+            phase.pose_subphase_sequence = family_subphase_sequence
+        if candidate.semantic_family == "garment_transition":
+            phase.garment_subphase = family_subphase_sequence[0] if family_subphase_sequence else "stable"
+            phase.garment_subphase_sequence = family_subphase_sequence
+        if candidate.semantic_family == "interaction_transition":
+            phase.interaction_subphase = family_subphase_sequence[0] if family_subphase_sequence else "free"
+            phase.interaction_subphase_sequence = family_subphase_sequence
+        if candidate.semantic_family == "expression_transition":
+            phase.expression_subphase = family_subphase_sequence[0] if family_subphase_sequence else "neutral"
+            phase.expression_subphase_sequence = family_subphase_sequence
+        return RuntimeSemanticTransition(
+            family=candidate.semantic_family,
+            goal=candidate.semantic_action,
+            confidence=candidate.confidence,
+            lexical_bootstrap_score=self._bootstrap_strength(candidate.lexical_reason),
+            lexical_trace=[candidate.lexical_reason],
+            target_profile=target_profile,
+            phase=phase,
+            modifiers={
+                "intensity": float(clause.modifiers.intensity if clause.modifiers.intensity is not None else 0.6),
+                "speed": clause.modifiers.speed,
+                "abruptness": clause.modifiers.abruptness,
+                "carefulness": clause.modifiers.carefulness,
+                "extent": "full" if (clause.modifiers.degree_hint or "") in {"fully", "полностью"} else "partial",
+                "simultaneity": clause.modifiers.simultaneity_hint,
+                "sequencing": sequencing,
+                "global_phase_sequence": global_phase_sequence,
+                "family_subphase_sequence": family_subphase_sequence,
+            },
+        )
+
+    def _global_phase_sequence(self) -> list[str]:
+        return ["prepare", "transition", "contact_or_reveal", "stabilize"]
+
+    def _family_subphase_sequence(self, family: str, goal: str) -> list[str]:
+        if family == "pose_transition" and goal == "seated_pose":
+            return ["weight_shift", "lowering", "contact_settle", "seated_stabilization"]
+        if family == "pose_transition" and goal == "arm_elevation":
+            return ["shoulder_lift", "elbow_extension", "arm_lock", "arm_stabilization"]
+        if family == "pose_transition" and goal == "head_rotation":
+            return ["neck_prepare", "head_rotation", "gaze_lock", "head_stabilization"]
+        if family == "garment_transition":
+            return ["tensioned", "opening", "partially_detached", "garment_settle"]
+        if family == "interaction_transition":
+            return ["near_support", "approach_contact", "weight_transfer", "stabilized_contact"]
+        if family == "expression_transition":
+            return ["subtle_rise", "forming_expression", "stable_expression", "expression_relax"]
+        return ["steady"]
+
+    def _runtime_semantic_transition_to_dict(self, transition: RuntimeSemanticTransition) -> dict[str, object]:
+        regions = sorted(
+            set(
+                transition.target_profile.primary_regions
+                + transition.target_profile.secondary_regions
+                + transition.target_profile.context_regions
+            )
+        )
+        return {
+            "family": transition.family,
+            "goal": transition.goal,
+            "global_phase_sequence": transition.phase.global_phase_sequence,
+            "family_subphase_sequence": (
+                transition.phase.pose_subphase_sequence
+                or transition.phase.garment_subphase_sequence
+                or transition.phase.interaction_subphase_sequence
+                or transition.phase.expression_subphase_sequence
+            ),
+            "active_phase": transition.phase.global_phase,
+            "targets": {
+                "entity": transition.target_profile.entity,
+                "entity_id": transition.target_profile.entity_id,
+                "regions": regions,
+                "primary_regions": transition.target_profile.primary_regions,
+                "secondary_regions": transition.target_profile.secondary_regions,
+                "context_regions": transition.target_profile.context_regions,
+                "object_role": transition.target_profile.object_role,
+                "support_target": transition.target_profile.support_target,
+            },
+            "modifiers": transition.modifiers,
+            "confidence": transition.confidence,
+            "lexical_bootstrap": transition.lexical_trace,
+            "lexical_bootstrap_score": transition.lexical_bootstrap_score,
+        }
+
+    def _structured_target_regions(
+        self,
+        family: str,
+        goal: str,
+        resolved: ResolvedTarget | None,
+    ) -> tuple[list[str], list[str], list[str]]:
+        if family == "pose_transition" and goal == "seated_pose":
+            return ["legs", "pelvis"], ["torso"], ["support_zone"]
+        if family == "pose_transition" and goal == "arm_elevation":
+            return ["left_arm", "right_arm"], ["upper_torso", "shoulders"], []
+        if family == "pose_transition" and goal == "head_rotation":
+            return ["face", "head", "neck"], ["upper_torso"], []
+        if family == "garment_transition":
+            return ["garments", "sleeves"], ["torso", "inner_garment"], ["support_zone"] if resolved and resolved.target_entity_class == "object" else []
+        if family == "expression_transition":
+            return ["face", "head", "neck"], ["upper_torso"], []
+        if family == "interaction_transition":
+            return ["support_zone", "pelvis"], ["legs", "torso"], ["chair"] if resolved and resolved.target_object else []
+        return ["torso"], [], []
+
+    def _bootstrap_strength(self, lexical_reason: str) -> float:
+        if lexical_reason == "fallback_generic":
+            return 1.0
+        if lexical_reason.startswith("marker:"):
+            return 0.35
+        return 0.5
 
     def _normalize_text(self, text: str) -> str:
         """Нормализует строку и приводит ключевые синонимы к общим формам."""
