@@ -233,8 +233,11 @@ class GennadyEngine:
                 patch_channels = self.build_patch_memory_channels(memory_channels)
                 transition_metadata = transition_output.metadata if isinstance(transition_output.metadata, dict) else {}
                 learned_temporal_contract = transition_metadata.get("temporal_transition_contract", {})
+                learned_human_state_contract = transition_metadata.get("human_state_contract", {})
                 learned_target_profile = {}
-                if isinstance(learned_temporal_contract, dict):
+                if isinstance(learned_human_state_contract, dict):
+                    learned_target_profile = learned_human_state_contract.get("target_profile", {}) if isinstance(learned_human_state_contract.get("target_profile", {}), dict) else {}
+                if not learned_target_profile and isinstance(learned_temporal_contract, dict):
                     learned_target_profile = learned_temporal_contract.get("target_profile", {}) if isinstance(learned_temporal_contract.get("target_profile", {}), dict) else {}
                 patch_request = PatchSynthesisRequest(
                     region=region,
@@ -247,6 +250,7 @@ class GennadyEngine:
                         "step_index": planned_state.step_index,
                         "target_profile": learned_target_profile or transition_metadata.get("target_profile", {}),
                         "learned_temporal_contract": learned_temporal_contract,
+                        "learned_human_state_contract": learned_human_state_contract,
                         "region_selection_rationale": transition_metadata.get("region_selection_rationale", {}),
                         "semantic_families": transition_metadata.get("semantic_families", []),
                     },

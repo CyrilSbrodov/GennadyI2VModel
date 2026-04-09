@@ -10,6 +10,7 @@ import numpy as np
 
 from dynamics.model import DynamicsModel, decode_prediction, featurize_runtime
 from dynamics.state_update import apply_delta
+from dynamics.human_state_transition import HumanStateTransitionModel
 from dynamics.temporal_transition_encoder import TemporalTransitionEncoder
 from planning.transition_engine import PlannedState
 from rendering.trainable_patch_renderer import TemporalLocalPatchModel, TrainableLocalPatchModel
@@ -87,6 +88,8 @@ def evaluate_rollout_on_video_manifest(
     rollout_steps: int = 1,
     max_records: int | None = None,
     renderer_backend: str = "legacy_local_renderer",
+    use_human_state_contract: bool = False,
+    human_state_model: HumanStateTransitionModel | None = None,
 ) -> dict[str, object]:
     payload = json.loads(Path(dataset_manifest).read_text(encoding="utf-8"))
     if payload.get("manifest_type") != "video_transition_manifest":
@@ -98,6 +101,7 @@ def evaluate_rollout_on_video_manifest(
         return {"dataset_source": "synthetic_rollout_bootstrap_fallback_manifest_empty", "records_used": 0, "payloads": [], "rollout_frame_reconstruction_proxy": 0.0}
 
     temporal = temporal_model or (TemporalTransitionEncoder.load(temporal_weights_path) if temporal_weights_path else TemporalTransitionEncoder())
+    human_state = human_state_model or HumanStateTransitionModel()
     dynamics = dynamics_model or (DynamicsModel.load(dynamics_weights_path) if dynamics_weights_path else DynamicsModel())
     renderer = renderer_model or (
         TemporalLocalPatchModel.load(renderer_weights_path)
@@ -163,9 +167,38 @@ def evaluate_rollout_on_video_manifest(
             )
             temporal_pred = temporal.forward(np.asarray(feature_vector, dtype=np.float64))
             temporal_contract = temporal.to_typed_contract(temporal_pred)
+            selected_family = temporal_contract.predicted_family
+            selected_phase = temporal_contract.predicted_phase
+            selected_profile = {
+                "primary_regions": list(temporal_contract.target_profile.primary_regions),
+                "secondary_regions": list(temporal_contract.target_profile.secondary_regions),
+                "context_regions": list(temporal_contract.target_profile.context_regions),
+            }
+            reveal_score = float(temporal_contract.reveal_score)
+            occlusion_score = float(temporal_contract.occlusion_score)
+            support_score = float(temporal_contract.support_contact_score)
+            human_contract_payload = {}
+            if use_human_state_contract:
+                human_input = np.asarray(feature_vector + list(temporal_contract.transition_embedding) + [reveal_score, occlusion_score, support_score], dtype=np.float64)
+                if human_input.shape[0] < human_state.input_dim:
+                    human_input = np.concatenate([human_input, np.zeros((human_state.input_dim - human_input.shape[0],), dtype=np.float64)])
+                human_pred = human_state.forward(human_input[: human_state.input_dim])
+                human_contract = human_state.to_typed_contract(human_pred)
+                human_contract_payload = human_contract.to_metadata()
+                selected_family = human_contract.predicted_family
+                selected_phase = human_contract.predicted_phase
+                selected_profile = {
+                    "primary_regions": list(human_contract.target_profile.primary_regions),
+                    "secondary_regions": list(human_contract.target_profile.secondary_regions),
+                    "context_regions": list(human_contract.target_profile.context_regions),
+                }
+                mean_vis = float(np.mean(list(human_contract.visibility_state_scores.values()) or [0.0]))
+                reveal_score = mean_vis
+                occlusion_score = 1.0 - mean_vis
+                support_score = float(human_contract.support_contact_state)
 
             labels = [str(x) for x in ((rec.get("graph_delta_target", {}) or {}).get("semantic_reasons", []))] or [family_gt]
-            labels += [f"temporal_family={temporal_contract.predicted_family}", f"temporal_phase={temporal_contract.predicted_phase}"]
+            labels += [f"temporal_family={selected_family}", f"temporal_phase={selected_phase}"]
             plan_state = PlannedState(step_index=int(planner.get("step_index", rec_idx + 1)), labels=labels)
             dyn_inputs = featurize_runtime(
                 cur_graph,
@@ -173,7 +206,7 @@ def evaluate_rollout_on_video_manifest(
                 {
                     "step_index": float(planner.get("step_index", rec_idx + 1)),
                     "total_steps": float(planner.get("total_steps", max(2, len(records)))),
-                    "phase": temporal_contract.predicted_phase,
+                    "phase": selected_phase,
                     "target_duration": float(planner.get("target_duration", 1.0)),
                 },
                 None,
@@ -182,9 +215,9 @@ def evaluate_rollout_on_video_manifest(
             pred_delta = decode_prediction(
                 dyn_pred,
                 scene_graph=copy.deepcopy(cur_graph),
-                phase=temporal_contract.predicted_phase,
+                phase=selected_phase,
                 semantic_reasons=labels,
-                planner_context={"phase": temporal_contract.predicted_phase},
+                planner_context={"phase": selected_phase},
             )
 
             render_batch = type("_RolloutBatch", (), {})()
@@ -193,9 +226,9 @@ def evaluate_rollout_on_video_manifest(
             render_batch.changed_mask = changed_mask
             render_batch.alpha_target = np.clip(0.2 + 0.8 * changed_mask, 0.0, 1.0)
             render_batch.blend_hint = preservation
-            render_batch.semantic_embed = np.asarray([1.0 if temporal_contract.predicted_family == "expression_transition" else 0.0, 1.0 if temporal_contract.predicted_family in {"garment_transition", "visibility_transition"} else 0.0, 1.0 if temporal_contract.predicted_family in {"pose_transition", "interaction_transition"} else 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
-            render_batch.delta_cond = np.asarray([temporal_contract.reveal_score, temporal_contract.occlusion_score, temporal_contract.support_contact_score] + [0.0] * 9, dtype=np.float32)[:12]
-            render_batch.planner_cond = np.asarray([1.0 if temporal_contract.predicted_phase == p else 0.0 for p in ("prepare", "transition", "contact_or_reveal", "stabilize")] + [0.0] * 10, dtype=np.float32)[:10]
+            render_batch.semantic_embed = np.asarray([1.0 if selected_family == "expression_transition" else 0.0, 1.0 if selected_family in {"garment_transition", "visibility_transition"} else 0.0, 1.0 if selected_family in {"pose_transition", "interaction_transition"} else 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+            render_batch.delta_cond = np.asarray([reveal_score, occlusion_score, support_score] + [0.0] * 9, dtype=np.float32)[:12]
+            render_batch.planner_cond = np.asarray([1.0 if selected_phase == p else 0.0 for p in ("prepare", "transition", "contact_or_reveal", "stabilize")] + [0.0] * 10, dtype=np.float32)[:10]
             render_batch.graph_cond = np.zeros((8,), dtype=np.float32)
             render_batch.memory_cond = np.zeros((10,), dtype=np.float32)
             render_batch.appearance_cond = np.asarray(np.concatenate([np.mean(cur_roi, axis=(0, 1)), np.std(cur_roi, axis=(0, 1))]), dtype=np.float32)
@@ -209,38 +242,34 @@ def evaluate_rollout_on_video_manifest(
             render_batch.profile_role = "primary"
             render_batch.conditioning_summary = {
                 "contract_source": "rollout_eval",
-                "predicted_family": temporal_contract.predicted_family,
-                "predicted_phase": temporal_contract.predicted_phase,
+                "predicted_family": selected_family,
+                "predicted_phase": selected_phase,
             }
             render_batch.previous_roi = cur_roi if renderer_backend == "temporal_local_renderer" else None
-            render_batch.predicted_family = temporal_contract.predicted_family
-            render_batch.predicted_phase = temporal_contract.predicted_phase
-            render_batch.target_profile = {
-                "primary_regions": list(temporal_contract.target_profile.primary_regions),
-                "secondary_regions": list(temporal_contract.target_profile.secondary_regions),
-                "context_regions": list(temporal_contract.target_profile.context_regions),
-            }
-            render_batch.reveal_score = float(temporal_contract.reveal_score)
-            render_batch.occlusion_score = float(temporal_contract.occlusion_score)
-            render_batch.support_contact_score = float(temporal_contract.support_contact_score)
+            render_batch.predicted_family = selected_family
+            render_batch.predicted_phase = selected_phase
+            render_batch.target_profile = selected_profile
+            render_batch.reveal_score = float(reveal_score)
+            render_batch.occlusion_score = float(occlusion_score)
+            render_batch.support_contact_score = float(support_score)
             render_batch.rollout_weight = float(np.clip(1.0 + render_batch.reveal_score * 0.4 + render_batch.occlusion_score * 0.3, 0.5, 2.0))
             render_out = renderer.forward(render_batch)
             pred_roi = np.asarray(render_out["rgb"], dtype=np.float32)
 
             gt_delta_raw = rec.get("graph_delta_target", {}) if isinstance(rec.get("graph_delta_target", {}), dict) else {}
             gt_regions = _target_regions(target_profile_gt)
-            pred_regions = set(temporal_contract.target_profile.primary_regions + temporal_contract.target_profile.secondary_regions + temporal_contract.target_profile.context_regions)
+            pred_regions = _target_regions(selected_profile)
 
             frame_proxy = float(max(0.0, 1.0 - np.mean(np.abs(pred_roi - gt_after_roi))))
             roi_proxy = float(max(0.0, 1.0 - np.mean(np.abs(pred_roi - gt_after_roi) * (0.25 + 0.75 * changed_mask))))
-            phase_acc = 1.0 if temporal_contract.predicted_phase == phase_gt else 0.0
-            family_acc = 1.0 if temporal_contract.predicted_family == family_gt else 0.0
+            phase_acc = 1.0 if selected_phase == phase_gt else 0.0
+            family_acc = 1.0 if selected_family == family_gt else 0.0
             profile_consistency = _jaccard(pred_regions, gt_regions)
             alignment = float(np.clip(0.4 * family_acc + 0.3 * phase_acc + 0.3 * profile_consistency, 0.0, 1.0))
             dyn_valid = 1.0 if (pred_delta.region_transition_mode and pred_delta.state_after and pred_delta.affected_regions) else 0.0
             renderer_valid = 1.0 if pred_roi.shape == gt_after_roi.shape else 0.0
-            reveal_q = float(max(0.0, 1.0 - abs(float(temporal_contract.reveal_score) - float(np.clip(rec.get("reveal_score", 0.0), 0.0, 1.0)))))
-            occlusion_q = float(max(0.0, 1.0 - abs(float(temporal_contract.occlusion_score) - float(np.clip(rec.get("occlusion_score", 0.0), 0.0, 1.0)))))
+            reveal_q = float(max(0.0, 1.0 - abs(float(reveal_score) - float(np.clip(rec.get("reveal_score", 0.0), 0.0, 1.0)))))
+            occlusion_q = float(max(0.0, 1.0 - abs(float(occlusion_score) - float(np.clip(rec.get("occlusion_score", 0.0), 0.0, 1.0)))))
 
             metrics["rollout_frame_reconstruction_proxy"] += frame_proxy
             metrics["rollout_roi_reconstruction_proxy"] += roi_proxy
@@ -261,6 +290,9 @@ def evaluate_rollout_on_video_manifest(
                         "start_frame": cur_roi.tolist(),
                         "start_graph": _serialize_graph(cur_graph),
                         "predicted_temporal_contract": temporal_contract.to_metadata(),
+                        "predicted_human_state_contract": human_contract_payload,
+                        "active_conditioning_source": "human_state" if human_contract_payload else "temporal",
+                        "active_target_profile": selected_profile,
                         "predicted_graph_delta": _serialize_delta_contract(pred_delta),
                         "predicted_rendered_roi": {
                             "rgb": pred_roi.tolist(),
@@ -306,6 +338,7 @@ def evaluate_rollout_on_video_manifest(
             "dataset_source": "manifest_video_rollout_eval_primary",
             "rollout_mode": mode,
             "renderer_backend": renderer_backend,
+            "conditioning_path": "temporal_plus_human_state" if use_human_state_contract else "temporal_only",
             "payloads": [t.rollout_payload for t in traces],
         }
     )
@@ -321,6 +354,8 @@ def evaluate_rollout_modes_on_video_manifest(
     rollout_steps: int = 1,
     max_records: int | None = None,
     renderer_backend: str = "legacy_local_renderer",
+    use_human_state_contract: bool = False,
+    human_state_model: HumanStateTransitionModel | None = None,
 ) -> dict[str, object]:
     teacher = evaluate_rollout_on_video_manifest(
         dataset_manifest=dataset_manifest,
@@ -342,7 +377,26 @@ def evaluate_rollout_modes_on_video_manifest(
         max_records=max_records,
         renderer_backend=renderer_backend,
     )
-    return {"teacher_forced_rollout": teacher, "predicted_rollout": predicted}
+    predicted_human = evaluate_rollout_on_video_manifest(
+        dataset_manifest=dataset_manifest,
+        temporal_model=temporal_model,
+        dynamics_model=dynamics_model,
+        renderer_model=renderer_model,
+        mode="predicted_rollout",
+        rollout_steps=rollout_steps,
+        max_records=max_records,
+        renderer_backend=renderer_backend,
+        use_human_state_contract=True,
+    )
+    return {
+        "teacher_forced_rollout": teacher,
+        "predicted_rollout": predicted,
+        "predicted_rollout_with_human_state": predicted_human,
+        "path_comparison": {
+            "temporal_only": predicted.get("rollout_frame_reconstruction_proxy", 0.0),
+            "temporal_plus_human_state": predicted_human.get("rollout_frame_reconstruction_proxy", 0.0),
+        },
+    }
 
 
 def tiny_video_overfit_harness(
@@ -352,6 +406,8 @@ def tiny_video_overfit_harness(
     epochs: int = 4,
     rollout_steps: int = 1,
     renderer_backend: str = "legacy_local_renderer",
+    use_human_state_contract: bool = False,
+    human_state_model: HumanStateTransitionModel | None = None,
 ) -> dict[str, object]:
     from training.datasets import DynamicsDataset, RendererDataset, TemporalTransitionDataset
     from training.dynamics_trainer import DynamicsDatasetAdapter

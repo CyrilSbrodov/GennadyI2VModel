@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from dynamics.model import DynamicsInputs, DynamicsModel, DynamicsTargets, decode_prediction, featurize_runtime, targets_from_delta
+from dynamics.human_state_transition import HumanStateTransitionModel
 from dynamics.temporal_transition_encoder import PHASES, REGION_KEYS, TemporalTransitionEncoder
 from planning.transition_engine import PlannedState
 from rendering.trainable_patch_renderer import TrainableLocalPatchModel
@@ -66,7 +67,7 @@ class DynamicsDatasetAdapter:
         )
 
     @classmethod
-    def sample_to_batch(cls, sample: TrainingSample, *, encoder: TemporalTransitionEncoder | None, conditioning_mode: str, step_index: int = 1) -> DynamicsBatch:
+    def sample_to_batch(cls, sample: TrainingSample, *, encoder: TemporalTransitionEncoder | None, human_encoder: HumanStateTransitionModel | None = None, conditioning_mode: str, step_index: int = 1) -> DynamicsBatch:
         graph_before = sample["graphs"][0]
         actions = sample.get("actions", [])
         action_tokens = [a.type for a in actions] or ["micro_adjust"]
@@ -93,11 +94,31 @@ class DynamicsDatasetAdapter:
                 support_contact_score=float(typed.support_contact_score),
             )
 
+        human: TemporalContractConditioning | None = None
+        human_features = sample.get("human_state_transition_features")
+        if human_encoder is not None and isinstance(human_features, list) and human_features:
+            hp = human_encoder.forward(np.asarray(human_features, dtype=np.float64))
+            hc = human_encoder.to_typed_contract(hp)
+            mean_vis = float(np.mean(list(hc.visibility_state_scores.values()) or [0.0]))
+            human = TemporalContractConditioning(
+                source="learned_human_state_contract",
+                predicted_family=hc.predicted_family,
+                predicted_phase=hc.predicted_phase,
+                target_profile={
+                    "primary_regions": list(hc.target_profile.primary_regions),
+                    "secondary_regions": list(hc.target_profile.secondary_regions),
+                    "context_regions": list(hc.target_profile.context_regions),
+                },
+                reveal_score=mean_vis,
+                occlusion_score=float(1.0 - mean_vis),
+                support_contact_score=float(hc.support_contact_state),
+            )
+
         selected = weak
         if conditioning_mode == "learned_contract_only":
-            selected = learned or weak
-        elif conditioning_mode == "mixed_contract_bootstrap" and learned is not None:
-            selected = learned
+            selected = human or learned or weak
+        elif conditioning_mode == "mixed_contract_bootstrap":
+            selected = human or learned or weak
         elif conditioning_mode == "weak_contract_only":
             selected = weak
 
@@ -151,6 +172,7 @@ class DynamicsTrainer(BaseTrainer):
 
     def __init__(self) -> None:
         self.temporal_encoder = TemporalTransitionEncoder()
+        self.human_state_encoder = HumanStateTransitionModel()
         self.contract_conditioning_mode = "weak_contract_only"
 
     @staticmethod
@@ -186,8 +208,10 @@ class DynamicsTrainer(BaseTrainer):
 
     def _iter_batches(self, dataset: DynamicsDataset) -> list[DynamicsBatch]:
         has_temporal = bool(dataset.samples and isinstance(dataset.samples[0].get("temporal_transition_features"), list))
+        has_human = bool(dataset.samples and isinstance(dataset.samples[0].get("human_state_transition_features"), list))
         encoder = self.temporal_encoder if has_temporal else None
-        return [DynamicsDatasetAdapter.sample_to_batch(sample, encoder=encoder, conditioning_mode=self.contract_conditioning_mode, step_index=max(1, idx + 1)) for idx, sample in enumerate(dataset.samples)]
+        human_encoder = self.human_state_encoder if has_human else None
+        return [DynamicsDatasetAdapter.sample_to_batch(sample, encoder=encoder, human_encoder=human_encoder, conditioning_mode=self.contract_conditioning_mode, step_index=max(1, idx + 1)) for idx, sample in enumerate(dataset.samples)]
 
     def _evaluate(self, model: DynamicsModel, batches: list[DynamicsBatch]) -> dict[str, float]:
         metrics = {
@@ -239,8 +263,9 @@ class DynamicsTrainer(BaseTrainer):
             for group, present in batch.delta_groups.items():
                 metrics[f"{group}_group_coverage"] += present
             csrc = batch.temporal_contract_conditioning.source
-            metrics["learned_contract_usage_ratio"] += 1.0 if csrc == "learned_temporal_contract" else 0.0
-            metrics["weak_contract_usage_ratio"] += 1.0 if csrc != "learned_temporal_contract" else 0.0
+            is_learned = csrc in {"learned_temporal_contract", "learned_human_state_contract"}
+            metrics["learned_contract_usage_ratio"] += 1.0 if is_learned else 0.0
+            metrics["weak_contract_usage_ratio"] += 1.0 if csrc == "weak_manifest_bootstrap" else 0.0
             metrics["temporal_to_dynamics_phase_consistency"] += 1.0 if batch.temporal_contract_conditioning.predicted_phase == str(batch.planner_context.get("phase", "")) else 0.0
             target_regions = set(
                 batch.temporal_contract_conditioning.target_profile.get("primary_regions", [])
@@ -282,12 +307,13 @@ class DynamicsTrainer(BaseTrainer):
                 losses = model.train_step(batch.inputs, batch.targets, lr=config.learning_rate)
                 for key in accum:
                     accum[key] += float(losses[key])
-                if batch.temporal_contract_conditioning.source == "learned_temporal_contract":
+                if batch.temporal_contract_conditioning.source in {"learned_temporal_contract", "learned_human_state_contract"}:
                     learned_usage += 1.0
+            weak_usage = float(sum(1.0 for b in train_batches if b.temporal_contract_conditioning.source == "weak_manifest_bootstrap"))
             denom = max(1.0, float(len(train_batches)))
             train_metrics = {k.replace("_loss", ""): round(v / denom, 6) for k, v in accum.items()}
             train_metrics["learned_contract_usage_ratio"] = round(learned_usage / denom, 6)
-            train_metrics["weak_contract_usage_ratio"] = round(1.0 - train_metrics["learned_contract_usage_ratio"], 6)
+            train_metrics["weak_contract_usage_ratio"] = round(weak_usage / denom, 6)
 
         val_metrics = self._evaluate(model, val_batches)
         val_metrics["score"] = round(max(0.0, 1.0 - val_metrics["pose_mse"]), 6)

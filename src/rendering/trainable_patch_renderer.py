@@ -8,7 +8,7 @@ import numpy as np
 
 from core.region_ids import parse_region_id
 from core.schema import RegionRef
-from dynamics.transition_contracts import LearnedTemporalTransitionContract
+from dynamics.transition_contracts import LearnedHumanStateContract, LearnedTemporalTransitionContract
 from learned.interfaces import PatchSynthesisOutput, PatchSynthesisRequest
 from utils_tensor import shape
 
@@ -182,7 +182,18 @@ def _default_profile_role(region_type: str, reason: str, delta_regions: list[str
 
 def _resolve_profile_role(request: PatchSynthesisRequest, region_type: str) -> str:
     ctx = request.transition_context if isinstance(request.transition_context, dict) else {}
+    human_contract = LearnedHumanStateContract.from_metadata(ctx.get("learned_human_state_contract"))
     learned_contract = LearnedTemporalTransitionContract.from_metadata(ctx.get("learned_temporal_contract"))
+    if human_contract is not None and human_contract.is_learned_primary:
+        primary = set(human_contract.target_profile.primary_regions)
+        secondary = set(human_contract.target_profile.secondary_regions)
+        context = set(human_contract.target_profile.context_regions)
+        if region_type in primary:
+            return "primary"
+        if region_type in secondary:
+            return "secondary"
+        if region_type in context:
+            return "context"
     if learned_contract is not None and learned_contract.is_learned_primary:
         primary = set(learned_contract.target_profile.primary_regions)
         secondary = set(learned_contract.target_profile.secondary_regions)
@@ -221,13 +232,26 @@ def _resolve_profile_role(request: PatchSynthesisRequest, region_type: str) -> s
 
 def _build_render_profile(request: PatchSynthesisRequest) -> RenderConditioningProfile:
     ctx = request.transition_context if isinstance(request.transition_context, dict) else {}
+    human_contract = LearnedHumanStateContract.from_metadata(ctx.get("learned_human_state_contract"))
     learned_contract = LearnedTemporalTransitionContract.from_metadata(ctx.get("learned_temporal_contract"))
     delta = ctx.get("graph_delta")
     _, region_type = parse_region_id(request.region.region_id)
     raw_mode = ""
     if delta is not None:
         raw_mode = str(getattr(delta, "region_transition_mode", {}).get(region_type, ""))
-    if learned_contract is not None and learned_contract.is_learned_primary:
+    if human_contract is not None and human_contract.is_learned_primary:
+        vis_scores = list(human_contract.visibility_state_scores.values())
+        vis_mean = float(np.mean(vis_scores)) if vis_scores else 0.0
+        torso_vis = float(human_contract.visibility_state_scores.get(region_type, human_contract.visibility_state_scores.get("torso", vis_mean)))
+        if vis_mean > max(torso_vis, 0.65):
+            raw_mode = "visibility_occlusion"
+        elif torso_vis >= 0.5:
+            raw_mode = "garment_reveal"
+        elif human_contract.predicted_family == "expression_transition":
+            raw_mode = "expression_refine"
+        elif human_contract.predicted_family in {"pose_transition", "interaction_transition"}:
+            raw_mode = "pose_exposure"
+    elif learned_contract is not None and learned_contract.is_learned_primary:
         if learned_contract.occlusion_score > max(learned_contract.reveal_score, 0.55):
             raw_mode = "visibility_occlusion"
         elif learned_contract.reveal_score >= 0.5:
@@ -772,6 +796,7 @@ def _semantic_embed(region_id: str, profile: RenderConditioningProfile) -> np.nd
 
 def _delta_features(request: PatchSynthesisRequest, profile: RenderConditioningProfile) -> tuple[np.ndarray, np.ndarray]:
     ctx = request.transition_context if isinstance(request.transition_context, dict) else {}
+    human_contract = LearnedHumanStateContract.from_metadata(ctx.get("learned_human_state_contract"))
     learned_contract = LearnedTemporalTransitionContract.from_metadata(ctx.get("learned_temporal_contract"))
     delta = ctx.get("graph_delta")
     transition_phase = str(ctx.get("transition_phase", "")).lower()
