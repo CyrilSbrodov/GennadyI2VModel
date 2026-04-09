@@ -73,18 +73,20 @@ class DynamicsTrainer(BaseTrainer):
         self.dataset_source = "synthetic_dynamics_bootstrap"
         self.dataset_diagnostics = {}
         if config.learned_dataset_path:
-            manifest_ds = DynamicsDataset.from_transition_manifest(config.learned_dataset_path, strict=False)
+            payload = json.loads(Path(config.learned_dataset_path).read_text(encoding="utf-8"))
+            is_video_manifest = payload.get("manifest_type") == "video_transition_manifest"
+            manifest_ds = DynamicsDataset.from_video_transition_manifest(config.learned_dataset_path, strict=False) if is_video_manifest else DynamicsDataset.from_transition_manifest(config.learned_dataset_path, strict=False)
             self.dataset_diagnostics = getattr(manifest_ds, "diagnostics", {})
             if len(manifest_ds) > 1:
                 split = max(1, int(0.8 * len(manifest_ds)))
-                self.dataset_source = "manifest_dynamics_primary"
+                self.dataset_source = "manifest_video_dynamics_primary" if is_video_manifest else "manifest_dynamics_primary"
                 train_ds = DynamicsDataset(samples=manifest_ds.samples[:split])
                 val_ds = DynamicsDataset(samples=manifest_ds.samples[split:])
                 train_ds.diagnostics = dict(self.dataset_diagnostics, split="train")
                 val_ds.diagnostics = dict(self.dataset_diagnostics, split="val")
                 return train_ds, val_ds
             if len(manifest_ds) == 1:
-                self.dataset_source = "manifest_dynamics_primary_with_synthetic_val_fallback"
+                self.dataset_source = "manifest_video_dynamics_primary_with_synthetic_val_fallback" if is_video_manifest else "manifest_dynamics_primary_with_synthetic_val_fallback"
                 return manifest_ds, DynamicsDataset.synthetic(max(1, config.val_size))
             self.dataset_source = "synthetic_dynamics_bootstrap_fallback_manifest_empty"
         train = DynamicsDataset.synthetic(config.train_size)
@@ -113,6 +115,10 @@ class DynamicsTrainer(BaseTrainer):
             "expression_group_coverage": 0.0,
             "interaction_group_coverage": 0.0,
             "region_group_coverage": 0.0,
+            "family_coverage_count": 0.0,
+            "region_coverage_count": 0.0,
+            "phase_coverage_count": 0.0,
+            "fallback_free_ratio": 0.0,
         }
         if not batches:
             metrics["score"] = 0.0
@@ -143,6 +149,13 @@ class DynamicsTrainer(BaseTrainer):
         if self.dataset_diagnostics:
             metrics["invalid_records"] = float(self.dataset_diagnostics.get("invalid_records", 0))
             metrics["skipped_records"] = float(self.dataset_diagnostics.get("skipped_records", 0))
+            family_cov = self.dataset_diagnostics.get("family_coverage") or self.dataset_diagnostics.get("family_counts", {})
+            region_cov = self.dataset_diagnostics.get("region_coverage", {})
+            phase_cov = self.dataset_diagnostics.get("phase_coverage", {})
+            metrics["family_coverage_count"] = float(len(family_cov)) if isinstance(family_cov, dict) else 0.0
+            metrics["region_coverage_count"] = float(len(region_cov)) if isinstance(region_cov, dict) else 0.0
+            metrics["phase_coverage_count"] = float(len(phase_cov)) if isinstance(phase_cov, dict) else 0.0
+            metrics["fallback_free_ratio"] = float(self.dataset_diagnostics.get("fallback_free_ratio", 0.0))
         metrics["score"] = round(max(0.0, 1.0 - metrics["pose_mse"]), 6)
         return metrics
 

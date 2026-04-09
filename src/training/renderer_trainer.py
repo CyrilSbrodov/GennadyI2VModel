@@ -85,18 +85,20 @@ class RendererTrainer:
 
     def build_datasets(self, config: TrainingConfig) -> tuple[RendererDataset, RendererDataset]:
         if config.learned_dataset_path:
-            manifest_ds = RendererDataset.from_renderer_manifest(config.learned_dataset_path, strict=False)
+            payload = json.loads(Path(config.learned_dataset_path).read_text(encoding="utf-8"))
+            is_video_manifest = payload.get("manifest_type") == "video_transition_manifest"
+            manifest_ds = RendererDataset.from_video_transition_manifest(config.learned_dataset_path, strict=False) if is_video_manifest else RendererDataset.from_renderer_manifest(config.learned_dataset_path, strict=False)
             if len(manifest_ds) > 1:
                 split = max(1, int(0.8 * len(manifest_ds)))
                 train_ds = RendererDataset(samples=manifest_ds.samples[:split])
                 val_ds = RendererDataset(samples=manifest_ds.samples[split:])
                 train_ds.diagnostics = dict(getattr(manifest_ds, "diagnostics", {}), split="train")
                 val_ds.diagnostics = dict(getattr(manifest_ds, "diagnostics", {}), split="val")
-                self.dataset_source = "manifest_paired_roi_primary"
+                self.dataset_source = "manifest_video_renderer_primary" if is_video_manifest else "manifest_paired_roi_primary"
                 self.dataset_diagnostics = getattr(manifest_ds, "diagnostics", {})
                 return train_ds, val_ds
             if len(manifest_ds) == 1:
-                self.dataset_source = "manifest_paired_roi_primary_with_synthetic_val_fallback"
+                self.dataset_source = "manifest_video_renderer_primary_with_synthetic_val_fallback" if is_video_manifest else "manifest_paired_roi_primary_with_synthetic_val_fallback"
                 self.dataset_diagnostics = getattr(manifest_ds, "diagnostics", {})
                 return manifest_ds, RendererDataset.synthetic(max(1, config.val_size))
             self.dataset_source = "synthetic_bootstrap_fallback_manifest_empty"

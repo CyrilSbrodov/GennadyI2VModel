@@ -167,6 +167,92 @@ class RepresentationDataset(BaseStageDataset):
 
 class DynamicsDataset(BaseStageDataset):
     @classmethod
+    def from_video_transition_manifest(cls, manifest_path: str, strict: bool = False) -> "DynamicsDataset":
+        payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        records = payload.get("records", [])
+        out: list[TrainingSample] = []
+        diagnostics: dict[str, object] = {
+            "source": "manifest_video_dynamics_primary",
+            "manifest_path": manifest_path,
+            "manifest_type": payload.get("manifest_type", "unknown"),
+            "total_records": len(records),
+            "loaded_records": 0,
+            "invalid_records": 0,
+            "skipped_records": 0,
+            "invalid_examples": [],
+            "family_coverage": {},
+            "region_coverage": {},
+            "phase_coverage": {},
+            "fallback_free_ratio": 0.0,
+        }
+        fallback_free = 0
+        for idx, rec in enumerate(records):
+            try:
+                if not isinstance(rec, dict):
+                    raise ValueError("record must be object")
+                graph_before = _deserialize_graph(rec["scene_graph_before"])
+                graph_after = _deserialize_graph(rec["scene_graph_after"])
+                delta_raw = rec.get("graph_delta_target", {})
+                if not isinstance(delta_raw, dict):
+                    raise ValueError("graph_delta_target must be object")
+                delta = GraphDelta(
+                    pose_deltas={str(k): float(v) for k, v in (delta_raw.get("pose_deltas", {}) or {}).items()},
+                    garment_deltas={str(k): float(v) for k, v in (delta_raw.get("garment_deltas", {}) or {}).items()},
+                    visibility_deltas={str(k): str(v) for k, v in (delta_raw.get("visibility_deltas", {}) or {}).items()},
+                    expression_deltas={str(k): float(v) for k, v in (delta_raw.get("expression_deltas", {}) or {}).items()},
+                    interaction_deltas={str(k): float(v) for k, v in (delta_raw.get("interaction_deltas", {}) or {}).items()},
+                    affected_entities=[str(x) for x in delta_raw.get("affected_entities", [str(rec.get("tracked_entity_id", "scene"))])],
+                    affected_regions=[str(x) for x in delta_raw.get("affected_regions", ["person_roi"])],
+                    semantic_reasons=[str(x) for x in delta_raw.get("semantic_reasons", [str(rec.get("transition_family", "micro_adjust"))])],
+                    region_transition_mode={str(k): str(v) for k, v in (delta_raw.get("region_transition_mode", {}) or {}).items()},
+                    transition_phase=str(delta_raw.get("transition_phase", rec.get("phase_estimate", "mid"))),
+                )
+                if not (delta.pose_deltas or delta.garment_deltas or delta.visibility_deltas or delta.expression_deltas or delta.interaction_deltas):
+                    raise ValueError("graph_delta_target requires at least one delta group")
+                family = str(rec.get("transition_family", "micro_adjust"))
+                planner_context = rec.get("planner_context", {}) if isinstance(rec.get("planner_context", {}), dict) else {}
+                out.append(
+                    {
+                        "graphs": [graph_before, graph_after],
+                        "actions": [ActionStep(type=family, priority=1, target_entity=str(rec.get("tracked_entity_id", "scene")))],
+                        "deltas": [delta],
+                        "source": "manifest_video_dynamics_primary",
+                        "delta_contract": _serialize_delta_contract(delta),
+                        "graph_transition_contract": {
+                            "planner_context": {
+                                "step_index": float(planner_context.get("step_index", idx + 1)),
+                                "total_steps": float(planner_context.get("total_steps", max(2, len(records)))),
+                                "phase": str(planner_context.get("phase", rec.get("phase_estimate", "mid"))),
+                                "target_duration": float(planner_context.get("target_duration", 1.0)),
+                            },
+                            "target_transition_context": rec.get("target_transition_context", {}) if isinstance(rec.get("target_transition_context"), dict) else {},
+                            "memory_context": rec.get("memory_context", {}) if isinstance(rec.get("memory_context"), dict) else {},
+                            "metadata": {"record_id": rec.get("record_id", f"video_transition_{idx}"), "transition_family": family},
+                        },
+                    }
+                )
+                diagnostics["loaded_records"] = int(diagnostics["loaded_records"]) + 1
+                diagnostics["family_coverage"][family] = int(diagnostics["family_coverage"].get(family, 0)) + 1
+                for region in delta.affected_regions:
+                    diagnostics["region_coverage"][region] = int(diagnostics["region_coverage"].get(region, 0)) + 1
+                phase = str(rec.get("phase_estimate", planner_context.get("phase", delta.transition_phase)))
+                diagnostics["phase_coverage"][phase] = int(diagnostics["phase_coverage"].get(phase, 0)) + 1
+                flags = rec.get("fallback_flags", {}) if isinstance(rec.get("fallback_flags"), dict) else {}
+                if not bool(flags.get("heuristic_priors_used", False)):
+                    fallback_free += 1
+            except Exception as exc:
+                diagnostics["invalid_records"] = int(diagnostics["invalid_records"]) + 1
+                diagnostics["skipped_records"] = int(diagnostics["skipped_records"]) + 1
+                if len(diagnostics["invalid_examples"]) < 8:
+                    diagnostics["invalid_examples"].append({"index": idx, "reason": str(exc)})
+                if strict:
+                    raise ValueError(f"video transition manifest record {idx} invalid: {exc}") from exc
+        diagnostics["fallback_free_ratio"] = round(float(fallback_free / max(1, len(out))), 6)
+        ds = cls(samples=out)
+        ds.diagnostics = diagnostics
+        return ds
+
+    @classmethod
     def synthetic(cls, size: int) -> "DynamicsDataset":
         from utils_tensor import zeros
 
@@ -303,6 +389,80 @@ class DynamicsDataset(BaseStageDataset):
 
 
 class RendererDataset(BaseStageDataset):
+    @classmethod
+    def from_video_transition_manifest(cls, manifest_path: str, strict: bool = False) -> "RendererDataset":
+        payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        records = payload.get("records", [])
+        samples: list[TrainingSample] = []
+        diagnostics: dict[str, object] = {
+            "source": "manifest_video_renderer_primary",
+            "manifest_path": manifest_path,
+            "manifest_type": payload.get("manifest_type", "unknown"),
+            "total_records": len(records),
+            "loaded_records": 0,
+            "invalid_records": 0,
+            "skipped_records": 0,
+            "invalid_examples": [],
+            "family_counts": {},
+            "region_coverage": {},
+            "phase_coverage": {},
+            "fallback_free_ratio": 0.0,
+        }
+        fallback_free = 0
+        for idx, rec in enumerate(records):
+            try:
+                if "roi_before" not in rec or "roi_after" not in rec:
+                    raise ValueError("record requires roi_before and roi_after")
+                roi_before = cls._as_hw3_tensor(rec["roi_before"], "roi_before")
+                roi_after = cls._as_hw3_tensor(rec["roi_after"], "roi_after")
+                b = np.asarray(roi_before, dtype=np.float32)
+                a = np.asarray(roi_after, dtype=np.float32)
+                if b.shape != a.shape:
+                    raise ValueError("roi_before and roi_after shape mismatch")
+                changed = rec.get("changed_mask")
+                if changed is None:
+                    changed = np.clip(np.mean(np.abs(a - b), axis=2, keepdims=True) * 3.0, 0.0, 1.0).tolist()
+                preservation = rec.get("preservation_mask")
+                if preservation is None:
+                    preservation = np.clip(1.0 - np.asarray(changed, dtype=np.float32), 0.0, 1.0).tolist()
+                changed = cls._as_hw1_tensor(changed, "changed_mask")
+                preservation = cls._as_hw1_tensor(preservation, "preservation_mask")
+                family = str(rec.get("transition_family", "micro_adjust")).strip().lower()
+                renderer_contract = {
+                    "semantic_embed": rec.get("semantic_embed", cls._semantic_embed_from_family("face_expression" if "face" in family else ("torso_reveal" if "garment" in family else "sleeve_arm_transition"))),
+                    "delta_cond": rec.get("delta_cond", [0.0] * 9),
+                    "planner_cond": rec.get("planner_cond", [0.0] * 8),
+                    "graph_cond": rec.get("graph_cond", [0.0] * 7),
+                    "memory_cond": rec.get("memory_cond", [0.0] * 8),
+                    "appearance_cond": rec.get("appearance_cond", np.concatenate([np.mean(b, axis=(0, 1)), np.std(b, axis=(0, 1))]).tolist()),
+                    "bbox_cond": rec.get("bbox_cond", [0.2, 0.2, 0.4, 0.4]),
+                    "alpha_target": changed,
+                    "blend_hint": preservation,
+                    "changed_mask": changed,
+                    "preservation_mask": preservation,
+                    "heuristic_priors": rec.get("heuristic_priors", {}),
+                }
+                samples.append({"frames": [roi_before, roi_after], "roi_pairs": [(roi_before, roi_after)], "source": "manifest_video_renderer_primary", "region_family": family, "renderer_batch_contract": renderer_contract, "delta_contract": rec.get("graph_delta_target", {}), "graph_transition_contract": {"planner_context": rec.get("planner_context", {}) if isinstance(rec.get("planner_context"), dict) else {}, "target_transition_context": rec.get("target_transition_context", {}) if isinstance(rec.get("target_transition_context"), dict) else {}, "memory_context": rec.get("memory_context", {}) if isinstance(rec.get("memory_context"), dict) else {}}})
+                diagnostics["loaded_records"] = int(diagnostics["loaded_records"]) + 1
+                diagnostics["family_counts"][family] = int(diagnostics["family_counts"].get(family, 0)) + 1
+                diagnostics["region_coverage"]["person_roi"] = int(diagnostics["region_coverage"].get("person_roi", 0)) + 1
+                phase = str(rec.get("phase_estimate", (rec.get("planner_context", {}) or {}).get("phase", "mid")))
+                diagnostics["phase_coverage"][phase] = int(diagnostics["phase_coverage"].get(phase, 0)) + 1
+                flags = rec.get("fallback_flags", {}) if isinstance(rec.get("fallback_flags"), dict) else {}
+                if not bool(flags.get("heuristic_priors_used", False)):
+                    fallback_free += 1
+            except Exception as exc:
+                diagnostics["invalid_records"] = int(diagnostics["invalid_records"]) + 1
+                diagnostics["skipped_records"] = int(diagnostics["skipped_records"]) + 1
+                if len(diagnostics["invalid_examples"]) < 8:
+                    diagnostics["invalid_examples"].append({"index": idx, "error": str(exc)})
+                if strict:
+                    raise ValueError(f"video transition renderer record {idx} invalid: {exc}") from exc
+        diagnostics["fallback_free_ratio"] = round(float(fallback_free / max(1, len(samples))), 6)
+        ds = cls(samples=samples)
+        ds.diagnostics = diagnostics
+        return ds
+
     @staticmethod
     def _as_hw3_tensor(value: object, field_name: str) -> list[list[list[float]]]:
         arr = np.asarray(value, dtype=np.float32)
