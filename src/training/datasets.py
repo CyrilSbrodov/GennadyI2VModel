@@ -166,6 +166,9 @@ class RepresentationDataset(BaseStageDataset):
 
 
 class DynamicsDataset(BaseStageDataset):
+    CANONICAL_PHASES = {"prepare", "transition", "contact_or_reveal", "stabilize"}
+    CANONICAL_FAMILIES = {"pose_transition", "garment_transition", "expression_transition", "interaction_transition", "visibility_transition"}
+
     @classmethod
     def from_video_transition_manifest(cls, manifest_path: str, strict: bool = False) -> "DynamicsDataset":
         payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
@@ -202,15 +205,23 @@ class DynamicsDataset(BaseStageDataset):
                     expression_deltas={str(k): float(v) for k, v in (delta_raw.get("expression_deltas", {}) or {}).items()},
                     interaction_deltas={str(k): float(v) for k, v in (delta_raw.get("interaction_deltas", {}) or {}).items()},
                     affected_entities=[str(x) for x in delta_raw.get("affected_entities", [str(rec.get("tracked_entity_id", "scene"))])],
-                    affected_regions=[str(x) for x in delta_raw.get("affected_regions", ["person_roi"])],
-                    semantic_reasons=[str(x) for x in delta_raw.get("semantic_reasons", [str(rec.get("transition_family", "micro_adjust"))])],
+                    affected_regions=[str(x) for x in delta_raw.get("affected_regions", ["torso"])],
+                    semantic_reasons=[str(x) for x in delta_raw.get("semantic_reasons", [str(rec.get("transition_family", "pose_transition"))])],
                     region_transition_mode={str(k): str(v) for k, v in (delta_raw.get("region_transition_mode", {}) or {}).items()},
-                    transition_phase=str(delta_raw.get("transition_phase", rec.get("phase_estimate", "mid"))),
+                    transition_phase=str(delta_raw.get("transition_phase", rec.get("phase_estimate", "transition"))),
                 )
                 if not (delta.pose_deltas or delta.garment_deltas or delta.visibility_deltas or delta.expression_deltas or delta.interaction_deltas):
                     raise ValueError("graph_delta_target requires at least one delta group")
-                family = str(rec.get("transition_family", "micro_adjust"))
+                family = str(rec.get("transition_family", "pose_transition"))
+                if family not in cls.CANONICAL_FAMILIES:
+                    raise ValueError(f"transition_family must be canonical, got {family}")
                 planner_context = rec.get("planner_context", {}) if isinstance(rec.get("planner_context", {}), dict) else {}
+                phase = str(rec.get("phase_estimate", planner_context.get("phase", delta.transition_phase)))
+                if phase not in cls.CANONICAL_PHASES:
+                    raise ValueError(f"phase must be canonical, got {phase}")
+                target_profile = rec.get("target_profile", {}) if isinstance(rec.get("target_profile"), dict) else {}
+                reveal_cov = 1 if any("revealed" in str(k) for k in delta.visibility_deltas.keys()) else 0
+                occlusion_cov = 1 if any("occluded" in str(k) for k in delta.visibility_deltas.keys()) else 0
                 out.append(
                     {
                         "graphs": [graph_before, graph_after],
@@ -222,12 +233,12 @@ class DynamicsDataset(BaseStageDataset):
                             "planner_context": {
                                 "step_index": float(planner_context.get("step_index", idx + 1)),
                                 "total_steps": float(planner_context.get("total_steps", max(2, len(records)))),
-                                "phase": str(planner_context.get("phase", rec.get("phase_estimate", "mid"))),
+                                "phase": str(planner_context.get("phase", rec.get("phase_estimate", "transition"))),
                                 "target_duration": float(planner_context.get("target_duration", 1.0)),
                             },
                             "target_transition_context": rec.get("target_transition_context", {}) if isinstance(rec.get("target_transition_context"), dict) else {},
                             "memory_context": rec.get("memory_context", {}) if isinstance(rec.get("memory_context"), dict) else {},
-                            "metadata": {"record_id": rec.get("record_id", f"video_transition_{idx}"), "transition_family": family},
+                            "metadata": {"record_id": rec.get("record_id", f"video_transition_{idx}"), "transition_family": family, "target_profile": target_profile},
                         },
                     }
                 )
@@ -235,8 +246,16 @@ class DynamicsDataset(BaseStageDataset):
                 diagnostics["family_coverage"][family] = int(diagnostics["family_coverage"].get(family, 0)) + 1
                 for region in delta.affected_regions:
                     diagnostics["region_coverage"][region] = int(diagnostics["region_coverage"].get(region, 0)) + 1
-                phase = str(rec.get("phase_estimate", planner_context.get("phase", delta.transition_phase)))
                 diagnostics["phase_coverage"][phase] = int(diagnostics["phase_coverage"].get(phase, 0)) + 1
+                tp_cov = diagnostics.setdefault("target_profile_coverage", {"primary_regions": {}, "secondary_regions": {}, "context_regions": {}})
+                for slot in ("primary_regions", "secondary_regions", "context_regions"):
+                    for region in target_profile.get(slot, []) if isinstance(target_profile.get(slot, []), list) else []:
+                        tp_cov[slot][str(region)] = int(tp_cov[slot].get(str(region), 0)) + 1
+                roc_cov = diagnostics.setdefault("reveal_occlusion_coverage", {"revealed": 0, "occluded": 0})
+                roc_cov["revealed"] = int(roc_cov.get("revealed", 0)) + reveal_cov
+                roc_cov["occluded"] = int(roc_cov.get("occluded", 0)) + occlusion_cov
+                support_cov = diagnostics.setdefault("support_contact_coverage", 0)
+                diagnostics["support_contact_coverage"] = int(support_cov) + (1 if delta.interaction_deltas else 0)
                 flags = rec.get("fallback_flags", {}) if isinstance(rec.get("fallback_flags"), dict) else {}
                 if not bool(flags.get("heuristic_priors_used", False)):
                     fallback_free += 1
@@ -389,6 +408,9 @@ class DynamicsDataset(BaseStageDataset):
 
 
 class RendererDataset(BaseStageDataset):
+    CANONICAL_PHASES = {"prepare", "transition", "contact_or_reveal", "stabilize"}
+    CANONICAL_FAMILIES = {"pose_transition", "garment_transition", "expression_transition", "interaction_transition", "visibility_transition"}
+
     @classmethod
     def from_video_transition_manifest(cls, manifest_path: str, strict: bool = False) -> "RendererDataset":
         payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
@@ -411,43 +433,82 @@ class RendererDataset(BaseStageDataset):
         fallback_free = 0
         for idx, rec in enumerate(records):
             try:
-                if "roi_before" not in rec or "roi_after" not in rec:
-                    raise ValueError("record requires roi_before and roi_after")
-                roi_before = cls._as_hw3_tensor(rec["roi_before"], "roi_before")
-                roi_after = cls._as_hw3_tensor(rec["roi_after"], "roi_after")
-                b = np.asarray(roi_before, dtype=np.float32)
-                a = np.asarray(roi_after, dtype=np.float32)
-                if b.shape != a.shape:
-                    raise ValueError("roi_before and roi_after shape mismatch")
-                changed = rec.get("changed_mask")
-                if changed is None:
-                    changed = np.clip(np.mean(np.abs(a - b), axis=2, keepdims=True) * 3.0, 0.0, 1.0).tolist()
-                preservation = rec.get("preservation_mask")
-                if preservation is None:
-                    preservation = np.clip(1.0 - np.asarray(changed, dtype=np.float32), 0.0, 1.0).tolist()
-                changed = cls._as_hw1_tensor(changed, "changed_mask")
-                preservation = cls._as_hw1_tensor(preservation, "preservation_mask")
-                family = str(rec.get("transition_family", "micro_adjust")).strip().lower()
-                renderer_contract = {
-                    "semantic_embed": rec.get("semantic_embed", cls._semantic_embed_from_family("face_expression" if "face" in family else ("torso_reveal" if "garment" in family else "sleeve_arm_transition"))),
-                    "delta_cond": rec.get("delta_cond", [0.0] * 9),
-                    "planner_cond": rec.get("planner_cond", [0.0] * 8),
-                    "graph_cond": rec.get("graph_cond", [0.0] * 7),
-                    "memory_cond": rec.get("memory_cond", [0.0] * 8),
-                    "appearance_cond": rec.get("appearance_cond", np.concatenate([np.mean(b, axis=(0, 1)), np.std(b, axis=(0, 1))]).tolist()),
-                    "bbox_cond": rec.get("bbox_cond", [0.2, 0.2, 0.4, 0.4]),
-                    "alpha_target": changed,
-                    "blend_hint": preservation,
-                    "changed_mask": changed,
-                    "preservation_mask": preservation,
-                    "heuristic_priors": rec.get("heuristic_priors", {}),
-                }
-                samples.append({"frames": [roi_before, roi_after], "roi_pairs": [(roi_before, roi_after)], "source": "manifest_video_renderer_primary", "region_family": family, "renderer_batch_contract": renderer_contract, "delta_contract": rec.get("graph_delta_target", {}), "graph_transition_contract": {"planner_context": rec.get("planner_context", {}) if isinstance(rec.get("planner_context"), dict) else {}, "target_transition_context": rec.get("target_transition_context", {}) if isinstance(rec.get("target_transition_context"), dict) else {}, "memory_context": rec.get("memory_context", {}) if isinstance(rec.get("memory_context"), dict) else {}}})
-                diagnostics["loaded_records"] = int(diagnostics["loaded_records"]) + 1
-                diagnostics["family_counts"][family] = int(diagnostics["family_counts"].get(family, 0)) + 1
-                diagnostics["region_coverage"]["person_roi"] = int(diagnostics["region_coverage"].get("person_roi", 0)) + 1
-                phase = str(rec.get("phase_estimate", (rec.get("planner_context", {}) or {}).get("phase", "mid")))
-                diagnostics["phase_coverage"][phase] = int(diagnostics["phase_coverage"].get(phase, 0)) + 1
+                family = str(rec.get("transition_family", "pose_transition")).strip().lower()
+                if family not in cls.CANONICAL_FAMILIES:
+                    raise ValueError(f"transition_family must be canonical, got {family}")
+                phase = str(rec.get("phase_estimate", (rec.get("planner_context", {}) or {}).get("phase", "transition")))
+                if phase not in cls.CANONICAL_PHASES:
+                    raise ValueError(f"phase_estimate must be canonical, got {phase}")
+                roi_records = rec.get("roi_records", [])
+                if not isinstance(roi_records, list) or not roi_records:
+                    if "roi_before" not in rec or "roi_after" not in rec:
+                        raise ValueError("record requires roi_records or roi_before/roi_after")
+                    roi_records = [
+                        {
+                            "region_type": "torso",
+                            "roi_before": rec["roi_before"],
+                            "roi_after": rec["roi_after"],
+                            "changed_mask": rec.get("changed_mask"),
+                            "preservation_mask": rec.get("preservation_mask"),
+                            "priors": {},
+                        }
+                    ]
+                for roi_idx, roi_rec in enumerate(roi_records):
+                    if not isinstance(roi_rec, dict):
+                        raise ValueError(f"roi_records[{roi_idx}] must be object")
+                    roi_before = cls._as_hw3_tensor(roi_rec.get("roi_before"), "roi_before")
+                    roi_after = cls._as_hw3_tensor(roi_rec.get("roi_after"), "roi_after")
+                    b = np.asarray(roi_before, dtype=np.float32)
+                    a = np.asarray(roi_after, dtype=np.float32)
+                    if b.shape != a.shape:
+                        raise ValueError("roi_before and roi_after shape mismatch")
+                    changed = roi_rec.get("changed_mask")
+                    if changed is None:
+                        changed = np.clip(np.mean(np.abs(a - b), axis=2, keepdims=True) * 3.0, 0.0, 1.0).tolist()
+                    preservation = roi_rec.get("preservation_mask")
+                    if preservation is None:
+                        preservation = np.clip(1.0 - np.asarray(changed, dtype=np.float32), 0.0, 1.0).tolist()
+                    changed = cls._as_hw1_tensor(changed, "changed_mask")
+                    preservation = cls._as_hw1_tensor(preservation, "preservation_mask")
+                    region_type = str(roi_rec.get("region_type", "torso"))
+                    tp = roi_rec.get("target_profile", rec.get("target_profile", {}))
+                    renderer_contract = {
+                        "semantic_embed": rec.get("semantic_embed", cls._semantic_embed_from_family(family)),
+                        "delta_cond": rec.get("delta_cond", [0.0] * 9),
+                        "planner_cond": rec.get("planner_cond", [0.0] * 8),
+                        "graph_cond": rec.get("graph_cond", [0.0] * 7),
+                        "memory_cond": rec.get("memory_cond", [0.0] * 8),
+                        "appearance_cond": rec.get("appearance_cond", np.concatenate([np.mean(b, axis=(0, 1)), np.std(b, axis=(0, 1))]).tolist()),
+                        "bbox_cond": rec.get("bbox_cond", [0.2, 0.2, 0.4, 0.4]),
+                        "alpha_target": changed,
+                        "blend_hint": preservation,
+                        "changed_mask": changed,
+                        "preservation_mask": preservation,
+                        "region_type": region_type,
+                        "transition_family": family,
+                        "target_profile": tp,
+                        "heuristic_priors": roi_rec.get("priors", rec.get("heuristic_priors", {})),
+                    }
+                    samples.append(
+                        {
+                            "frames": [roi_before, roi_after],
+                            "roi_pairs": [(roi_before, roi_after)],
+                            "source": "manifest_video_renderer_primary",
+                            "region_family": family,
+                            "renderer_batch_contract": renderer_contract,
+                            "delta_contract": rec.get("graph_delta_target", {}),
+                            "graph_transition_contract": {
+                                "planner_context": rec.get("planner_context", {}) if isinstance(rec.get("planner_context"), dict) else {},
+                                "target_transition_context": rec.get("target_transition_context", {}) if isinstance(rec.get("target_transition_context"), dict) else {},
+                                "memory_context": rec.get("memory_context", {}) if isinstance(rec.get("memory_context"), dict) else {},
+                                "metadata": {"record_id": rec.get("record_id", f"video_transition_{idx}"), "region_type": region_type, "target_profile": tp},
+                            },
+                        }
+                    )
+                    diagnostics["loaded_records"] = int(diagnostics["loaded_records"]) + 1
+                    diagnostics["family_counts"][family] = int(diagnostics["family_counts"].get(family, 0)) + 1
+                    diagnostics["region_coverage"][region_type] = int(diagnostics["region_coverage"].get(region_type, 0)) + 1
+                    diagnostics["phase_coverage"][phase] = int(diagnostics["phase_coverage"].get(phase, 0)) + 1
                 flags = rec.get("fallback_flags", {}) if isinstance(rec.get("fallback_flags"), dict) else {}
                 if not bool(flags.get("heuristic_priors_used", False)):
                     fallback_free += 1
@@ -490,11 +551,13 @@ class RendererDataset(BaseStageDataset):
     @staticmethod
     def _semantic_embed_from_family(family: str) -> list[float]:
         family = family.lower().strip()
-        if family == "face_expression":
+        if family == "expression_transition":
             return [1.0, 0.0, 0.0, 0.9, 0.1, 0.2]
-        if family == "torso_reveal":
+        if family in {"garment_transition", "visibility_transition"}:
             return [0.0, 1.0, 0.0, 0.2, 0.85, 0.4]
-        return [0.0, 0.0, 1.0, 0.15, 0.45, 0.9]
+        if family == "interaction_transition":
+            return [0.0, 0.0, 1.0, 0.4, 0.65, 0.85]
+        return [0.0, 0.0, 1.0, 0.15, 0.45, 0.9]  # pose_transition
 
     @classmethod
     def from_renderer_manifest(cls, manifest_path: str, strict: bool = False) -> "RendererDataset":
