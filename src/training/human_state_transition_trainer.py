@@ -128,6 +128,13 @@ class HumanStateTransitionTrainer:
             "skipped": 0,
         }
 
+        self.dataset_diagnostics = {
+            "source": self.dataset_source,
+            "usable": len(train_ds.samples) + len(val_ds.samples),
+            "invalid": 0,
+            "skipped": 0,
+        }
+
         return train_ds, val_ds
 
     def _iter_batches(self, dataset: HumanStateTransitionDataset) -> list[HumanStateTransitionBatch]:

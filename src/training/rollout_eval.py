@@ -367,7 +367,7 @@ def evaluate_rollout_modes_on_video_manifest(
         max_records=max_records,
         renderer_backend=renderer_backend,
     )
-    predicted = evaluate_rollout_on_video_manifest(
+    predicted_human = evaluate_rollout_on_video_manifest(
         dataset_manifest=dataset_manifest,
         temporal_model=temporal_model,
         dynamics_model=dynamics_model,
@@ -376,6 +376,8 @@ def evaluate_rollout_modes_on_video_manifest(
         rollout_steps=rollout_steps,
         max_records=max_records,
         renderer_backend=renderer_backend,
+        use_human_state_contract=True,
+        human_state_model=human_state_model,
     )
     predicted_human = evaluate_rollout_on_video_manifest(
         dataset_manifest=dataset_manifest,

@@ -65,6 +65,8 @@ class TrainingSample(TypedDict, total=False):
     reveal_occlusion_support_cues: dict[str, float]
     visibility_targets: list[float]
 
+    region_id: str
+
 
 @dataclass(slots=True)
 class BaseStageDataset:
@@ -351,16 +353,15 @@ class DynamicsDataset(BaseStageDataset):
                 delta=delta,
                 transition_context={"source": "graph_sequence", "step_index": idx},
             )
-            samples.append(
-                {
-                    "graphs": [graphs[idx], graphs[idx + 1]],
-                    "actions": actions,
-                    "deltas": [delta],
-                    "source": "graph_sequence",
-                    "delta_contract": _serialize_delta_contract(delta),
-                    "graph_transition_contract": graph_contract,
-                }
-            )
+            sample: TrainingSample = {
+                "graphs": [graphs[idx], graphs[idx + 1]],
+                "actions": actions,
+                "deltas": [delta],
+                "source": "graph_sequence",
+                "delta_contract": _serialize_delta_contract(delta),
+                "graph_transition_contract": graph_contract,
+            }
+            samples.append(sample)
         return cls(samples=samples)
 
     @classmethod
@@ -1002,8 +1003,7 @@ class RendererDataset(BaseStageDataset):
                     "changed_mask": changed_mask,
                 }
 
-                samples.append(
-                    {
+                sample: TrainingSample = {
                         "frames": [roi_before, roi_after],
                         "roi_pairs": [(roi_before, roi_after)],
                         "source": str(rec.get("source", "manifest_paired_roi")),
@@ -1015,7 +1015,7 @@ class RendererDataset(BaseStageDataset):
                         "memory_records": rec.get("memory_records", []),
                         "patch_synthesis_contract": rec.get("patch_synthesis_contract", {}),
                     }
-                )
+                samples.append(sample)
                 diagnostics["loaded_records"] = int(diagnostics["loaded_records"]) + 1
             except Exception as exc:
                 diagnostics["invalid_records"] = int(diagnostics["invalid_records"]) + 1
@@ -1134,24 +1134,23 @@ class RendererDataset(BaseStageDataset):
                     scene_transition_context=rec.get("scene_transition_context", {}),
                     memory_transition_context=rec.get("memory_transition_context", {}),
                 )
-            out.append(
-                {
-                    "frames": [frames[0], frames[1]],
-                    "roi_pairs": roi_pairs,
-                    "patch_synthesis_contract": patch_contract,
-                    "temporal_consistency_contract": temporal_contract,
-                    "renderer_batch_contract": {
-                        "semantic_embed": rec.get("semantic_embed", [0.0, 1.0, 0.0, 0.25, 0.8, 0.35]),
-                        "delta_cond": rec.get("delta_cond", [0.3, 0.1, 0.2, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0]),
-                        "planner_cond": rec.get("planner_cond", [0.2, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
-                        "graph_cond": rec.get("graph_cond", [1.0, 0.2, 0.15, 0.5, 0.5, 0.5, 0.2]),
-                        "memory_cond": rec.get("memory_cond", [0.5, 0.4, 0.2, 0.6, 0.3, 0.2, 0.4, 0.0]),
-                        "appearance_cond": rec.get("appearance_cond", [0.3, 0.3, 0.3, 0.05, 0.05, 0.05]),
-                        "bbox_cond": rec.get("bbox_cond", [0.2, 0.2, 0.4, 0.4]),
-                    },
-                    "source": rec.get("source", "video_manifest"),
-                }
-            )
+            sample: TrainingSample = {
+                "frames": [frames[0], frames[1]],
+                "roi_pairs": roi_pairs,
+                "patch_synthesis_contract": patch_contract,
+                "temporal_consistency_contract": temporal_contract,
+                "renderer_batch_contract": {
+                    "semantic_embed": rec.get("semantic_embed", [0.0, 1.0, 0.0, 0.25, 0.8, 0.35]),
+                    "delta_cond": rec.get("delta_cond", [0.3, 0.1, 0.2, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0]),
+                    "planner_cond": rec.get("planner_cond", [0.2, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+                    "graph_cond": rec.get("graph_cond", [1.0, 0.2, 0.15, 0.5, 0.5, 0.5, 0.2]),
+                    "memory_cond": rec.get("memory_cond", [0.5, 0.4, 0.2, 0.6, 0.3, 0.2, 0.4, 0.0]),
+                    "appearance_cond": rec.get("appearance_cond", [0.3, 0.3, 0.3, 0.05, 0.05, 0.05]),
+                    "bbox_cond": rec.get("bbox_cond", [0.2, 0.2, 0.4, 0.4]),
+                },
+                "source": rec.get("source", "video_manifest"),
+            }
+            out.append(sample)
         return cls(samples=out)
 
 
@@ -1365,15 +1364,14 @@ class TextActionDataset(BaseStageDataset):
             actions = [ActionStep(type=a.get("type", "unknown"), priority=i + 1, target_entity=a.get("target_entity"), target_object=a.get("target_object")) for i, a in enumerate(rec.get("actions", []))]
             encoding = encoder.encode(rec.get("text", ""))
             contract = build_text_action_state_contract(rec.get("text", ""), actions, vars(encoding))
-            samples.append(
-                {
-                    "text": rec.get("text", ""),
-                    "actions": actions,
-                    "text_alignment": rec,
-                    "text_action_contract": contract,
-                    "source": rec.get("source", "annotation_manifest"),
-                }
-            )
+            sample: TrainingSample = {
+                "text": rec.get("text", ""),
+                "actions": actions,
+                "text_alignment": rec,
+                "text_action_contract": contract,
+                "source": rec.get("source", "annotation_manifest"),
+            }
+            samples.append(sample)
         return cls(samples=samples)
 
 
