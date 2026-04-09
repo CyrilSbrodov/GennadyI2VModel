@@ -651,7 +651,7 @@ class HumanStateTransitionDataset(BaseStageDataset):
                 reveal_cue = float(human_target.get("reveal_memory_target", 0.0))
                 occlusion_cue = float(1.0 - float(np.mean(human_target.get("visibility_targets", [1.0]))))
 
-                sample = {
+                sample: TrainingSample = {
                     "source": "manifest_video_human_state_transition_primary",
                     "graphs": [before, after],
                     "human_state_transition_features": human_features,
