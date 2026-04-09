@@ -7,7 +7,9 @@ from pathlib import Path
 import numpy as np
 
 from dynamics.temporal_transition_encoder import PHASES, TemporalTransitionEncoder
+from dynamics.model import DynamicsModel
 from rendering.trainable_patch_renderer import PatchBatch, TrainableLocalPatchModel
+from training.rollout_eval import evaluate_rollout_modes_on_video_manifest
 from training.datasets import RendererDataset
 from training.types import StageResult, TrainingConfig
 
@@ -288,6 +290,28 @@ class RendererTrainer:
             }
             last_val = eval_metrics
             last_val["contract_conditioning_mode"] = self.contract_conditioning_mode
+            if config.learned_dataset_path and self.dataset_source.startswith("manifest_video_renderer_primary"):
+                rollout = evaluate_rollout_modes_on_video_manifest(
+                    dataset_manifest=config.learned_dataset_path,
+                    temporal_model=self.temporal_encoder,
+                    dynamics_model=DynamicsModel(),
+                    renderer_model=self.model,
+                    rollout_steps=2,
+                    max_records=max(1, config.val_size),
+                )
+                tf = rollout.get("teacher_forced_rollout", {})
+                pr = rollout.get("predicted_rollout", {})
+                last_val["rollout_teacher_frame_reconstruction_proxy"] = float(tf.get("rollout_frame_reconstruction_proxy", 0.0))
+                last_val["rollout_predicted_frame_reconstruction_proxy"] = float(pr.get("rollout_frame_reconstruction_proxy", 0.0))
+                last_val["rollout_consistency_regularizer"] = round(
+                    max(
+                        0.0,
+                        1.0
+                        - 0.5 * last_val["rollout_teacher_frame_reconstruction_proxy"]
+                        - 0.5 * last_val["rollout_predicted_frame_reconstruction_proxy"],
+                    ),
+                    6,
+                )
             history.append({"epoch": epoch + 1, "train": last_train, "val": last_val})
             lr *= 0.94
 
