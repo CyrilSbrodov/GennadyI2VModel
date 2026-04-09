@@ -18,6 +18,7 @@ from training.perception_trainer import PerceptionTrainer
 from training.renderer_trainer import RendererTrainer
 from training.representation_trainer import RepresentationTrainer
 from training.temporal_trainer import TemporalTrainer
+from training.temporal_transition_trainer import TemporalTransitionTrainer
 from training.types import StageResult, StageTrainer, TrainingConfig
 
 
@@ -71,6 +72,7 @@ def _build_stage_trainers() -> dict[str, StageTrainer]:
         DynamicsTrainer(),
         RendererTrainer(),
         TemporalTrainer(),
+        TemporalTransitionTrainer(),
     ]
     return {trainer.stage_name: trainer for trainer in trainers}
 
@@ -114,6 +116,7 @@ def train_pipeline(config: TrainingConfig) -> list[StageResult]:
         "stage4_renderer": "renderer",
         "stage5_memory": "representation",
         "stage6_temporal": "temporal_refinement",
+        "stage6b_temporal_transition": "temporal_transition",
         "stage7_instruction": "text_encoder",
         "stage8_joint_tuning": "renderer",
     }

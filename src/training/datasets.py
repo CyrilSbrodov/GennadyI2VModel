@@ -407,6 +407,136 @@ class DynamicsDataset(BaseStageDataset):
         return ds
 
 
+class TemporalTransitionDataset(BaseStageDataset):
+    CANONICAL_PHASES = {"prepare", "transition", "contact_or_reveal", "stabilize"}
+    CANONICAL_FAMILIES = {"pose_transition", "garment_transition", "expression_transition", "interaction_transition", "visibility_transition"}
+    REGION_KEYS = ("face", "torso", "left_arm", "right_arm", "legs", "garments", "inner_garment", "outer_garment")
+
+    @classmethod
+    def from_video_transition_manifest(cls, manifest_path: str, strict: bool = False) -> "TemporalTransitionDataset":
+        payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        records = payload.get("records", [])
+        samples: list[TrainingSample] = []
+        diagnostics: dict[str, object] = {
+            "source": "manifest_video_temporal_transition_primary",
+            "manifest_path": manifest_path,
+            "manifest_type": payload.get("manifest_type", "unknown"),
+            "total_records": len(records),
+            "loaded_records": 0,
+            "invalid_records": 0,
+            "skipped_records": 0,
+            "invalid_examples": [],
+            "family_coverage": {},
+            "phase_coverage": {},
+            "region_coverage": {},
+            "fallback_free_ratio": 0.0,
+        }
+        fallback_free = 0
+        for idx, rec in enumerate(records):
+            try:
+                if not isinstance(rec, dict):
+                    raise ValueError("record must be object")
+                graph_before = _deserialize_graph(rec["scene_graph_before"])
+                graph_after = _deserialize_graph(rec["scene_graph_after"])
+                family = str(rec.get("transition_family", rec.get("runtime_semantic_transition", "pose_transition"))).strip().lower()
+                if family not in cls.CANONICAL_FAMILIES:
+                    raise ValueError(f"transition_family must be canonical, got {family}")
+                planner_context = rec.get("planner_context", {}) if isinstance(rec.get("planner_context"), dict) else {}
+                phase = str(rec.get("phase_estimate", planner_context.get("phase", "transition"))).strip().lower()
+                if phase not in cls.CANONICAL_PHASES:
+                    raise ValueError(f"phase must be canonical, got {phase}")
+                target_profile = rec.get("target_profile", {}) if isinstance(rec.get("target_profile"), dict) else {}
+                graph_delta_target = rec.get("graph_delta_target", {}) if isinstance(rec.get("graph_delta_target"), dict) else {}
+                roi_records = rec.get("roi_records", [])
+                if not isinstance(roi_records, list):
+                    roi_records = []
+                changed_ratio = float(np.mean([float(r.get("changed_ratio", 0.0)) for r in roi_records if isinstance(r, dict)] or [0.0]))
+                reveal_score = float(graph_delta_target.get("visibility_deltas", {}).get("revealed_regions_score", rec.get("reveal_score", changed_ratio)) if isinstance(graph_delta_target.get("visibility_deltas", {}), dict) else changed_ratio)
+                occlusion_score = float(graph_delta_target.get("visibility_deltas", {}).get("occluded_regions_score", rec.get("occlusion_score", changed_ratio * 0.5)) if isinstance(graph_delta_target.get("visibility_deltas", {}), dict) else changed_ratio * 0.5)
+                support_score = float(graph_delta_target.get("interaction_deltas", {}).get("support_contact", rec.get("support_contact_score", 0.0)) if isinstance(graph_delta_target.get("interaction_deltas", {}), dict) else 0.0)
+                transition_confidence = float(rec.get("transition_confidence", changed_ratio))
+
+                feature_vector = _build_temporal_transition_features(
+                    graph_before=graph_before,
+                    graph_after=graph_after,
+                    roi_records=roi_records,
+                    graph_delta_target=graph_delta_target,
+                    planner_context=planner_context,
+                    target_profile=target_profile,
+                    runtime_semantic_transition=str(rec.get("runtime_semantic_transition", family)),
+                    phase_estimate=phase,
+                    reveal_score=reveal_score,
+                    occlusion_score=occlusion_score,
+                    support_score=support_score,
+                    transition_confidence=transition_confidence,
+                )
+                samples.append(
+                    {
+                        "graphs": [graph_before, graph_after],
+                        "source": "manifest_video_temporal_transition_primary",
+                        "temporal_transition_features": feature_vector,
+                        "temporal_transition_target": {
+                            "family": family,
+                            "phase": phase,
+                            "target_profile": target_profile,
+                            "reveal_score": float(np.clip(reveal_score, 0.0, 1.0)),
+                            "occlusion_score": float(np.clip(occlusion_score, 0.0, 1.0)),
+                            "support_contact_score": float(np.clip(support_score, 0.0, 1.0)),
+                        },
+                        "graph_transition_contract": {
+                            "planner_context": planner_context,
+                            "target_transition_context": rec.get("target_transition_context", {}) if isinstance(rec.get("target_transition_context"), dict) else {},
+                            "memory_context": rec.get("memory_context", {}) if isinstance(rec.get("memory_context"), dict) else {},
+                            "metadata": {"record_id": rec.get("record_id", f"video_transition_{idx}"), "transition_family": family},
+                        },
+                    }
+                )
+                diagnostics["loaded_records"] = int(diagnostics["loaded_records"]) + 1
+                diagnostics["family_coverage"][family] = int(diagnostics["family_coverage"].get(family, 0)) + 1
+                diagnostics["phase_coverage"][phase] = int(diagnostics["phase_coverage"].get(phase, 0)) + 1
+                for slot in ("primary_regions", "secondary_regions", "context_regions"):
+                    for region in target_profile.get(slot, []) if isinstance(target_profile.get(slot, []), list) else []:
+                        diagnostics["region_coverage"][str(region)] = int(diagnostics["region_coverage"].get(str(region), 0)) + 1
+                flags = rec.get("fallback_flags", {}) if isinstance(rec.get("fallback_flags"), dict) else {}
+                if not bool(flags.get("heuristic_priors_used", False)):
+                    fallback_free += 1
+            except Exception as exc:
+                diagnostics["invalid_records"] = int(diagnostics["invalid_records"]) + 1
+                diagnostics["skipped_records"] = int(diagnostics["skipped_records"]) + 1
+                if len(diagnostics["invalid_examples"]) < 8:
+                    diagnostics["invalid_examples"].append({"index": idx, "error": str(exc)})
+                if strict:
+                    raise ValueError(f"video transition temporal record {idx} invalid: {exc}") from exc
+        diagnostics["fallback_free_ratio"] = round(float(fallback_free / max(1, len(samples))), 6)
+        ds = cls(samples=samples)
+        ds.diagnostics = diagnostics
+        return ds
+
+    @classmethod
+    def synthetic(cls, size: int) -> "TemporalTransitionDataset":
+        samples: list[TrainingSample] = []
+        for i in range(size):
+            family = ("pose_transition", "garment_transition", "expression_transition", "interaction_transition", "visibility_transition")[i % 5]
+            phase = ("prepare", "transition", "contact_or_reveal", "stabilize")[i % 4]
+            samples.append(
+                {
+                    "source": "synthetic_temporal_transition_bootstrap",
+                    "temporal_transition_features": [0.01 * float((j + 1) * (i + 1)) for j in range(128)],
+                    "temporal_transition_target": {
+                        "family": family,
+                        "phase": phase,
+                        "target_profile": {"primary_regions": ["torso"], "secondary_regions": ["face"], "context_regions": ["legs"]},
+                        "reveal_score": 0.35,
+                        "occlusion_score": 0.2,
+                        "support_contact_score": 0.1,
+                    },
+                }
+            )
+        ds = cls(samples=samples)
+        ds.diagnostics = {"source": "synthetic_temporal_transition_bootstrap", "total_records": len(samples), "loaded_records": len(samples), "invalid_records": 0, "skipped_records": 0, "fallback_free_ratio": 1.0}
+        return ds
+
+
 class RendererDataset(BaseStageDataset):
     CANONICAL_PHASES = {"prepare", "transition", "contact_or_reveal", "stabilize"}
     CANONICAL_FAMILIES = {"pose_transition", "garment_transition", "expression_transition", "interaction_transition", "visibility_transition"}
@@ -1054,6 +1184,94 @@ def _serialize_graph(graph: SceneGraph) -> dict[str, object]:
         "objects": [{"object_id": o.object_id, "object_type": o.object_type, "bbox": _serialize_bbox(o.bbox), "confidence": o.confidence} for o in graph.objects],
         "relations": [{"source": r.source, "relation": r.relation, "target": r.target, "confidence": r.confidence, "provenance": r.provenance} for r in graph.relations],
     }
+
+
+def _build_temporal_transition_features(
+    *,
+    graph_before: SceneGraph,
+    graph_after: SceneGraph,
+    roi_records: list[dict[str, object]],
+    graph_delta_target: dict[str, object],
+    planner_context: dict[str, object],
+    target_profile: dict[str, object],
+    runtime_semantic_transition: str,
+    phase_estimate: str,
+    reveal_score: float,
+    occlusion_score: float,
+    support_score: float,
+    transition_confidence: float,
+) -> list[float]:
+    def _person_graph_features(graph: SceneGraph) -> list[float]:
+        person = graph.persons[0] if graph.persons else None
+        if not person:
+            return [0.0] * 14
+        return [
+            float(person.bbox.x),
+            float(person.bbox.y),
+            float(person.bbox.w),
+            float(person.bbox.h),
+            float(len(person.body_parts)) / 12.0,
+            float(len(person.garments)) / 8.0,
+            float(person.expression_state.smile_intensity),
+            float(person.expression_state.eye_openness),
+            float(person.orientation.yaw) / 90.0,
+            float(person.orientation.pitch) / 90.0,
+            float(person.orientation.roll) / 90.0,
+            float(person.pose_state.angles.get("torso_pitch", 0.0)) / 45.0,
+            float(person.pose_state.angles.get("head_yaw", 0.0)) / 45.0,
+            float(len(graph.objects)) / 8.0,
+        ]
+
+    fb = _person_graph_features(graph_before)
+    fa = _person_graph_features(graph_after)
+    graph_delta = [fa[i] - fb[i] for i in range(len(fa))]
+
+    region_stats = {k: [] for k in TemporalTransitionDataset.REGION_KEYS}
+    for rec in roi_records:
+        if not isinstance(rec, dict):
+            continue
+        region = str(rec.get("region_type", "torso"))
+        if region in region_stats:
+            region_stats[region].append(float(rec.get("changed_ratio", 0.0)))
+    roi_features = []
+    for k in TemporalTransitionDataset.REGION_KEYS:
+        vals = region_stats[k]
+        roi_features.extend([float(np.mean(vals or [0.0])), float(len(vals)) / 4.0])
+
+    pose_d = graph_delta_target.get("pose_deltas", {}) if isinstance(graph_delta_target.get("pose_deltas", {}), dict) else {}
+    garment_d = graph_delta_target.get("garment_deltas", {}) if isinstance(graph_delta_target.get("garment_deltas", {}), dict) else {}
+    expr_d = graph_delta_target.get("expression_deltas", {}) if isinstance(graph_delta_target.get("expression_deltas", {}), dict) else {}
+    inter_d = graph_delta_target.get("interaction_deltas", {}) if isinstance(graph_delta_target.get("interaction_deltas", {}), dict) else {}
+    vis_d = graph_delta_target.get("visibility_deltas", {}) if isinstance(graph_delta_target.get("visibility_deltas", {}), dict) else {}
+    delta_features = [
+        float(pose_d.get("torso_motion", pose_d.get("torso_pitch", 0.0))),
+        float(pose_d.get("head_motion", pose_d.get("head_yaw", 0.0))),
+        float(pose_d.get("arm_motion", pose_d.get("arm_raise", 0.0))),
+        float(garment_d.get("coverage_change", garment_d.get("coverage_delta", 0.0))),
+        float(garment_d.get("attachment_shift", garment_d.get("attachment_delta", 0.0))),
+        float(expr_d.get("face_expression_shift", expr_d.get("smile_intensity", 0.0))),
+        float(inter_d.get("support_contact", 0.0)),
+        float(inter_d.get("contact_hint", 0.0)),
+        float(vis_d.get("revealed_regions_score", reveal_score)),
+        float(vis_d.get("occluded_regions_score", occlusion_score)),
+    ]
+    profile_vec = []
+    for slot in ("primary_regions", "secondary_regions", "context_regions"):
+        listed = target_profile.get(slot, []) if isinstance(target_profile.get(slot, []), list) else []
+        for region in TemporalTransitionDataset.REGION_KEYS:
+            profile_vec.append(1.0 if region in listed else 0.0)
+    phase_onehot = [1.0 if phase_estimate == p else 0.0 for p in ("prepare", "transition", "contact_or_reveal", "stabilize")]
+    family_onehot = [1.0 if runtime_semantic_transition == f else 0.0 for f in ("pose_transition", "garment_transition", "expression_transition", "interaction_transition", "visibility_transition")]
+    planner_vec = [
+        float(planner_context.get("step_index", 1.0)) / 16.0,
+        float(planner_context.get("total_steps", 4.0)) / 16.0,
+        float(planner_context.get("target_duration", 1.0)) / 8.0,
+    ]
+    clues = [float(np.clip(reveal_score, 0.0, 1.0)), float(np.clip(occlusion_score, 0.0, 1.0)), float(np.clip(support_score, 0.0, 1.0)), float(np.clip(transition_confidence, 0.0, 1.0))]
+    merged = fb + fa + graph_delta + roi_features + delta_features + profile_vec + phase_onehot + family_onehot + planner_vec + clues
+    if len(merged) < 128:
+        merged.extend([0.0] * (128 - len(merged)))
+    return [float(v) for v in merged[:128]]
 
 
 def _deserialize_graph(payload: dict[str, object]) -> SceneGraph:

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from core.schema import GraphDelta, SceneGraph, VideoMemory
 from dynamics.graph_delta_predictor import DynamicsMetrics, GraphDeltaPredictor
+from dynamics.temporal_transition_encoder import TemporalTransitionEncoder
 from learned.interfaces import DynamicsTransitionModel, DynamicsTransitionOutput, DynamicsTransitionRequest
 from text.encoder_contracts import TextEncodingDiagnostics
 
@@ -20,6 +21,35 @@ class LearnedDynamicsTransitionModel(DynamicsTransitionModel):
 
     def __init__(self, *, strict_mode: bool = False) -> None:
         self.predictor = GraphDeltaPredictor(strict_mode=strict_mode)
+        self.temporal_transition_encoder = TemporalTransitionEncoder()
+
+    @staticmethod
+    def _transition_feature_vector(graph_state: SceneGraph, delta: GraphDelta, step_index: int) -> list[float]:
+        person = graph_state.persons[0] if graph_state.persons else None
+        base = [
+            float(person.bbox.x) if person else 0.0,
+            float(person.bbox.y) if person else 0.0,
+            float(person.bbox.w) if person else 0.0,
+            float(person.bbox.h) if person else 0.0,
+            float(len(graph_state.persons)) / 4.0,
+            float(len(graph_state.objects)) / 8.0,
+            float(len(delta.pose_deltas)),
+            float(len(delta.garment_deltas)),
+            float(len(delta.visibility_deltas)),
+            float(len(delta.expression_deltas)),
+            float(len(delta.interaction_deltas)),
+            float(step_index) / 16.0,
+            1.0 if delta.transition_phase == "prepare" else 0.0,
+            1.0 if delta.transition_phase == "transition" else 0.0,
+            1.0 if delta.transition_phase == "contact_or_reveal" else 0.0,
+            1.0 if delta.transition_phase == "stabilize" else 0.0,
+            float(delta.interaction_deltas.get("support_contact", 0.0)),
+            float(delta.visibility_deltas.get("revealed_regions_score", 0.0)) if isinstance(delta.visibility_deltas, dict) else 0.0,
+            float(delta.visibility_deltas.get("occluded_regions_score", 0.0)) if isinstance(delta.visibility_deltas, dict) else 0.0,
+        ]
+        if len(base) < 128:
+            base.extend([0.0] * (128 - len(base)))
+        return base[:128]
 
     def predict_transition(self, request: DynamicsTransitionRequest) -> DynamicsTransitionOutput:
         labels = request.text_action_summary.structured_action_tokens or ["micro_adjust"]
@@ -43,6 +73,9 @@ class LearnedDynamicsTransitionModel(DynamicsTransitionModel):
             memory=request.step_context.get("memory") if isinstance(request.step_context.get("memory"), VideoMemory) else None,
         )
         used_channels = [name for name, payload in request.memory_channels.items() if payload]
+        temporal_features = self._transition_feature_vector(request.graph_state, delta, step_index)
+        temporal_prediction = self.temporal_transition_encoder.forward(temporal_features)
+        temporal_contract = self.temporal_transition_encoder.to_contract(temporal_prediction)
         return DynamicsTransitionOutput(
             delta=delta,
             confidence=max(0.0, min(1.0, 1.0 - 0.05 * metrics.constraint_violations)),
@@ -54,6 +87,7 @@ class LearnedDynamicsTransitionModel(DynamicsTransitionModel):
             metadata={
                 "backend": "learned_graph_delta_predictor",
                 "runtime_path": delta.transition_diagnostics.get("runtime_path", "learned_primary"),
+                "temporal_transition_contract": temporal_contract,
                 "learned_ready_usage": {
                     "memory_channels_used": used_channels,
                     "graph_encoding_used": bool(request.graph_encoding and request.graph_encoding.graph_embedding),
