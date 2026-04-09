@@ -1,18 +1,34 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
 
+from dynamics.temporal_transition_encoder import PHASES, TemporalTransitionEncoder
 from rendering.trainable_patch_renderer import PatchBatch, TrainableLocalPatchModel
 from training.datasets import RendererDataset
 from training.types import StageResult, TrainingConfig
 
 
+@dataclass(slots=True)
+class RendererTemporalConditioning:
+    source: str
+    predicted_family: str
+    predicted_phase: str
+    target_profile: dict[str, list[str]]
+    reveal_score: float
+    occlusion_score: float
+    support_contact_score: float
+
+
 class RendererBatchAdapter:
     """Runtime-aligned adapter from dataset records into full PatchBatch contract."""
+
+    def __init__(self, encoder: TemporalTransitionEncoder | None = None, conditioning_mode: str = "weak_contract_only") -> None:
+        self.encoder = encoder
+        self.conditioning_mode = conditioning_mode
 
     @staticmethod
     def _np3(x: list) -> np.ndarray:
@@ -28,17 +44,69 @@ class RendererBatchAdapter:
         diff = np.mean(np.abs(after - before), axis=2, keepdims=True)
         return np.clip(diff * 3.0, 0.0, 1.0)
 
+    def _weak_contract(self, sample: dict[str, object]) -> RendererTemporalConditioning:
+        contract = sample.get("renderer_batch_contract", {}) if isinstance(sample.get("renderer_batch_contract", {}), dict) else {}
+        ttarget = sample.get("temporal_transition_target", {}) if isinstance(sample.get("temporal_transition_target"), dict) else {}
+        profile = ttarget.get("target_profile", contract.get("target_profile", {})) if isinstance(ttarget.get("target_profile", contract.get("target_profile", {})), dict) else {}
+        return RendererTemporalConditioning(
+            source="weak_manifest_bootstrap",
+            predicted_family=str(ttarget.get("family", contract.get("transition_family", sample.get("region_family", "pose_transition")))),
+            predicted_phase=str(ttarget.get("phase", "transition")),
+            target_profile={
+                "primary_regions": [str(x) for x in profile.get("primary_regions", [])],
+                "secondary_regions": [str(x) for x in profile.get("secondary_regions", [])],
+                "context_regions": [str(x) for x in profile.get("context_regions", [])],
+            },
+            reveal_score=float(ttarget.get("reveal_score", 0.0)),
+            occlusion_score=float(ttarget.get("occlusion_score", 0.0)),
+            support_contact_score=float(ttarget.get("support_contact_score", 0.0)),
+        )
+
+    @staticmethod
+    def _semantic_from_family(family: str) -> list[float]:
+        f = family.strip().lower()
+        if f == "expression_transition":
+            return [1.0, 0.0, 0.0, 0.85, 0.15, 0.2]
+        if f in {"garment_transition", "visibility_transition"}:
+            return [0.0, 1.0, 0.0, 0.25, 0.8, 0.35]
+        return [0.0, 0.0, 1.0, 0.3, 0.45, 0.8]
+
     def adapt(self, sample: dict[str, object]) -> PatchBatch:
         roi_pairs = sample.get("roi_pairs") or []
         before, after = roi_pairs[0] if roi_pairs else (sample["frames"][0], sample["frames"][1])
         b = self._np3(before)
         a = self._np3(after)
         contract = sample.get("renderer_batch_contract", {}) if isinstance(sample.get("renderer_batch_contract", {}), dict) else {}
-        family = str(sample.get("region_family", "")).lower()
-        semantic_default = [1.0, 0.0, 0.0, 0.9, 0.1, 0.2] if family == "face_expression" else ([0.0, 1.0, 0.0, 0.2, 0.85, 0.4] if family == "torso_reveal" else [0.0, 0.0, 1.0, 0.15, 0.45, 0.9])
-        semantic_embed = np.asarray(contract.get("semantic_embed", semantic_default), dtype=np.float32)
+        weak = self._weak_contract(sample)
+        learned: RendererTemporalConditioning | None = None
+        features = sample.get("temporal_transition_features")
+        if self.encoder is not None and isinstance(features, list) and features:
+            pred = self.encoder.forward(np.asarray(features, dtype=np.float64))
+            typed = self.encoder.to_typed_contract(pred)
+            learned = RendererTemporalConditioning(
+                source="learned_temporal_contract",
+                predicted_family=typed.predicted_family,
+                predicted_phase=typed.predicted_phase,
+                target_profile={"primary_regions": list(typed.target_profile.primary_regions), "secondary_regions": list(typed.target_profile.secondary_regions), "context_regions": list(typed.target_profile.context_regions)},
+                reveal_score=float(typed.reveal_score),
+                occlusion_score=float(typed.occlusion_score),
+                support_contact_score=float(typed.support_contact_score),
+            )
+        selected = weak
+        if self.conditioning_mode == "learned_contract_only":
+            selected = learned or weak
+        elif self.conditioning_mode == "mixed_contract_bootstrap" and learned is not None:
+            selected = learned
+
+        semantic_embed = np.asarray(contract.get("semantic_embed", self._semantic_from_family(selected.predicted_family)), dtype=np.float32)
+        if selected.source == "learned_temporal_contract":
+            semantic_embed = np.asarray(self._semantic_from_family(selected.predicted_family), dtype=np.float32)
         delta_cond = np.asarray(contract.get("delta_cond", [0.0] * 9), dtype=np.float32)
         planner_cond = np.asarray(contract.get("planner_cond", [0.0] * 8), dtype=np.float32)
+        if selected.source == "learned_temporal_contract":
+            delta_cond = np.asarray([selected.reveal_score, selected.occlusion_score, selected.support_contact_score] + delta_cond.tolist(), dtype=np.float32)[:9]
+            phase_onehot = [1.0 if selected.predicted_phase == p else 0.0 for p in PHASES]
+            planner_cond = np.asarray(phase_onehot + planner_cond.tolist(), dtype=np.float32)[:8]
         graph_cond = np.asarray(contract.get("graph_cond", [0.0] * 7), dtype=np.float32)
         memory_cond = np.asarray(contract.get("memory_cond", [0.0] * 8), dtype=np.float32)
         appearance_cond = np.asarray(contract.get("appearance_cond", np.concatenate([np.mean(b, axis=(0, 1)), np.std(b, axis=(0, 1))]).tolist()), dtype=np.float32)
@@ -71,6 +139,12 @@ class RendererBatchAdapter:
             memory_cond=memory_cond,
             appearance_cond=appearance_cond,
             bbox_cond=bbox_cond,
+            conditioning_summary={
+                "contract_source": selected.source,
+                "predicted_family": selected.predicted_family,
+                "predicted_phase": selected.predicted_phase,
+                "target_profile": selected.target_profile,
+            },
         )
 
 
@@ -79,9 +153,18 @@ class RendererTrainer:
 
     def __init__(self) -> None:
         self.model = TrainableLocalPatchModel()
-        self.adapter = RendererBatchAdapter()
         self.dataset_source = "synthetic_bootstrap"
         self.dataset_diagnostics: dict[str, object] = {}
+        self.contract_conditioning_mode = "weak_contract_only"
+        self.temporal_encoder = TemporalTransitionEncoder()
+        self.adapter = RendererBatchAdapter(encoder=None)
+
+    @staticmethod
+    def _resolve_conditioning_mode(config: TrainingConfig, has_manifest: bool) -> str:
+        raw = str(getattr(config, "contract_conditioning_mode", "auto") or "auto")
+        if raw in {"weak_contract_only", "learned_contract_only", "mixed_contract_bootstrap"}:
+            return raw
+        return "mixed_contract_bootstrap" if has_manifest else "weak_contract_only"
 
     def build_datasets(self, config: TrainingConfig) -> tuple[RendererDataset, RendererDataset]:
         if config.learned_dataset_path:
@@ -109,19 +192,24 @@ class RendererTrainer:
         return RendererDataset.synthetic(config.train_size), RendererDataset.synthetic(config.val_size)
 
     def _iter_batches(self, dataset: RendererDataset):
+        has_temporal = bool(dataset.samples and isinstance(dataset.samples[0].get("temporal_transition_features"), list))
+        self.adapter = RendererBatchAdapter(encoder=self.temporal_encoder if has_temporal else None, conditioning_mode=self.contract_conditioning_mode)
         for sample in dataset.samples:
             yield self.adapter.adapt(sample)
 
     @staticmethod
     def evaluate_model(model: TrainableLocalPatchModel, batches: list[PatchBatch], diagnostics: dict[str, object] | None = None) -> dict[str, float]:
         if not batches:
-            return {"reconstruction_mae": 1.0, "alpha_mae": 1.0, "uncertainty_calibration_mae": 1.0, "contract_validity": 0.0, "fallback_free_happy_path_ratio": 0.0, "face_family_score": 0.0, "torso_family_score": 0.0, "sleeve_family_score": 0.0, "usable_sample_count": 0.0, "invalid_records": float((diagnostics or {}).get("invalid_records", 0)), "skipped_records": float((diagnostics or {}).get("skipped_records", 0)), "score": 0.0}
+            return {"reconstruction_mae": 1.0, "alpha_mae": 1.0, "uncertainty_calibration_mae": 1.0, "contract_validity": 0.0, "fallback_free_happy_path_ratio": 0.0, "face_family_score": 0.0, "torso_family_score": 0.0, "sleeve_family_score": 0.0, "usable_sample_count": 0.0, "invalid_records": float((diagnostics or {}).get("invalid_records", 0)), "skipped_records": float((diagnostics or {}).get("skipped_records", 0)), "learned_contract_usage_ratio": 0.0, "weak_contract_usage_ratio": 1.0, "temporal_to_renderer_mode_consistency": 0.0, "temporal_to_renderer_target_profile_consistency": 0.0, "score": 0.0}
         eval_entries = [model.eval_step(b) for b in batches]
         recon_mae = float(sum(e["mae"] for e in eval_entries) / len(eval_entries))
         alpha_mae = float(sum(e["alpha_mae"] for e in eval_entries) / len(eval_entries))
         unc_mae = float(sum(e["uncertainty_calibration_loss"] for e in eval_entries) / len(eval_entries))
         contract_validity = float(sum(1.0 for b in batches if b.alpha_target.shape[:2] == b.roi_before.shape[:2] and b.changed_mask.shape[:2] == b.roi_before.shape[:2]) / len(batches))
         per_family = {"face": [], "torso": [], "sleeve": []}
+        learned_usage = 0.0
+        mode_consistency = 0.0
+        profile_consistency = 0.0
         for b, e in zip(batches, eval_entries):
             if b.semantic_embed[0] > 0.5:
                 per_family["face"].append(e["mae"])
@@ -129,6 +217,16 @@ class RendererTrainer:
                 per_family["torso"].append(e["mae"])
             else:
                 per_family["sleeve"].append(e["mae"])
+            summary = b.conditioning_summary if isinstance(b.conditioning_summary, dict) else {}
+            source = str(summary.get("contract_source", "weak_manifest_bootstrap"))
+            learned_usage += 1.0 if source == "learned_temporal_contract" else 0.0
+            fam = str(summary.get("predicted_family", ""))
+            if (fam in {"expression_transition"} and b.semantic_embed[0] > 0.5) or (fam in {"garment_transition", "visibility_transition"} and b.semantic_embed[1] > 0.5) or (fam in {"pose_transition", "interaction_transition"} and b.semantic_embed[2] > 0.5):
+                mode_consistency += 1.0
+            profile = summary.get("target_profile", {}) if isinstance(summary.get("target_profile", {}), dict) else {}
+            has_profile = bool(profile.get("primary_regions") or profile.get("secondary_regions") or profile.get("context_regions"))
+            profile_consistency += 1.0 if has_profile else 0.0
+
         def fam_score(vals: list[float]) -> float:
             if not vals:
                 return 0.0
@@ -146,6 +244,10 @@ class RendererTrainer:
             "usable_sample_count": float(len(batches)),
             "invalid_records": float((diagnostics or {}).get("invalid_records", 0)),
             "skipped_records": float((diagnostics or {}).get("skipped_records", 0)),
+            "learned_contract_usage_ratio": float(learned_usage / len(batches)),
+            "weak_contract_usage_ratio": float(1.0 - (learned_usage / len(batches))),
+            "temporal_to_renderer_mode_consistency": float(mode_consistency / len(batches)),
+            "temporal_to_renderer_target_profile_consistency": float(profile_consistency / len(batches)),
             "score": score,
         }
         family_counts = (diagnostics or {}).get("family_counts", {})
@@ -155,6 +257,7 @@ class RendererTrainer:
 
     def train(self, config: TrainingConfig) -> StageResult:
         train_dataset, val_dataset = self.build_datasets(config)
+        self.contract_conditioning_mode = self._resolve_conditioning_mode(config, has_manifest=bool(config.learned_dataset_path and len(train_dataset) > 0 and self.dataset_source.startswith("manifest")))
         stage_dir = Path(config.checkpoint_dir) / self.stage_name
         stage_dir.mkdir(parents=True, exist_ok=True)
         history: list[dict[str, object]] = []
@@ -172,15 +275,19 @@ class RendererTrainer:
             def m(items: list[dict[str, float]], key: str) -> float:
                 return float(sum(i[key] for i in items) / max(1, len(items)))
 
+            learned_ratio = float(sum(1.0 for b in train_batches if (b.conditioning_summary or {}).get("contract_source") == "learned_temporal_contract") / max(1, len(train_batches)))
             last_train = {
                 "loss": m(train_losses, "total_loss"),
                 "reconstruction_loss": m(train_losses, "reconstruction_loss"),
                 "alpha_loss": m(train_losses, "alpha_loss"),
                 "uncertainty_calibration_loss": m(train_losses, "uncertainty_calibration_loss"),
                 "seam_loss": m(train_losses, "seam_loss"),
+                "learned_contract_usage_ratio": learned_ratio,
+                "weak_contract_usage_ratio": 1.0 - learned_ratio,
                 "progress": (epoch + 1) / max(1, config.epochs),
             }
             last_val = eval_metrics
+            last_val["contract_conditioning_mode"] = self.contract_conditioning_mode
             history.append({"epoch": epoch + 1, "train": last_train, "val": last_val})
             lr *= 0.94
 
@@ -202,6 +309,11 @@ class RendererTrainer:
                         "train_samples": len(train_dataset),
                         "val_samples": len(val_dataset),
                         "diagnostics": self.dataset_diagnostics,
+                    },
+                    "contract_conditioning": {
+                        "mode": self.contract_conditioning_mode,
+                        "learned_contract_usage_ratio": last_val.get("learned_contract_usage_ratio", 0.0),
+                        "weak_contract_usage_ratio": last_val.get("weak_contract_usage_ratio", 0.0),
                     },
                 },
                 indent=2,

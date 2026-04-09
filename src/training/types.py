@@ -32,6 +32,7 @@ class TrainingConfig:
     train_head_only: bool = True
     learned_dataset_path: str = ""
     learned_backend_config: BackendConfig | None = None
+    contract_conditioning_mode: str = "auto"
 
 
 @dataclass(slots=True)
