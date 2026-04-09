@@ -12,7 +12,7 @@ from dynamics.model import DynamicsModel, decode_prediction, featurize_runtime
 from dynamics.state_update import apply_delta
 from dynamics.temporal_transition_encoder import TemporalTransitionEncoder
 from planning.transition_engine import PlannedState
-from rendering.trainable_patch_renderer import TrainableLocalPatchModel
+from rendering.trainable_patch_renderer import TemporalLocalPatchModel, TrainableLocalPatchModel
 from training.datasets import _build_temporal_transition_features, _deserialize_graph, _serialize_delta_contract, _serialize_graph
 
 
@@ -79,13 +79,14 @@ def evaluate_rollout_on_video_manifest(
     dataset_manifest: str,
     temporal_model: TemporalTransitionEncoder | None = None,
     dynamics_model: DynamicsModel | None = None,
-    renderer_model: TrainableLocalPatchModel | None = None,
+    renderer_model: TrainableLocalPatchModel | TemporalLocalPatchModel | None = None,
     temporal_weights_path: str = "",
     dynamics_weights_path: str = "",
     renderer_weights_path: str = "",
     mode: str = "teacher_forced_rollout",
     rollout_steps: int = 1,
     max_records: int | None = None,
+    renderer_backend: str = "legacy_local_renderer",
 ) -> dict[str, object]:
     payload = json.loads(Path(dataset_manifest).read_text(encoding="utf-8"))
     if payload.get("manifest_type") != "video_transition_manifest":
@@ -98,7 +99,11 @@ def evaluate_rollout_on_video_manifest(
 
     temporal = temporal_model or (TemporalTransitionEncoder.load(temporal_weights_path) if temporal_weights_path else TemporalTransitionEncoder())
     dynamics = dynamics_model or (DynamicsModel.load(dynamics_weights_path) if dynamics_weights_path else DynamicsModel())
-    renderer = renderer_model or (TrainableLocalPatchModel.load(renderer_weights_path) if renderer_weights_path else TrainableLocalPatchModel())
+    renderer = renderer_model or (
+        TemporalLocalPatchModel.load(renderer_weights_path)
+        if (renderer_weights_path and renderer_backend == "temporal_local_renderer")
+        else (TrainableLocalPatchModel.load(renderer_weights_path) if renderer_weights_path else (TemporalLocalPatchModel() if renderer_backend == "temporal_local_renderer" else TrainableLocalPatchModel()))
+    )
 
     traces: list[RolloutStepPayload] = []
     metrics = {
@@ -207,6 +212,18 @@ def evaluate_rollout_on_video_manifest(
                 "predicted_family": temporal_contract.predicted_family,
                 "predicted_phase": temporal_contract.predicted_phase,
             }
+            render_batch.previous_roi = cur_roi if renderer_backend == "temporal_local_renderer" else None
+            render_batch.predicted_family = temporal_contract.predicted_family
+            render_batch.predicted_phase = temporal_contract.predicted_phase
+            render_batch.target_profile = {
+                "primary_regions": list(temporal_contract.target_profile.primary_regions),
+                "secondary_regions": list(temporal_contract.target_profile.secondary_regions),
+                "context_regions": list(temporal_contract.target_profile.context_regions),
+            }
+            render_batch.reveal_score = float(temporal_contract.reveal_score)
+            render_batch.occlusion_score = float(temporal_contract.occlusion_score)
+            render_batch.support_contact_score = float(temporal_contract.support_contact_score)
+            render_batch.rollout_weight = float(np.clip(1.0 + render_batch.reveal_score * 0.4 + render_batch.occlusion_score * 0.3, 0.5, 2.0))
             render_out = renderer.forward(render_batch)
             pred_roi = np.asarray(render_out["rgb"], dtype=np.float32)
 
@@ -288,6 +305,7 @@ def evaluate_rollout_on_video_manifest(
             "steps_evaluated": total_steps,
             "dataset_source": "manifest_video_rollout_eval_primary",
             "rollout_mode": mode,
+            "renderer_backend": renderer_backend,
             "payloads": [t.rollout_payload for t in traces],
         }
     )
@@ -299,9 +317,10 @@ def evaluate_rollout_modes_on_video_manifest(
     dataset_manifest: str,
     temporal_model: TemporalTransitionEncoder | None = None,
     dynamics_model: DynamicsModel | None = None,
-    renderer_model: TrainableLocalPatchModel | None = None,
+    renderer_model: TrainableLocalPatchModel | TemporalLocalPatchModel | None = None,
     rollout_steps: int = 1,
     max_records: int | None = None,
+    renderer_backend: str = "legacy_local_renderer",
 ) -> dict[str, object]:
     teacher = evaluate_rollout_on_video_manifest(
         dataset_manifest=dataset_manifest,
@@ -311,6 +330,7 @@ def evaluate_rollout_modes_on_video_manifest(
         mode="teacher_forced_rollout",
         rollout_steps=rollout_steps,
         max_records=max_records,
+        renderer_backend=renderer_backend,
     )
     predicted = evaluate_rollout_on_video_manifest(
         dataset_manifest=dataset_manifest,
@@ -320,6 +340,7 @@ def evaluate_rollout_modes_on_video_manifest(
         mode="predicted_rollout",
         rollout_steps=rollout_steps,
         max_records=max_records,
+        renderer_backend=renderer_backend,
     )
     return {"teacher_forced_rollout": teacher, "predicted_rollout": predicted}
 
@@ -330,6 +351,7 @@ def tiny_video_overfit_harness(
     tiny_subset_records: int = 3,
     epochs: int = 4,
     rollout_steps: int = 1,
+    renderer_backend: str = "legacy_local_renderer",
 ) -> dict[str, object]:
     from training.datasets import DynamicsDataset, RendererDataset, TemporalTransitionDataset
     from training.dynamics_trainer import DynamicsDatasetAdapter
@@ -342,7 +364,7 @@ def tiny_video_overfit_harness(
 
     temporal = TemporalTransitionEncoder()
     dynamics = DynamicsModel()
-    renderer = TrainableLocalPatchModel()
+    renderer = TemporalLocalPatchModel() if renderer_backend == "temporal_local_renderer" else TrainableLocalPatchModel()
 
     before = evaluate_rollout_on_video_manifest(
         dataset_manifest=dataset_manifest,
@@ -352,6 +374,7 @@ def tiny_video_overfit_harness(
         mode="teacher_forced_rollout",
         rollout_steps=rollout_steps,
         max_records=tiny_subset_records,
+        renderer_backend=renderer_backend,
     )
     best_after = dict(before)
 
@@ -368,7 +391,7 @@ def tiny_video_overfit_harness(
             dynamics.train_step(batch.inputs, batch.targets, lr=2e-3)
         adapter = RendererBatchAdapter(encoder=temporal, conditioning_mode="learned_contract_only")
         for sample in r_samples:
-            batch = adapter.adapt(sample)
+            batch = adapter.adapt(sample, temporal_mode=renderer_backend == "temporal_local_renderer")
             renderer.train_step(batch, lr=2e-3)
         candidate = evaluate_rollout_on_video_manifest(
             dataset_manifest=dataset_manifest,
@@ -378,6 +401,7 @@ def tiny_video_overfit_harness(
             mode="teacher_forced_rollout",
             rollout_steps=rollout_steps,
             max_records=tiny_subset_records,
+            renderer_backend=renderer_backend,
         )
         if float(candidate.get("rollout_frame_reconstruction_proxy", 0.0)) >= float(best_after.get("rollout_frame_reconstruction_proxy", 0.0)):
             best_after = candidate

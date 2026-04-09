@@ -100,6 +100,16 @@ class PatchBatch:
     transition_mode: str = "stable"
     profile_role: str = "primary"
     conditioning_summary: dict[str, object] = field(default_factory=dict)
+    previous_roi: np.ndarray | None = None
+    predicted_family: str = ""
+    predicted_phase: str = ""
+    target_profile: dict[str, list[str]] = field(default_factory=dict)
+    reveal_score: float = 0.0
+    occlusion_score: float = 0.0
+    support_contact_score: float = 0.0
+    temporal_contract_target: dict[str, object] = field(default_factory=dict)
+    graph_delta_target: dict[str, object] = field(default_factory=dict)
+    rollout_weight: float = 1.0
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
@@ -621,6 +631,102 @@ class TrainableLocalPatchModel:
         model.W_unc = np.array(payload["W_unc"], dtype=np.float32)
         model.b_unc = np.array(payload["b_unc"], dtype=np.float32)
         return model
+
+
+class TemporalLocalPatchModel(TrainableLocalPatchModel):
+    """Short-window temporal renderer with explicit temporal conditioning channels."""
+
+    PHASE_ORDER = ("prepare", "transition", "contact_or_reveal", "stabilize")
+    FAMILY_ORDER = ("pose_transition", "garment_transition", "expression_transition", "interaction_transition", "visibility_transition")
+
+    def _temporal_feature_vector(self, batch: PatchBatch) -> np.ndarray:
+        fam = np.zeros((len(self.FAMILY_ORDER),), dtype=np.float32)
+        if batch.predicted_family in self.FAMILY_ORDER:
+            fam[self.FAMILY_ORDER.index(batch.predicted_family)] = 1.0
+        phase = np.zeros((len(self.PHASE_ORDER),), dtype=np.float32)
+        if batch.predicted_phase in self.PHASE_ORDER:
+            phase[self.PHASE_ORDER.index(batch.predicted_phase)] = 1.0
+        profile = batch.target_profile if isinstance(batch.target_profile, dict) else {}
+        primary = float(len(profile.get("primary_regions", [])))
+        secondary = float(len(profile.get("secondary_regions", [])))
+        context = float(len(profile.get("context_regions", [])))
+        return np.concatenate(
+            [
+                fam,
+                phase,
+                np.asarray(
+                    [
+                        float(np.clip(batch.reveal_score, 0.0, 1.0)),
+                        float(np.clip(batch.occlusion_score, 0.0, 1.0)),
+                        float(np.clip(batch.support_contact_score, 0.0, 1.0)),
+                        float(np.clip(primary / 4.0, 0.0, 1.0)),
+                        float(np.clip(secondary / 4.0, 0.0, 1.0)),
+                        float(np.clip(context / 4.0, 0.0, 1.0)),
+                    ],
+                    dtype=np.float32,
+                ),
+            ]
+        ).astype(np.float32)
+
+    def forward(self, batch: PatchBatch) -> dict[str, np.ndarray | float]:
+        out = super().forward(batch)
+        prev = batch.previous_roi if isinstance(batch.previous_roi, np.ndarray) and batch.previous_roi.shape == batch.roi_before.shape else batch.roi_before
+        temporal_delta = np.mean(np.abs(batch.roi_before - prev), axis=2, keepdims=True)
+        temporal_feat = self._temporal_feature_vector(batch)
+        temporal_strength = float(np.clip(np.mean(temporal_feat[-6:]), 0.0, 1.0))
+        reveal_boost = float(np.clip(batch.reveal_score - batch.occlusion_score, -1.0, 1.0))
+        consistency = np.clip(1.0 - temporal_delta * (0.55 + 0.30 * temporal_strength), 0.0, 1.0)
+        edit_gate = np.asarray(out["edit_gate"], dtype=np.float32)
+        alpha = np.asarray(out["alpha"], dtype=np.float32)
+        rgb = np.asarray(out["rgb"], dtype=np.float32)
+        unc = np.asarray(out["uncertainty"], dtype=np.float32)
+
+        temporal_edit_gate = np.clip(edit_gate[..., None] * (0.80 + 0.20 * (1.0 - consistency)) * (1.0 + 0.12 * reveal_boost), 0.0, 1.0)
+        residual = np.tanh(rgb - batch.roi_before)
+        rgb_temporal = np.clip(batch.roi_before + residual * temporal_edit_gate, 0.0, 1.0)
+        alpha_temporal = np.clip(alpha * (0.84 + 0.16 * np.squeeze(temporal_edit_gate, axis=2)), 0.0, 1.0)
+        unc_temporal = np.clip(unc * (0.86 + 0.14 * np.squeeze(1.0 - consistency, axis=2)) + np.squeeze(temporal_delta, axis=2) * 0.08, 0.0, 1.0)
+
+        out["rgb"] = rgb_temporal
+        out["alpha"] = alpha_temporal
+        out["uncertainty"] = unc_temporal
+        out["temporal_consistency"] = np.squeeze(consistency, axis=2)
+        out["temporal_edit_gate"] = np.squeeze(temporal_edit_gate, axis=2)
+        out["temporal_features"] = temporal_feat
+        return out
+
+    def compute_losses(self, batch: PatchBatch, out: dict[str, np.ndarray | float]) -> dict[str, float]:
+        losses = super().compute_losses(batch, out)
+        rgb = np.asarray(out["rgb"], dtype=np.float32)
+        prev = batch.previous_roi if isinstance(batch.previous_roi, np.ndarray) and batch.previous_roi.shape == batch.roi_before.shape else batch.roi_before
+        changed = np.clip(batch.changed_mask[..., 0], 0.0, 1.0)
+        unchanged = np.clip(1.0 - changed, 0.0, 1.0)
+        temporal_consistency = float(np.mean(np.abs(rgb - prev) * unchanged[..., None]))
+        reveal_focus = float(np.mean(np.abs(rgb - batch.roi_after) * np.clip(changed * float(np.clip(batch.reveal_score, 0.0, 1.0)), 0.0, 1.0)[..., None]))
+        occ_edge = np.abs(np.gradient(np.clip(batch.changed_mask[..., 0], 0.0, 1.0), axis=0)) + np.abs(np.gradient(np.clip(batch.changed_mask[..., 0], 0.0, 1.0), axis=1))
+        occlusion_boundary = float(np.mean(np.abs(rgb - batch.roi_after) * np.clip(occ_edge * max(batch.occlusion_score, 1e-4), 0.0, 1.0)[..., None]))
+        preservation_loss = float(np.mean(np.abs(rgb - batch.roi_before) * unchanged[..., None]))
+        rollout_weight = float(np.clip(batch.rollout_weight, 0.1, 3.0))
+        rollout_weighted_reconstruction = float(losses["reconstruction_loss"] * rollout_weight)
+        total = (
+            losses["total_loss"]
+            + 0.35 * temporal_consistency
+            + 0.25 * reveal_focus
+            + 0.25 * occlusion_boundary
+            + 0.22 * preservation_loss
+            + 0.20 * rollout_weighted_reconstruction
+        )
+        losses.update(
+            {
+                "temporal_consistency_loss": temporal_consistency,
+                "reveal_region_focus_loss": reveal_focus,
+                "occlusion_boundary_loss": occlusion_boundary,
+                "preservation_loss": preservation_loss,
+                "rollout_weighted_reconstruction_loss": rollout_weighted_reconstruction,
+                "total_loss": total,
+            }
+        )
+        return losses
 
 
 def _to_np_patch(tensor: list) -> np.ndarray:
