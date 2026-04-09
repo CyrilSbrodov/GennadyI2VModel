@@ -9,8 +9,10 @@ import numpy as np
 from dynamics.model import DynamicsInputs, DynamicsModel, DynamicsTargets, decode_prediction, featurize_runtime, targets_from_delta
 from dynamics.temporal_transition_encoder import PHASES, REGION_KEYS, TemporalTransitionEncoder
 from planning.transition_engine import PlannedState
+from rendering.trainable_patch_renderer import TrainableLocalPatchModel
 from training.base_trainer import BaseTrainer
 from training.datasets import DynamicsDataset, TrainingSample
+from training.rollout_eval import evaluate_rollout_modes_on_video_manifest
 from training.types import StageResult, TrainingConfig
 
 
@@ -290,6 +292,28 @@ class DynamicsTrainer(BaseTrainer):
         val_metrics = self._evaluate(model, val_batches)
         val_metrics["score"] = round(max(0.0, 1.0 - val_metrics["pose_mse"]), 6)
         val_metrics["contract_conditioning_mode"] = self.contract_conditioning_mode
+        if config.learned_dataset_path and self.dataset_source.startswith("manifest_video_dynamics_primary"):
+            rollout = evaluate_rollout_modes_on_video_manifest(
+                dataset_manifest=config.learned_dataset_path,
+                temporal_model=self.temporal_encoder,
+                dynamics_model=model,
+                renderer_model=TrainableLocalPatchModel(),
+                rollout_steps=2,
+                max_records=max(1, config.val_size),
+            )
+            tf = rollout.get("teacher_forced_rollout", {})
+            pr = rollout.get("predicted_rollout", {})
+            val_metrics["rollout_teacher_frame_reconstruction_proxy"] = float(tf.get("rollout_frame_reconstruction_proxy", 0.0))
+            val_metrics["rollout_predicted_frame_reconstruction_proxy"] = float(pr.get("rollout_frame_reconstruction_proxy", 0.0))
+            val_metrics["rollout_consistency_regularizer"] = round(
+                max(
+                    0.0,
+                    1.0
+                    - 0.5 * val_metrics["rollout_teacher_frame_reconstruction_proxy"]
+                    - 0.5 * val_metrics["rollout_predicted_frame_reconstruction_proxy"],
+                ),
+                6,
+            )
 
         stage_dir = Path(config.checkpoint_dir) / self.stage_name
         stage_dir.mkdir(parents=True, exist_ok=True)
