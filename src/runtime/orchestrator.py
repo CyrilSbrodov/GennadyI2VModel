@@ -206,7 +206,7 @@ class GennadyEngine:
                 text_action_summary=text_encoding,
                 graph_encoding=graph_encoding,
                 identity_embeddings={entity_id: identity_embedding},
-                step_context={"step_index": planned_state.step_index, "memory": memory},
+                step_context={"step_index": planned_state.step_index, "memory": memory, "semantic_transition": planned_state.semantic_transition},
             )
             transition_output = self.backends.dynamics_backend.predict_transition(transition_request)
             parity_contract = dynamics_io_to_contract(transition_request, transition_output)
@@ -231,12 +231,25 @@ class GennadyEngine:
             step_hidden_cases = 0
             for region in changed_regions[: profile.max_roi_count]:
                 patch_channels = self.build_patch_memory_channels(memory_channels)
+                transition_metadata = transition_output.metadata if isinstance(transition_output.metadata, dict) else {}
                 patch_request = PatchSynthesisRequest(
                     region=region,
                     scene_state=scene_graph,
                     memory_summary=memory_summary,
-                    transition_context={"graph_delta": delta, "video_memory": memory},
-                    retrieval_summary={"backend": "learned_primary", "identity_entity": entity_id},
+                    transition_context={
+                        "graph_delta": delta,
+                        "video_memory": memory,
+                        "transition_phase": delta.transition_phase,
+                        "step_index": planned_state.step_index,
+                        "target_profile": transition_metadata.get("target_profile", {}),
+                        "region_selection_rationale": transition_metadata.get("region_selection_rationale", {}),
+                        "semantic_families": transition_metadata.get("semantic_families", []),
+                    },
+                    retrieval_summary={
+                        "backend": "learned_primary",
+                        "identity_entity": entity_id,
+                        "target_profile": transition_metadata.get("target_profile", {}),
+                    },
                     current_frame=current_frame,
                     memory_channels=patch_channels,
                     graph_encoding=graph_encoding,

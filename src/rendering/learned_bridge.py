@@ -9,6 +9,8 @@ from rendering.trainable_patch_renderer import (
     TrainableLocalPatchModel,
     build_patch_batch,
     output_from_prediction,
+    summarize_patch_batch,
+    summarize_request_contract,
     _extract_roi,
 )
 
@@ -48,10 +50,12 @@ class TrainablePatchSynthesisModel(PatchSynthesisModel):
         self.strict_mode = strict_mode
 
     def synthesize_patch(self, request: PatchSynthesisRequest) -> PatchSynthesisOutput:
+        request_contract = summarize_request_contract(request)
         try:
             roi_before = _extract_roi(request.current_frame, request.region)
             batch = build_patch_batch(request, roi_before)
             pred = self.model.infer(batch)
+            batch_summary = summarize_patch_batch(batch)
             return output_from_prediction(
                 request,
                 pred,
@@ -60,6 +64,11 @@ class TrainablePatchSynthesisModel(PatchSynthesisModel):
                     "fallback_used": False,
                     "strict_mode": self.strict_mode,
                     "roi_shape": list(roi_before.shape),
+                    "transition_mode": batch.transition_mode,
+                    "profile_role": batch.profile_role,
+                    "reveal_like": bool(batch.conditioning_summary.get("reveal_like", False)),
+                    "output_provenance": "trainable_local_patch_model",
+                    "conditioning_summary": batch_summary,
                     "conditioning": {
                         "has_graph_encoding": bool(request.graph_encoding),
                         "identity_dim": len(request.identity_embedding),
@@ -69,6 +78,11 @@ class TrainablePatchSynthesisModel(PatchSynthesisModel):
                         "graph_cond_norm": float(batch.graph_cond.mean()),
                         "memory_cond_norm": float(batch.memory_cond.mean()),
                         "appearance_cond_norm": float(batch.appearance_cond.mean()),
+                        "mode_cond_norm": float(batch.mode_cond.mean()) if batch.mode_cond is not None else 0.0,
+                        "role_cond_norm": float(batch.role_cond.mean()) if batch.role_cond is not None else 0.0,
+                        "preservation_mean": batch_summary["preservation_mean"],
+                        "seam_prior_mean": batch_summary["seam_prior_mean"],
+                        "uncertainty_target_mean": batch_summary["uncertainty_target_mean"],
                     },
                 },
                 batch=batch,
@@ -78,8 +92,30 @@ class TrainablePatchSynthesisModel(PatchSynthesisModel):
                 raise
             fb = self.fallback.synthesize_patch(request)
             fb.execution_trace = dict(fb.execution_trace)
-            fb.execution_trace.update({"renderer_path": "legacy_fallback", "fallback_reason": type(err).__name__, "fallback_message": str(err), "strict_mode": self.strict_mode})
+            fb.execution_trace.update(
+                {
+                    "renderer_path": "legacy_fallback",
+                    "fallback_reason": type(err).__name__,
+                    "fallback_message": str(err),
+                    "strict_mode": self.strict_mode,
+                    "requested_transition_mode": request_contract["requested_transition_mode"],
+                    "requested_profile_role": request_contract["requested_profile_role"],
+                    "fallback_provenance": "legacy_deterministic_patch_renderer",
+                }
+            )
             fb.metadata = dict(fb.metadata)
-            fb.metadata.update({"fallback_reason": type(err).__name__, "fallback_message": str(err)})
-            fb.debug_trace = list(fb.debug_trace) + [f"fallback_reason={type(err).__name__}"]
+            fb.metadata.update(
+                {
+                    "fallback_reason": type(err).__name__,
+                    "fallback_message": str(err),
+                    "requested_transition_mode": request_contract["requested_transition_mode"],
+                    "requested_profile_role": request_contract["requested_profile_role"],
+                    "output_provenance": "legacy_deterministic_patch_renderer",
+                }
+            )
+            fb.debug_trace = list(fb.debug_trace) + [
+                f"fallback_reason={type(err).__name__}",
+                f"requested_mode={request_contract['requested_transition_mode']}",
+                f"requested_role={request_contract['requested_profile_role']}",
+            ]
             return fb

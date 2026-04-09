@@ -6,6 +6,24 @@ from utils_tensor import blend, shape
 
 
 class Compositor:
+    @staticmethod
+    def _effective_alpha(patch: RenderedPatch, roi_h: int, roi_w: int) -> list[list[float]]:
+        alpha = [[float(v) for v in row[:roi_w]] for row in patch.alpha_mask[:roi_h]]
+        if not patch.uncertainty_map:
+            return alpha
+
+        conf = max(0.0, min(1.0, float(patch.confidence)))
+        out: list[list[float]] = []
+        for y in range(roi_h):
+            row: list[float] = []
+            for x in range(roi_w):
+                unc = float(patch.uncertainty_map[y][x]) if y < len(patch.uncertainty_map) and x < len(patch.uncertainty_map[y]) else 0.0
+                edge = 1.0 - min(x, roi_w - 1 - x, y, roi_h - 1 - y) / max(1.0, min(roi_h, roi_w) / 2.0)
+                attenuation = 1.0 - unc * (0.22 + 0.28 * edge) - (1.0 - conf) * (0.10 + 0.08 * edge)
+                row.append(max(0.0, min(1.0, alpha[y][x] * attenuation)))
+            out.append(row)
+        return out
+
     def compose(self, current_frame: list, patches: list[RenderedPatch], delta: GraphDelta) -> list:
         _ = delta
         frame = [[px[:] for px in row] for row in current_frame]
@@ -21,7 +39,7 @@ class Compositor:
                 continue
             dst = [row[x0 : x0 + roi_w] for row in frame[y0 : y0 + roi_h]]
             src = [row[:roi_w] for row in p.rgb_patch[:roi_h]]
-            alpha = [row[:roi_w] for row in p.alpha_mask[:roi_h]]
+            alpha = self._effective_alpha(p, roi_h, roi_w)
             blended = blend(dst, src, alpha)
             for yy in range(roi_h):
                 frame[y0 + yy][x0 : x0 + roi_w] = blended[yy]
