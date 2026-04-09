@@ -15,6 +15,7 @@ class TrainingConfig:
             "text_encoder",
             "dynamics",
             "dynamics_transition",
+            "temporal_transition",
             "renderer",
             "patch_synthesis",
             "temporal_refinement",

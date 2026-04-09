@@ -21,6 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
             "renderer",
             "text_encoder",
             "dynamics_transition",
+            "temporal_transition",
             "patch_synthesis",
             "temporal_refinement",
         ],
