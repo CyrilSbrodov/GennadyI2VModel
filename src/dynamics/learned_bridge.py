@@ -24,7 +24,15 @@ class LearnedDynamicsTransitionModel(DynamicsTransitionModel):
     def predict_transition(self, request: DynamicsTransitionRequest) -> DynamicsTransitionOutput:
         labels = request.text_action_summary.structured_action_tokens or ["micro_adjust"]
         step_index = int(request.step_context.get("step_index", 1))
-        planned_state = type("_PS", (), {"labels": labels, "step_index": step_index})()
+        planned_state = type(
+            "_PS",
+            (),
+            {
+                "labels": labels,
+                "step_index": step_index,
+                "semantic_transition": request.step_context.get("semantic_transition"),
+            },
+        )()
         strict = bool(request.step_context.get("strict_dynamics", False))
         if strict and not self.predictor.strict_mode:
             self.predictor = GraphDeltaPredictor(strict_mode=True)
@@ -64,7 +72,15 @@ class LegacyHeuristicDynamicsTransitionModel(DynamicsTransitionModel):
     def predict_transition(self, request: DynamicsTransitionRequest) -> DynamicsTransitionOutput:
         labels = request.text_action_summary.structured_action_tokens or ["micro_adjust"]
         step_index = int(request.step_context.get("step_index", 1))
-        planned_state = type("_PS", (), {"labels": labels, "step_index": step_index})()
+        planned_state = type(
+            "_PS",
+            (),
+            {
+                "labels": labels,
+                "step_index": step_index,
+                "semantic_transition": request.step_context.get("semantic_transition"),
+            },
+        )()
         delta, metrics = self.predictor._predict_legacy(
             scene_graph=request.graph_state,
             target_state=planned_state,
