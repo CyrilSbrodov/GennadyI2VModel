@@ -49,6 +49,24 @@ class TrainingSample(TypedDict, total=False):
     patch_synthesis_contract: dict[str, object]
     temporal_consistency_contract: dict[str, object]
 
+    temporal_transition_features: list[float]
+    temporal_transition_target: dict[str, object]
+
+    human_state_transition_features: list[float]
+    human_state_transition_target: dict[str, object]
+    human_state_history: dict[str, object]
+
+    renderer_batch_contract: dict[str, object]
+    temporal_roi_window: dict[str, object]
+    region_family: str
+
+    target_profile: dict[str, object]
+    phase_family: dict[str, object]
+    reveal_occlusion_support_cues: dict[str, float]
+    visibility_targets: list[float]
+
+    region_id: str
+
 
 @dataclass(slots=True)
 class BaseStageDataset:
@@ -236,6 +254,18 @@ class DynamicsDataset(BaseStageDataset):
                     support_score=float(np.clip((delta_raw.get("interaction_deltas", {}) or {}).get("support_contact", 0.0), 0.0, 1.0)),
                     transition_confidence=float(np.clip(rec.get("transition_confidence", 1.0), 0.0, 1.0)),
                 )
+                human_features, human_target, human_history = _build_human_state_transition_payload(
+                    record=rec,
+                    graph_before=graph_before,
+                    graph_after=graph_after,
+                    family=family,
+                    phase=phase,
+                    target_profile=target_profile,
+                    roi_records=rec.get("roi_records", []) if isinstance(rec.get("roi_records"), list) else [],
+                    planner_context=planner_context,
+                    graph_delta_target=delta_raw,
+                    has_previous_in_sequence=idx > 0,
+                )
                 out.append(
                     {
                         "graphs": [graph_before, graph_after],
@@ -252,6 +282,9 @@ class DynamicsDataset(BaseStageDataset):
                             "occlusion_score": float(np.clip(rec.get("occlusion_score", occlusion_cov), 0.0, 1.0)),
                             "support_contact_score": float(np.clip((delta_raw.get("interaction_deltas", {}) or {}).get("support_contact", 0.0), 0.0, 1.0)),
                         },
+                        "human_state_transition_features": human_features,
+                        "human_state_transition_target": human_target,
+                        "human_state_history": human_history,
                         "graph_transition_contract": {
                             "planner_context": {
                                 "step_index": float(planner_context.get("step_index", idx + 1)),
@@ -320,16 +353,15 @@ class DynamicsDataset(BaseStageDataset):
                 delta=delta,
                 transition_context={"source": "graph_sequence", "step_index": idx},
             )
-            samples.append(
-                {
-                    "graphs": [graphs[idx], graphs[idx + 1]],
-                    "actions": actions,
-                    "deltas": [delta],
-                    "source": "graph_sequence",
-                    "delta_contract": _serialize_delta_contract(delta),
-                    "graph_transition_contract": graph_contract,
-                }
-            )
+            sample: TrainingSample = {
+                "graphs": [graphs[idx], graphs[idx + 1]],
+                "actions": actions,
+                "deltas": [delta],
+                "source": "graph_sequence",
+                "delta_contract": _serialize_delta_contract(delta),
+                "graph_transition_contract": graph_contract,
+            }
+            samples.append(sample)
         return cls(samples=samples)
 
     @classmethod
@@ -560,6 +592,113 @@ class TemporalTransitionDataset(BaseStageDataset):
         return ds
 
 
+class HumanStateTransitionDataset(BaseStageDataset):
+    CANONICAL_PHASES = {"prepare", "transition", "contact_or_reveal", "stabilize"}
+    CANONICAL_FAMILIES = {"pose_transition", "garment_transition", "expression_transition", "interaction_transition", "visibility_transition"}
+    REGION_KEYS = ("face", "torso", "left_arm", "right_arm", "legs", "garments", "inner_garment", "outer_garment")
+
+    @classmethod
+    def from_video_transition_manifest(cls, manifest_path: str, strict: bool = False) -> "HumanStateTransitionDataset":
+        payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        records = payload.get("records", [])
+        samples: list[TrainingSample] = []
+        diagnostics: dict[str, object] = {
+            "source": "manifest_video_human_state_transition_primary",
+            "manifest_path": manifest_path,
+            "manifest_type": payload.get("manifest_type", "unknown"),
+            "total_records": len(records),
+            "usable": 0,
+            "invalid": 0,
+            "skipped": 0,
+            "family_coverage": {},
+            "phase_coverage": {},
+            "region_coverage": {},
+            "reveal_coverage": 0,
+            "occlusion_coverage": 0,
+            "history_available": 0,
+            "history_availability_ratio": 0.0,
+            "invalid_examples": [],
+        }
+        record_index = {str(r.get("record_id", f"record_{idx}")): idx for idx, r in enumerate(records) if isinstance(r, dict)}
+        for idx, rec in enumerate(records):
+            try:
+                if not isinstance(rec, dict):
+                    raise ValueError("record must be object")
+                family = str(rec.get("transition_family", rec.get("runtime_semantic_transition", "pose_transition"))).strip().lower()
+                if family not in cls.CANONICAL_FAMILIES:
+                    raise ValueError(f"transition_family must be canonical, got {family}")
+                planner = rec.get("planner_context", {}) if isinstance(rec.get("planner_context"), dict) else {}
+                phase = str(rec.get("phase_estimate", planner.get("phase", "transition"))).strip().lower()
+                if phase not in cls.CANONICAL_PHASES:
+                    raise ValueError(f"phase must be canonical, got {phase}")
+                before = _deserialize_graph(rec.get("scene_graph_before", {}))
+                after = _deserialize_graph(rec.get("scene_graph_after", {}))
+                roi_records = rec.get("roi_records", []) if isinstance(rec.get("roi_records"), list) else []
+                target_profile = rec.get("target_profile", {}) if isinstance(rec.get("target_profile"), dict) else {}
+                delta_target = rec.get("graph_delta_target", {}) if isinstance(rec.get("graph_delta_target"), dict) else {}
+                human_features, human_target, human_history = _build_human_state_transition_payload(
+                    record=rec,
+                    graph_before=before,
+                    graph_after=after,
+                    family=family,
+                    phase=phase,
+                    target_profile=target_profile,
+                    roi_records=roi_records,
+                    planner_context=planner,
+                    graph_delta_target=delta_target,
+                    has_previous_in_sequence=idx > 0,
+                )
+                reveal_cue = float(human_target.get("reveal_memory_target", 0.0))
+                occlusion_cue = float(1.0 - float(np.mean(human_target.get("visibility_targets", [1.0]))))
+
+                sample: TrainingSample = {
+                    "source": "manifest_video_human_state_transition_primary",
+                    "graphs": [before, after],
+                    "human_state_transition_features": human_features,
+                    "human_state_transition_target": human_target,
+                    "human_state_history": human_history,
+                    "graph_transition_contract": {
+                        "planner_context": planner,
+                        "target_transition_context": rec.get("target_transition_context", {}) if isinstance(rec.get("target_transition_context"), dict) else {},
+                        "memory_context": rec.get("memory_context", {}) if isinstance(rec.get("memory_context"), dict) else {},
+                        "metadata": {"record_id": rec.get("record_id", f"video_transition_{idx}")},
+                    },
+                    "target_profile": target_profile,
+                    "phase_family": {"phase": phase, "family": family},
+                    "reveal_occlusion_support_cues": {
+                        "reveal": reveal_cue,
+                        "occlusion": occlusion_cue,
+                        "support": float(human_target.get("support_contact_target", 0.0)),
+                    },
+                    "visibility_targets": human_target.get("visibility_targets", []),
+                }
+                if bool(human_history.get("has_history", False)):
+                    diagnostics["history_available"] = int(diagnostics["history_available"]) + 1
+                samples.append(sample)
+                diagnostics["usable"] = int(diagnostics["usable"]) + 1
+                diagnostics["family_coverage"][family] = int(diagnostics["family_coverage"].get(family, 0)) + 1
+                diagnostics["phase_coverage"][phase] = int(diagnostics["phase_coverage"].get(phase, 0)) + 1
+                active_regions = set(str(x) for x in (human_target.get("target_profile", {}) or {}).get("primary_regions", []))
+                active_regions.update(str(x) for x in (human_target.get("target_profile", {}) or {}).get("secondary_regions", []))
+                active_regions.update(str(x) for x in (human_target.get("target_profile", {}) or {}).get("context_regions", []))
+                for r in active_regions:
+                    diagnostics["region_coverage"][r] = int(diagnostics["region_coverage"].get(r, 0)) + 1
+                diagnostics["reveal_coverage"] = int(diagnostics["reveal_coverage"]) + (1 if reveal_cue > 0.1 else 0)
+                diagnostics["occlusion_coverage"] = int(diagnostics["occlusion_coverage"]) + (1 if occlusion_cue > 0.1 else 0)
+            except Exception as exc:
+                diagnostics["invalid"] = int(diagnostics["invalid"]) + 1
+                diagnostics["skipped"] = int(diagnostics["skipped"]) + 1
+                if len(diagnostics["invalid_examples"]) < 8:
+                    diagnostics["invalid_examples"].append({"index": idx, "error": str(exc)})
+                if strict:
+                    raise ValueError(f"video transition human-state record {idx} invalid: {exc}") from exc
+        diagnostics["history_availability_ratio"] = round(float(diagnostics["history_available"]) / max(1.0, float(diagnostics["usable"])), 6)
+        ds = cls(samples=samples)
+        ds.diagnostics = diagnostics
+        return ds
+
+
+
 class RendererDataset(BaseStageDataset):
     CANONICAL_PHASES = {"prepare", "transition", "contact_or_reveal", "stabilize"}
     CANONICAL_FAMILIES = {"pose_transition", "garment_transition", "expression_transition", "interaction_transition", "visibility_transition"}
@@ -681,6 +820,26 @@ class RendererDataset(BaseStageDataset):
                         support_score=float(np.clip((rec.get("graph_delta_target", {}) or {}).get("interaction_deltas", {}).get("support_contact", 0.0) if isinstance((rec.get("graph_delta_target", {}) or {}).get("interaction_deltas", {}), dict) else 0.0, 0.0, 1.0)),
                         transition_confidence=float(np.clip(rec.get("transition_confidence", 1.0), 0.0, 1.0)),
                     ) if isinstance(rec.get("scene_graph_before"), dict) and isinstance(rec.get("scene_graph_after"), dict) else [0.0] * 128
+                    human_features, human_target, human_history = _build_human_state_transition_payload(
+                        record=rec,
+                        graph_before=_deserialize_graph(rec.get("scene_graph_before", {})),
+                        graph_after=_deserialize_graph(rec.get("scene_graph_after", {})),
+                        family=family,
+                        phase=phase,
+                        target_profile=tp if isinstance(tp, dict) else {},
+                        roi_records=roi_records,
+                        planner_context=rec.get("planner_context", {}) if isinstance(rec.get("planner_context"), dict) else {},
+                        graph_delta_target=rec.get("graph_delta_target", {}) if isinstance(rec.get("graph_delta_target"), dict) else {},
+                        has_previous_in_sequence=idx > 0,
+                    ) if isinstance(rec.get("scene_graph_before"), dict) and isinstance(rec.get("scene_graph_after"), dict) else ([0.0] * 160, {
+                        "family": family,
+                        "phase": phase,
+                        "target_profile": tp if isinstance(tp, dict) else {},
+                        "region_state_targets": [0.0] * 8,
+                        "visibility_targets": [0.0] * 8,
+                        "reveal_memory_target": 0.0,
+                        "support_contact_target": 0.0,
+                    }, {"has_history": False, "previous_state_hint": [0.0] * 24})
                     samples.append(
                         {
                             "frames": [roi_before, roi_after],
@@ -706,6 +865,9 @@ class RendererDataset(BaseStageDataset):
                                 "occlusion_score": temporal_target["occlusion_score"],
                                 "support_contact_score": temporal_target["support_contact_score"],
                             },
+                            "human_state_transition_features": human_features,
+                            "human_state_transition_target": human_target,
+                            "human_state_history": human_history,
                             "graph_transition_contract": {
                                 "planner_context": rec.get("planner_context", {}) if isinstance(rec.get("planner_context"), dict) else {},
                                 "target_transition_context": rec.get("target_transition_context", {}) if isinstance(rec.get("target_transition_context"), dict) else {},
@@ -841,8 +1003,7 @@ class RendererDataset(BaseStageDataset):
                     "changed_mask": changed_mask,
                 }
 
-                samples.append(
-                    {
+                sample: TrainingSample = {
                         "frames": [roi_before, roi_after],
                         "roi_pairs": [(roi_before, roi_after)],
                         "source": str(rec.get("source", "manifest_paired_roi")),
@@ -854,7 +1015,7 @@ class RendererDataset(BaseStageDataset):
                         "memory_records": rec.get("memory_records", []),
                         "patch_synthesis_contract": rec.get("patch_synthesis_contract", {}),
                     }
-                )
+                samples.append(sample)
                 diagnostics["loaded_records"] = int(diagnostics["loaded_records"]) + 1
             except Exception as exc:
                 diagnostics["invalid_records"] = int(diagnostics["invalid_records"]) + 1
@@ -973,24 +1134,23 @@ class RendererDataset(BaseStageDataset):
                     scene_transition_context=rec.get("scene_transition_context", {}),
                     memory_transition_context=rec.get("memory_transition_context", {}),
                 )
-            out.append(
-                {
-                    "frames": [frames[0], frames[1]],
-                    "roi_pairs": roi_pairs,
-                    "patch_synthesis_contract": patch_contract,
-                    "temporal_consistency_contract": temporal_contract,
-                    "renderer_batch_contract": {
-                        "semantic_embed": rec.get("semantic_embed", [0.0, 1.0, 0.0, 0.25, 0.8, 0.35]),
-                        "delta_cond": rec.get("delta_cond", [0.3, 0.1, 0.2, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0]),
-                        "planner_cond": rec.get("planner_cond", [0.2, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
-                        "graph_cond": rec.get("graph_cond", [1.0, 0.2, 0.15, 0.5, 0.5, 0.5, 0.2]),
-                        "memory_cond": rec.get("memory_cond", [0.5, 0.4, 0.2, 0.6, 0.3, 0.2, 0.4, 0.0]),
-                        "appearance_cond": rec.get("appearance_cond", [0.3, 0.3, 0.3, 0.05, 0.05, 0.05]),
-                        "bbox_cond": rec.get("bbox_cond", [0.2, 0.2, 0.4, 0.4]),
-                    },
-                    "source": rec.get("source", "video_manifest"),
-                }
-            )
+            sample: TrainingSample = {
+                "frames": [frames[0], frames[1]],
+                "roi_pairs": roi_pairs,
+                "patch_synthesis_contract": patch_contract,
+                "temporal_consistency_contract": temporal_contract,
+                "renderer_batch_contract": {
+                    "semantic_embed": rec.get("semantic_embed", [0.0, 1.0, 0.0, 0.25, 0.8, 0.35]),
+                    "delta_cond": rec.get("delta_cond", [0.3, 0.1, 0.2, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0]),
+                    "planner_cond": rec.get("planner_cond", [0.2, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+                    "graph_cond": rec.get("graph_cond", [1.0, 0.2, 0.15, 0.5, 0.5, 0.5, 0.2]),
+                    "memory_cond": rec.get("memory_cond", [0.5, 0.4, 0.2, 0.6, 0.3, 0.2, 0.4, 0.0]),
+                    "appearance_cond": rec.get("appearance_cond", [0.3, 0.3, 0.3, 0.05, 0.05, 0.05]),
+                    "bbox_cond": rec.get("bbox_cond", [0.2, 0.2, 0.4, 0.4]),
+                },
+                "source": rec.get("source", "video_manifest"),
+            }
+            out.append(sample)
         return cls(samples=out)
 
 
@@ -1204,15 +1364,14 @@ class TextActionDataset(BaseStageDataset):
             actions = [ActionStep(type=a.get("type", "unknown"), priority=i + 1, target_entity=a.get("target_entity"), target_object=a.get("target_object")) for i, a in enumerate(rec.get("actions", []))]
             encoding = encoder.encode(rec.get("text", ""))
             contract = build_text_action_state_contract(rec.get("text", ""), actions, vars(encoding))
-            samples.append(
-                {
-                    "text": rec.get("text", ""),
-                    "actions": actions,
-                    "text_alignment": rec,
-                    "text_action_contract": contract,
-                    "source": rec.get("source", "annotation_manifest"),
-                }
-            )
+            sample: TrainingSample = {
+                "text": rec.get("text", ""),
+                "actions": actions,
+                "text_alignment": rec,
+                "text_action_contract": contract,
+                "source": rec.get("source", "annotation_manifest"),
+            }
+            samples.append(sample)
         return cls(samples=samples)
 
 
@@ -1265,6 +1424,81 @@ def _serialize_graph(graph: SceneGraph) -> dict[str, object]:
         "objects": [{"object_id": o.object_id, "object_type": o.object_type, "bbox": _serialize_bbox(o.bbox), "confidence": o.confidence} for o in graph.objects],
         "relations": [{"source": r.source, "relation": r.relation, "target": r.target, "confidence": r.confidence, "provenance": r.provenance} for r in graph.relations],
     }
+
+
+def _build_human_state_transition_payload(
+    *,
+    record: dict[str, object],
+    graph_before: SceneGraph,
+    graph_after: SceneGraph,
+    family: str,
+    phase: str,
+    target_profile: dict[str, object],
+    roi_records: list[dict[str, object]],
+    planner_context: dict[str, object],
+    graph_delta_target: dict[str, object],
+    feature_dim: int = 160,
+    has_previous_in_sequence: bool = False,
+) -> tuple[list[float], dict[str, object], dict[str, object]]:
+    vis_delta = (graph_delta_target.get("visibility_deltas", {}) or {}) if isinstance((graph_delta_target.get("visibility_deltas", {}) or {}), dict) else {}
+    reveal_cue = float(np.clip(record.get("reveal_score", vis_delta.get("revealed_regions_score", 0.0)), 0.0, 1.0))
+    occlusion_cue = float(np.clip(record.get("occlusion_score", vis_delta.get("occluded_regions_score", 0.0)), 0.0, 1.0))
+    support_cue = float(
+        np.clip(
+            ((graph_delta_target.get("interaction_deltas", {}) or {}).get("support_contact", record.get("support_contact_score", 0.0)))
+            if isinstance((graph_delta_target.get("interaction_deltas", {}) or {}), dict)
+            else float(record.get("support_contact_score", 0.0)),
+            0.0,
+            1.0,
+        )
+    )
+    temporal_feats = _build_temporal_transition_features(
+        graph_before=graph_before,
+        graph_after=graph_after,
+        roi_records=roi_records,
+        graph_delta_target=graph_delta_target,
+        planner_context=planner_context,
+        target_profile=target_profile,
+        runtime_semantic_transition=str(record.get("runtime_semantic_transition", family)),
+        phase_estimate=phase,
+        reveal_score=reveal_cue,
+        occlusion_score=occlusion_cue,
+        support_score=support_cue,
+        transition_confidence=float(np.clip(record.get("transition_confidence", 1.0), 0.0, 1.0)),
+    )
+    region_keys = ("face", "torso", "left_arm", "right_arm", "legs", "garments", "inner_garment", "outer_garment")
+    all_regions: set[str] = set()
+    for slot in ("primary_regions", "secondary_regions", "context_regions"):
+        for region in target_profile.get(slot, []) if isinstance(target_profile.get(slot, []), list) else []:
+            all_regions.add(str(region))
+    roi_region_changed = {str(rr.get("region_type", "")): float(rr.get("changed_ratio", 0.0)) for rr in roi_records if isinstance(rr, dict)}
+    region_states: list[float] = []
+    visibility_targets: list[float] = []
+    for region in region_keys:
+        on = 1.0 if region in all_regions else 0.0
+        region_states.append(float(np.clip(max(on * 0.65, roi_region_changed.get(region, 0.0)), 0.0, 1.0)))
+        visibility_targets.append(float(np.clip(1.0 - occlusion_cue * (1.0 if region in all_regions else 0.5), 0.0, 1.0)))
+
+    features = temporal_feats + region_states + visibility_targets + [reveal_cue, occlusion_cue, support_cue]
+    if len(features) < feature_dim:
+        features.extend([0.0] * (feature_dim - len(features)))
+    prev_hint = [0.0] * 24
+    return (
+        features[:feature_dim],
+        {
+            "family": family,
+            "phase": phase,
+            "target_profile": target_profile,
+            "region_state_targets": region_states,
+            "visibility_targets": visibility_targets,
+            "reveal_memory_target": reveal_cue,
+            "support_contact_target": support_cue,
+        },
+        {
+            "has_history": bool(record.get("previous_record_id")) or bool(has_previous_in_sequence),
+            "previous_state_hint": prev_hint,
+        },
+    )
 
 
 def _build_temporal_transition_features(

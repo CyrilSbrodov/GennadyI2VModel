@@ -167,3 +167,75 @@ class LearnedTemporalTransitionContract:
             teacher_source=str(payload.get("teacher_source", "weak_manifest_bootstrap")),
             is_learned_primary=bool(payload.get("is_learned_primary", False)),
         )
+
+
+@dataclass(slots=True)
+class LearnedHumanStateContract:
+    """Typed learned latent human-state contract with reveal/occlusion memory."""
+
+    predicted_family: str = "pose_transition"
+    predicted_phase: str = "transition"
+    target_profile: TransitionTargetProfile = field(default_factory=TransitionTargetProfile)
+    state_embedding: list[float] = field(default_factory=list)
+    region_state_embeddings: dict[str, list[float]] = field(default_factory=dict)
+    reveal_memory_embedding: list[float] = field(default_factory=list)
+    visibility_state_scores: dict[str, float] = field(default_factory=dict)
+    support_contact_state: float = 0.0
+    compact_conditioning_embedding: list[float] = field(default_factory=list)
+    confidence: float = 0.0
+    teacher_source: str = "human_state_bootstrap_manifest"
+    is_learned_primary: bool = True
+
+    def to_metadata(self) -> dict[str, object]:
+        return {
+            "predicted_family": self.predicted_family,
+            "predicted_phase": self.predicted_phase,
+            "target_profile": {
+                "primary_regions": list(self.target_profile.primary_regions),
+                "secondary_regions": list(self.target_profile.secondary_regions),
+                "context_regions": list(self.target_profile.context_regions),
+                "entity": self.target_profile.entity,
+                "entity_id": self.target_profile.entity_id,
+                "object_role": self.target_profile.object_role,
+                "support_target": self.target_profile.support_target,
+            },
+            "state_embedding": [float(x) for x in self.state_embedding],
+            "region_state_embeddings": {str(k): [float(v) for v in vals] for k, vals in self.region_state_embeddings.items()},
+            "reveal_memory_embedding": [float(x) for x in self.reveal_memory_embedding],
+            "visibility_state_scores": {str(k): float(v) for k, v in self.visibility_state_scores.items()},
+            "support_contact_state": float(self.support_contact_state),
+            "compact_conditioning_embedding": [float(x) for x in self.compact_conditioning_embedding],
+            "confidence": float(self.confidence),
+            "teacher_source": self.teacher_source,
+            "is_learned_primary": bool(self.is_learned_primary),
+        }
+
+    @classmethod
+    def from_metadata(cls, payload: dict[str, object] | None) -> "LearnedHumanStateContract | None":
+        if not isinstance(payload, dict):
+            return None
+        target = payload.get("target_profile", {}) if isinstance(payload.get("target_profile", {}), dict) else {}
+        raw_region = payload.get("region_state_embeddings", {}) if isinstance(payload.get("region_state_embeddings", {}), dict) else {}
+        raw_vis = payload.get("visibility_state_scores", {}) if isinstance(payload.get("visibility_state_scores", {}), dict) else {}
+        return cls(
+            predicted_family=str(payload.get("predicted_family", "pose_transition")),
+            predicted_phase=str(payload.get("predicted_phase", "transition")),
+            target_profile=TransitionTargetProfile(
+                primary_regions=[str(x) for x in target.get("primary_regions", []) if isinstance(x, str)],
+                secondary_regions=[str(x) for x in target.get("secondary_regions", []) if isinstance(x, str)],
+                context_regions=[str(x) for x in target.get("context_regions", []) if isinstance(x, str)],
+                entity=str(target.get("entity", "self")),
+                entity_id=str(target.get("entity_id")) if target.get("entity_id") is not None else None,
+                object_role=str(target.get("object_role")) if target.get("object_role") is not None else None,
+                support_target=str(target.get("support_target")) if target.get("support_target") is not None else None,
+            ),
+            state_embedding=[float(x) for x in payload.get("state_embedding", []) if isinstance(x, (int, float))],
+            region_state_embeddings={str(k): [float(x) for x in vals if isinstance(x, (int, float))] for k, vals in raw_region.items() if isinstance(vals, list)},
+            reveal_memory_embedding=[float(x) for x in payload.get("reveal_memory_embedding", []) if isinstance(x, (int, float))],
+            visibility_state_scores={str(k): float(v) for k, v in raw_vis.items() if isinstance(v, (int, float))},
+            support_contact_state=float(payload.get("support_contact_state", 0.0) or 0.0),
+            compact_conditioning_embedding=[float(x) for x in payload.get("compact_conditioning_embedding", []) if isinstance(x, (int, float))],
+            confidence=float(payload.get("confidence", 0.0) or 0.0),
+            teacher_source=str(payload.get("teacher_source", "human_state_bootstrap_manifest")),
+            is_learned_primary=bool(payload.get("is_learned_primary", False)),
+        )

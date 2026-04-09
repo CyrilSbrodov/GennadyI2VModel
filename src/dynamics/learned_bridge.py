@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 from core.schema import GraphDelta, SceneGraph, VideoMemory
 from dynamics.graph_delta_predictor import DynamicsMetrics, GraphDeltaPredictor
 from dynamics.temporal_contract_alignment import compute_temporal_contract_alignment
+from dynamics.human_state_transition import HumanStateTransitionModel
 from dynamics.temporal_transition_encoder import TemporalTransitionEncoder
-from dynamics.transition_contracts import LearnedTemporalTransitionContract
+from dynamics.transition_contracts import LearnedHumanStateContract, LearnedTemporalTransitionContract
 from learned.interfaces import DynamicsTransitionModel, DynamicsTransitionOutput, DynamicsTransitionRequest
 from text.encoder_contracts import TextEncodingDiagnostics
 
@@ -24,6 +27,7 @@ class LearnedDynamicsTransitionModel(DynamicsTransitionModel):
     def __init__(self, *, strict_mode: bool = False) -> None:
         self.predictor = GraphDeltaPredictor(strict_mode=strict_mode)
         self.temporal_transition_encoder = TemporalTransitionEncoder()
+        self.human_state_transition_model = HumanStateTransitionModel()
 
     @staticmethod
     def _transition_feature_vector(graph_state: SceneGraph, delta: GraphDelta, step_index: int) -> list[float]:
@@ -54,33 +58,105 @@ class LearnedDynamicsTransitionModel(DynamicsTransitionModel):
         return base[:128]
 
     @staticmethod
-    def _apply_learned_contract_to_delta(delta: GraphDelta, contract: LearnedTemporalTransitionContract) -> None:
+    def _apply_learned_contract_to_delta(
+            delta: GraphDelta,
+            contract: LearnedTemporalTransitionContract,
+            human_contract: LearnedHumanStateContract | None = None,
+    ) -> None:
         weak_phase = str(delta.transition_phase or "")
-        weak_target_profile = dict(delta.transition_diagnostics.get("target_profile", {})) if isinstance(delta.transition_diagnostics, dict) else {}
-        delta.transition_phase = contract.predicted_phase
+        weak_target_profile = dict(delta.transition_diagnostics.get("target_profile", {})) if isinstance(
+            delta.transition_diagnostics, dict) else {}
+
+        human_primary = human_contract is not None and human_contract.is_learned_primary
+
+        active_phase = human_contract.predicted_phase if human_primary else contract.predicted_phase
+        active_family = human_contract.predicted_family if human_primary else contract.predicted_family
+        active_profile = human_contract.target_profile if human_primary else contract.target_profile
+
+        if human_primary and human_contract.visibility_state_scores:
+            mean_visibility = float(np.mean(list(human_contract.visibility_state_scores.values())))
+            reveal_score = float(human_contract.visibility_state_scores.get("torso", mean_visibility))
+            occlusion_score = float(1.0 - mean_visibility)
+        else:
+            reveal_score = float(contract.reveal_score)
+            occlusion_score = float(contract.occlusion_score)
+
+        delta.transition_phase = active_phase
+
         if not isinstance(delta.transition_diagnostics, dict):
             delta.transition_diagnostics = {}
+
         delta.transition_diagnostics["weak_manifest_fallback"] = {
             "phase": weak_phase,
             "target_profile": weak_target_profile,
         }
-        delta.transition_diagnostics["target_profile"] = contract.to_metadata()["target_profile"]
+        delta.transition_diagnostics["target_profile"] = {
+            "primary_regions": list(active_profile.primary_regions),
+            "secondary_regions": list(active_profile.secondary_regions),
+            "context_regions": list(active_profile.context_regions),
+            "entity": active_profile.entity,
+            "entity_id": active_profile.entity_id,
+            "object_role": active_profile.object_role,
+            "support_target": active_profile.support_target,
+        }
         delta.transition_diagnostics["learned_temporal_primary"] = True
-        delta.transition_diagnostics["teacher_source"] = contract.teacher_source
-        if contract.reveal_score >= max(contract.occlusion_score, 0.55):
-            for region in contract.target_profile.primary_regions:
+        delta.transition_diagnostics["learned_human_state_primary"] = human_primary
+        delta.transition_diagnostics[
+            "teacher_source"] = human_contract.teacher_source if human_primary else contract.teacher_source
+
+        active_primary_regions = list(active_profile.primary_regions)
+
+        if reveal_score >= max(occlusion_score, 0.55):
+            for region in active_primary_regions:
                 delta.region_transition_mode.setdefault(region, "garment_reveal")
-        elif contract.occlusion_score > 0.55:
-            for region in contract.target_profile.primary_regions:
+        elif occlusion_score > 0.55:
+            for region in active_primary_regions:
                 delta.region_transition_mode.setdefault(region, "visibility_occlusion")
         else:
-            for region in contract.target_profile.primary_regions:
+            for region in active_primary_regions:
                 delta.region_transition_mode.setdefault(region, "pose_exposure")
-        delta.semantic_reasons = [contract.predicted_family] + [x for x in delta.semantic_reasons if x != contract.predicted_family]
-        contract_regions = contract.target_profile.primary_regions + contract.target_profile.secondary_regions + contract.target_profile.context_regions
+
+        delta.semantic_reasons = [active_family] + [x for x in delta.semantic_reasons if x != active_family]
+
+        contract_regions = (
+                list(active_profile.primary_regions)
+                + list(active_profile.secondary_regions)
+                + list(active_profile.context_regions)
+        )
         for region in contract_regions:
             if region not in delta.affected_regions:
                 delta.affected_regions.append(region)
+
+    def _build_human_state_runtime_features(
+        self,
+        *,
+        temporal_features: list[float],
+        temporal_contract: LearnedTemporalTransitionContract,
+    ) -> np.ndarray:
+        """Deterministic compact runtime builder for human-state model input."""
+        base = list(temporal_features[:128])
+        embed = list(temporal_contract.transition_embedding[:24])
+        if len(embed) < 24:
+            embed.extend([0.0] * (24 - len(embed)))
+        reveal_triplet = [
+            float(temporal_contract.reveal_score),
+            float(temporal_contract.occlusion_score),
+            float(temporal_contract.support_contact_score),
+        ]
+        profile = temporal_contract.target_profile
+        region_vocab = ["face", "torso", "left_arm", "right_arm", "legs"]
+        region_flags = [
+            1.0 if region in set(profile.primary_regions + profile.secondary_regions + profile.context_regions) else 0.0
+            for region in region_vocab
+        ]
+        phase_flags = [
+            1.0 if temporal_contract.predicted_phase == p else 0.0
+            for p in ("prepare", "transition", "contact_or_reveal", "stabilize")
+        ]
+        vec = np.asarray(base + embed + reveal_triplet + region_flags + phase_flags, dtype=np.float64)
+        if vec.shape[0] < self.human_state_transition_model.input_dim:
+            vec = np.concatenate([vec, np.zeros((self.human_state_transition_model.input_dim - vec.shape[0],), dtype=np.float64)])
+        return vec[: self.human_state_transition_model.input_dim]
 
     def predict_transition(self, request: DynamicsTransitionRequest) -> DynamicsTransitionOutput:
         labels = request.text_action_summary.structured_action_tokens or ["micro_adjust"]
@@ -108,7 +184,14 @@ class LearnedDynamicsTransitionModel(DynamicsTransitionModel):
         temporal_prediction = self.temporal_transition_encoder.forward(temporal_features)
         typed_contract = self.temporal_transition_encoder.to_typed_contract(temporal_prediction)
         temporal_contract = self.temporal_transition_encoder.to_contract(temporal_prediction)
-        self._apply_learned_contract_to_delta(delta, typed_contract)
+        human_input = self._build_human_state_runtime_features(
+            temporal_features=temporal_features,
+            temporal_contract=typed_contract,
+        )
+        human_pred = self.human_state_transition_model.forward(human_input)
+        human_contract_typed = self.human_state_transition_model.to_typed_contract(human_pred)
+        human_contract = human_contract_typed.to_metadata()
+        self._apply_learned_contract_to_delta(delta, typed_contract, human_contract_typed)
         alignment = compute_temporal_contract_alignment(typed_contract, delta)
         return DynamicsTransitionOutput(
             delta=delta,
@@ -122,6 +205,7 @@ class LearnedDynamicsTransitionModel(DynamicsTransitionModel):
                 "backend": "learned_graph_delta_predictor",
                 "runtime_path": delta.transition_diagnostics.get("runtime_path", "learned_primary"),
                 "temporal_transition_contract": temporal_contract,
+                "human_state_contract": human_contract,
                 "temporal_contract_alignment": alignment,
                 "learned_ready_usage": {
                     "memory_channels_used": used_channels,

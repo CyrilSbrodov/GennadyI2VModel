@@ -16,6 +16,7 @@ class TrainingConfig:
             "dynamics",
             "dynamics_transition",
             "temporal_transition",
+            "human_state_transition",
             "renderer",
             "patch_synthesis",
             "temporal_refinement",
