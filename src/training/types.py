@@ -33,6 +33,8 @@ class TrainingConfig:
     learned_dataset_path: str = ""
     learned_backend_config: BackendConfig | None = None
     contract_conditioning_mode: str = "auto"
+    renderer_backend: str = "legacy_local_renderer"
+    renderer_temporal_mode: str = "auto"
 
 
 @dataclass(slots=True)

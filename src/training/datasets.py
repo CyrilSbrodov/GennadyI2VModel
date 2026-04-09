@@ -582,6 +582,8 @@ class RendererDataset(BaseStageDataset):
             "region_coverage": {},
             "phase_coverage": {},
             "fallback_free_ratio": 0.0,
+            "temporal_window_records": 0,
+            "temporal_window_usage_ratio": 0.0,
         }
         fallback_free = 0
         for idx, rec in enumerate(records):
@@ -625,6 +627,24 @@ class RendererDataset(BaseStageDataset):
                     preservation = cls._as_hw1_tensor(preservation, "preservation_mask")
                     region_type = str(roi_rec.get("region_type", "torso"))
                     tp = roi_rec.get("target_profile", rec.get("target_profile", {}))
+                    prev_roi_raw = roi_rec.get("roi_prev", rec.get("roi_prev", roi_before))
+                    prev_roi = cls._as_hw3_tensor(prev_roi_raw, "roi_prev")
+                    temporal_target = {
+                        "predicted_family": family,
+                        "predicted_phase": phase,
+                        "target_profile": tp if isinstance(tp, dict) else {},
+                        "reveal_score": float(np.clip(rec.get("reveal_score", float(np.mean(changed))), 0.0, 1.0)),
+                        "occlusion_score": float(np.clip(rec.get("occlusion_score", float(np.mean(changed)) * 0.5), 0.0, 1.0)),
+                        "support_contact_score": float(
+                            np.clip(
+                                (rec.get("graph_delta_target", {}) or {}).get("interaction_deltas", {}).get("support_contact", 0.0)
+                                if isinstance((rec.get("graph_delta_target", {}) or {}).get("interaction_deltas", {}), dict)
+                                else 0.0,
+                                0.0,
+                                1.0,
+                            )
+                        ),
+                    }
                     renderer_contract = {
                         "semantic_embed": rec.get("semantic_embed", cls._semantic_embed_from_family(family)),
                         "delta_cond": rec.get("delta_cond", [0.0] * 9),
@@ -641,6 +661,11 @@ class RendererDataset(BaseStageDataset):
                         "transition_family": family,
                         "target_profile": tp,
                         "heuristic_priors": roi_rec.get("priors", rec.get("heuristic_priors", {})),
+                        "predicted_family": temporal_target["predicted_family"],
+                        "predicted_phase": temporal_target["predicted_phase"],
+                        "reveal_score": temporal_target["reveal_score"],
+                        "occlusion_score": temporal_target["occlusion_score"],
+                        "support_contact_score": temporal_target["support_contact_score"],
                     }
                     temporal_features = _build_temporal_transition_features(
                         graph_before=_deserialize_graph(rec.get("scene_graph_before", {})),
@@ -660,6 +685,14 @@ class RendererDataset(BaseStageDataset):
                         {
                             "frames": [roi_before, roi_after],
                             "roi_pairs": [(roi_before, roi_after)],
+                            "temporal_roi_window": {
+                                "roi_t_minus_1": prev_roi,
+                                "roi_t": roi_before,
+                                "roi_t_plus_1_target": roi_after,
+                                "region_type": region_type,
+                                "phase": phase,
+                                "target_profile": tp if isinstance(tp, dict) else {},
+                            },
                             "source": "manifest_video_renderer_primary",
                             "region_family": family,
                             "renderer_batch_contract": renderer_contract,
@@ -669,9 +702,9 @@ class RendererDataset(BaseStageDataset):
                                 "family": family,
                                 "phase": phase,
                                 "target_profile": tp if isinstance(tp, dict) else {},
-                                "reveal_score": float(np.clip(rec.get("reveal_score", float(np.mean(changed))), 0.0, 1.0)),
-                                "occlusion_score": float(np.clip(rec.get("occlusion_score", float(np.mean(changed)) * 0.5), 0.0, 1.0)),
-                                "support_contact_score": float(np.clip((rec.get("graph_delta_target", {}) or {}).get("interaction_deltas", {}).get("support_contact", 0.0) if isinstance((rec.get("graph_delta_target", {}) or {}).get("interaction_deltas", {}), dict) else 0.0, 0.0, 1.0)),
+                                "reveal_score": temporal_target["reveal_score"],
+                                "occlusion_score": temporal_target["occlusion_score"],
+                                "support_contact_score": temporal_target["support_contact_score"],
                             },
                             "graph_transition_contract": {
                                 "planner_context": rec.get("planner_context", {}) if isinstance(rec.get("planner_context"), dict) else {},
@@ -685,6 +718,7 @@ class RendererDataset(BaseStageDataset):
                     diagnostics["family_counts"][family] = int(diagnostics["family_counts"].get(family, 0)) + 1
                     diagnostics["region_coverage"][region_type] = int(diagnostics["region_coverage"].get(region_type, 0)) + 1
                     diagnostics["phase_coverage"][phase] = int(diagnostics["phase_coverage"].get(phase, 0)) + 1
+                    diagnostics["temporal_window_records"] = int(diagnostics["temporal_window_records"]) + 1
                 flags = rec.get("fallback_flags", {}) if isinstance(rec.get("fallback_flags"), dict) else {}
                 if not bool(flags.get("heuristic_priors_used", False)):
                     fallback_free += 1
@@ -696,6 +730,7 @@ class RendererDataset(BaseStageDataset):
                 if strict:
                     raise ValueError(f"video transition renderer record {idx} invalid: {exc}") from exc
         diagnostics["fallback_free_ratio"] = round(float(fallback_free / max(1, len(samples))), 6)
+        diagnostics["temporal_window_usage_ratio"] = round(float(diagnostics["temporal_window_records"]) / max(1, len(samples)), 6)
         ds = cls(samples=samples)
         ds.diagnostics = diagnostics
         return ds

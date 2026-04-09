@@ -8,7 +8,7 @@ import numpy as np
 
 from dynamics.temporal_transition_encoder import PHASES, TemporalTransitionEncoder
 from dynamics.model import DynamicsModel
-from rendering.trainable_patch_renderer import PatchBatch, TrainableLocalPatchModel
+from rendering.trainable_patch_renderer import PatchBatch, TemporalLocalPatchModel, TrainableLocalPatchModel
 from training.rollout_eval import evaluate_rollout_modes_on_video_manifest
 from training.datasets import RendererDataset
 from training.types import StageResult, TrainingConfig
@@ -73,7 +73,7 @@ class RendererBatchAdapter:
             return [0.0, 1.0, 0.0, 0.25, 0.8, 0.35]
         return [0.0, 0.0, 1.0, 0.3, 0.45, 0.8]
 
-    def adapt(self, sample: dict[str, object]) -> PatchBatch:
+    def adapt(self, sample: dict[str, object], *, temporal_mode: bool = False) -> PatchBatch:
         roi_pairs = sample.get("roi_pairs") or []
         before, after = roi_pairs[0] if roi_pairs else (sample["frames"][0], sample["frames"][1])
         b = self._np3(before)
@@ -128,6 +128,10 @@ class RendererBatchAdapter:
             blend_hint = np.mean(blend_hint, axis=2, keepdims=True)
         if alpha_target.shape[-1] == 3:
             alpha_target = np.mean(alpha_target, axis=2, keepdims=True)
+        temporal_window = sample.get("temporal_roi_window", {}) if isinstance(sample.get("temporal_roi_window", {}), dict) else {}
+        prev_roi = temporal_window.get("roi_t_minus_1", b)
+        prev_np = self._np3(prev_roi)
+        rollout_weight = float(np.clip(1.0 + selected.reveal_score * 0.4 + selected.occlusion_score * 0.3, 0.5, 2.0))
         return PatchBatch(
             roi_before=b,
             roi_after=a,
@@ -147,6 +151,16 @@ class RendererBatchAdapter:
                 "predicted_phase": selected.predicted_phase,
                 "target_profile": selected.target_profile,
             },
+            previous_roi=prev_np if temporal_mode else None,
+            predicted_family=selected.predicted_family,
+            predicted_phase=selected.predicted_phase,
+            target_profile=selected.target_profile,
+            reveal_score=selected.reveal_score,
+            occlusion_score=selected.occlusion_score,
+            support_contact_score=selected.support_contact_score,
+            temporal_contract_target=sample.get("temporal_transition_target", {}) if isinstance(sample.get("temporal_transition_target", {}), dict) else {},
+            graph_delta_target=sample.get("delta_contract", {}) if isinstance(sample.get("delta_contract", {}), dict) else {},
+            rollout_weight=rollout_weight,
         )
 
 
@@ -154,12 +168,13 @@ class RendererTrainer:
     stage_name = "renderer"
 
     def __init__(self) -> None:
-        self.model = TrainableLocalPatchModel()
+        self.model: TrainableLocalPatchModel | TemporalLocalPatchModel = TrainableLocalPatchModel()
         self.dataset_source = "synthetic_bootstrap"
         self.dataset_diagnostics: dict[str, object] = {}
         self.contract_conditioning_mode = "weak_contract_only"
         self.temporal_encoder = TemporalTransitionEncoder()
         self.adapter = RendererBatchAdapter(encoder=None)
+        self.temporal_renderer_mode = "legacy_local_renderer"
 
     @staticmethod
     def _resolve_conditioning_mode(config: TrainingConfig, has_manifest: bool) -> str:
@@ -197,10 +212,10 @@ class RendererTrainer:
         has_temporal = bool(dataset.samples and isinstance(dataset.samples[0].get("temporal_transition_features"), list))
         self.adapter = RendererBatchAdapter(encoder=self.temporal_encoder if has_temporal else None, conditioning_mode=self.contract_conditioning_mode)
         for sample in dataset.samples:
-            yield self.adapter.adapt(sample)
+            yield self.adapter.adapt(sample, temporal_mode=self.temporal_renderer_mode == "temporal_local_renderer")
 
     @staticmethod
-    def evaluate_model(model: TrainableLocalPatchModel, batches: list[PatchBatch], diagnostics: dict[str, object] | None = None) -> dict[str, float]:
+    def evaluate_model(model: TrainableLocalPatchModel | TemporalLocalPatchModel, batches: list[PatchBatch], diagnostics: dict[str, object] | None = None) -> dict[str, float]:
         if not batches:
             return {"reconstruction_mae": 1.0, "alpha_mae": 1.0, "uncertainty_calibration_mae": 1.0, "contract_validity": 0.0, "fallback_free_happy_path_ratio": 0.0, "face_family_score": 0.0, "torso_family_score": 0.0, "sleeve_family_score": 0.0, "usable_sample_count": 0.0, "invalid_records": float((diagnostics or {}).get("invalid_records", 0)), "skipped_records": float((diagnostics or {}).get("skipped_records", 0)), "learned_contract_usage_ratio": 0.0, "weak_contract_usage_ratio": 1.0, "temporal_to_renderer_mode_consistency": 0.0, "temporal_to_renderer_target_profile_consistency": 0.0, "score": 0.0}
         eval_entries = [model.eval_step(b) for b in batches]
@@ -228,6 +243,13 @@ class RendererTrainer:
             profile = summary.get("target_profile", {}) if isinstance(summary.get("target_profile", {}), dict) else {}
             has_profile = bool(profile.get("primary_regions") or profile.get("secondary_regions") or profile.get("context_regions"))
             profile_consistency += 1.0 if has_profile else 0.0
+        temporal_eval = {
+            "temporal_window_usage_ratio": float(sum(1.0 for b in batches if isinstance(b.previous_roi, np.ndarray)) / len(batches)),
+            "reveal_loss": float(sum(float(e.get("reveal_region_focus_loss", 0.0)) for e in eval_entries) / len(eval_entries)),
+            "occlusion_boundary_loss": float(sum(float(e.get("occlusion_boundary_loss", 0.0)) for e in eval_entries) / len(eval_entries)),
+            "temporal_consistency_loss": float(sum(float(e.get("temporal_consistency_loss", 0.0)) for e in eval_entries) / len(eval_entries)),
+            "rollout_proxy_before_after": float(max(0.0, 1.0 - recon_mae)),
+        }
 
         def fam_score(vals: list[float]) -> float:
             if not vals:
@@ -251,6 +273,7 @@ class RendererTrainer:
             "temporal_to_renderer_mode_consistency": float(mode_consistency / len(batches)),
             "temporal_to_renderer_target_profile_consistency": float(profile_consistency / len(batches)),
             "score": score,
+            **temporal_eval,
         }
         family_counts = (diagnostics or {}).get("family_counts", {})
         for key in ("face_expression", "torso_reveal", "sleeve_arm_transition"):
@@ -259,6 +282,14 @@ class RendererTrainer:
 
     def train(self, config: TrainingConfig) -> StageResult:
         train_dataset, val_dataset = self.build_datasets(config)
+        self.temporal_renderer_mode = (
+            str(getattr(config, "renderer_backend", "legacy_local_renderer"))
+            if str(getattr(config, "renderer_backend", "legacy_local_renderer")) in {"legacy_local_renderer", "temporal_local_renderer"}
+            else "legacy_local_renderer"
+        )
+        if self.temporal_renderer_mode == "temporal_local_renderer" and self.dataset_source.startswith("manifest_video_renderer_primary"):
+            self.dataset_source = "manifest_video_temporal_renderer_primary"
+        self.model = TemporalLocalPatchModel() if self.temporal_renderer_mode == "temporal_local_renderer" else TrainableLocalPatchModel()
         self.contract_conditioning_mode = self._resolve_conditioning_mode(config, has_manifest=bool(config.learned_dataset_path and len(train_dataset) > 0 and self.dataset_source.startswith("manifest")))
         stage_dir = Path(config.checkpoint_dir) / self.stage_name
         stage_dir.mkdir(parents=True, exist_ok=True)
@@ -296,6 +327,7 @@ class RendererTrainer:
                     temporal_model=self.temporal_encoder,
                     dynamics_model=DynamicsModel(),
                     renderer_model=self.model,
+                    renderer_backend=self.temporal_renderer_mode,
                     rollout_steps=2,
                     max_records=max(1, config.val_size),
                 )
@@ -339,6 +371,8 @@ class RendererTrainer:
                         "learned_contract_usage_ratio": last_val.get("learned_contract_usage_ratio", 0.0),
                         "weak_contract_usage_ratio": last_val.get("weak_contract_usage_ratio", 0.0),
                     },
+                    "renderer_backend": self.temporal_renderer_mode,
+                    "temporal_renderer_path_enabled": bool(self.temporal_renderer_mode == "temporal_local_renderer"),
                 },
                 indent=2,
             ),
