@@ -174,6 +174,43 @@ class SceneGraph:
 
 
 @dataclass(slots=True)
+class TransitionTargetProfile:
+    primary_regions: list[str] = field(default_factory=list)
+    secondary_regions: list[str] = field(default_factory=list)
+    context_regions: list[str] = field(default_factory=list)
+    entity: str = "self"
+    entity_id: str | None = None
+    object_role: str | None = None
+    support_target: str | None = None
+
+
+@dataclass(slots=True)
+class TransitionPhaseContract:
+    global_phase: str = "transition"
+    global_phase_sequence: list[str] = field(default_factory=lambda: ["prepare", "transition", "contact_or_reveal", "stabilize"])
+    pose_subphase: str = "steady"
+    pose_subphase_sequence: list[str] = field(default_factory=list)
+    garment_subphase: str = "stable"
+    garment_subphase_sequence: list[str] = field(default_factory=list)
+    interaction_subphase: str = "free"
+    interaction_subphase_sequence: list[str] = field(default_factory=list)
+    expression_subphase: str = "neutral"
+    expression_subphase_sequence: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class RuntimeSemanticTransition:
+    family: str = "pose_transition"
+    goal: str = "pose_hold"
+    confidence: float = 0.0
+    lexical_bootstrap_score: float = 0.0
+    lexical_trace: list[str] = field(default_factory=list)
+    target_profile: TransitionTargetProfile = field(default_factory=TransitionTargetProfile)
+    phase: TransitionPhaseContract = field(default_factory=TransitionPhaseContract)
+    modifiers: dict[str, str | float | bool] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class ActionStep:
     type: str
     priority: int
@@ -186,6 +223,7 @@ class ActionStep:
     can_run_parallel: bool = False
     constraints: list[str] = field(default_factory=list)
     modifiers: dict[str, Any] = field(default_factory=dict)
+    semantic_transition: RuntimeSemanticTransition | None = None
 
 
 @dataclass(slots=True)

@@ -50,7 +50,7 @@ def test_factory_default_backend_is_learned_graph_delta() -> None:
 
 def test_feature_contract_is_structured_and_conditioned_on_memory() -> None:
     memory = VideoMemory(last_transition_context={"visibility_phase": "mixed"})
-    inputs = featurize_runtime(_scene(), PlannedState(step_index=2, labels=["sit_down", "intensity=0.8"]), {"step_index": 2.0, "total_steps": 4.0, "phase": "mid"}, memory)
+    inputs = featurize_runtime(_scene(), PlannedState(step_index=2, labels=["sit_down", "intensity=0.8"]), {"step_index": 2.0, "total_steps": 4.0, "phase": "transition"}, memory)
     assert len(inputs.graph_features) == 27
     assert len(inputs.planner_features) == 8
     assert len(inputs.action_features) == 16
@@ -60,7 +60,7 @@ def test_feature_contract_is_structured_and_conditioned_on_memory() -> None:
 
 def test_model_save_load_and_loss_paths_are_separate(tmp_path: Path) -> None:
     model = DynamicsModel()
-    inputs = featurize_runtime(_scene(), PlannedState(step_index=1, labels=["smile"]), {"step_index": 1.0, "phase": "early"}, None)
+    inputs = featurize_runtime(_scene(), PlannedState(step_index=1, labels=["smile"]), {"step_index": 1.0, "phase": "prepare"}, None)
     pred = model.forward(inputs)
     targets = targets_from_delta(GraphDeltaPredictor()._predict_legacy(_scene(), PlannedState(step_index=1, labels=["smile"]))[0])
     losses_before = model.compute_losses(pred, targets)
@@ -100,7 +100,7 @@ def test_manifest_backed_dynamics_dataset_and_diagnostics(tmp_path: Path) -> Non
                         "record_id": "r1",
                         "scene_graph": {"frame_index": 3, "persons": [{"person_id": "p1", "track_id": "t1", "bbox": {"x": 0.2, "y": 0.1, "w": 0.5, "h": 0.8}}]},
                         "actions": [{"type": "sit_down", "priority": 1, "target_entity": "p1"}],
-                        "planner_context": {"step_index": 2, "total_steps": 4, "phase": "mid", "target_duration": 1.4},
+                        "planner_context": {"step_index": 2, "total_steps": 4, "phase": "transition", "target_duration": 1.4},
                         "target_transition_context": {"target_pose": "sitting"},
                         "memory_context": {"hidden_region_evidence": 0.7},
                         "graph_delta_target": {
@@ -128,7 +128,7 @@ def test_manifest_backed_dynamics_dataset_and_diagnostics(tmp_path: Path) -> Non
     assert ds.diagnostics["family_counts"]["pose"] == 1
     sample = ds[0]
     batch = DynamicsDatasetAdapter.sample_to_batch(sample, step_index=2)
-    assert batch.planner_context["phase"] == "mid"
+    assert batch.planner_context["phase"] == "transition"
     assert batch.target_transition_context["target_pose"] == "sitting"
     assert batch.memory_context["hidden_region_evidence"] == 0.7
     assert batch.delta_groups["interaction"] == 1.0
@@ -143,7 +143,7 @@ def test_trainer_and_eval_use_manifest_as_primary_when_provided(tmp_path: Path) 
                 "record_id": f"r{idx}",
                 "scene_graph": {"frame_index": idx, "persons": [{"person_id": "p1", "track_id": "t1", "bbox": {"x": 0.2, "y": 0.1, "w": 0.5, "h": 0.8}}]},
                 "labels": [action],
-                "planner_context": {"step_index": idx + 1, "total_steps": 5, "phase": "mid"},
+                "planner_context": {"step_index": idx + 1, "total_steps": 5, "phase": "transition"},
                 "graph_delta_target": {
                     "pose_deltas": {"torso_pitch": -0.1 * (idx + 1)},
                     "expression_deltas": {"smile_intensity": 0.2 if action == "smile" else 0.0},
