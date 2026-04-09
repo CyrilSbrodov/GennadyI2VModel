@@ -54,7 +54,10 @@ class HumanStateTransitionTrainer:
         if config.learned_dataset_path:
             payload = json.loads(Path(config.learned_dataset_path).read_text(encoding="utf-8"))
             if payload.get("manifest_type") == "video_transition_manifest":
-                manifest_ds = HumanStateTransitionDataset.from_video_transition_manifest(config.learned_dataset_path, strict=False)
+                manifest_ds = HumanStateTransitionDataset.from_video_transition_manifest(
+                    config.learned_dataset_path,
+                    strict=False,
+                )
                 self.dataset_diagnostics = getattr(manifest_ds, "diagnostics", {})
                 if len(manifest_ds) > 1:
                     split = max(1, int(0.8 * len(manifest_ds)))
@@ -67,8 +70,65 @@ class HumanStateTransitionTrainer:
                 if len(manifest_ds) == 1:
                     self.dataset_source = "manifest_video_human_state_transition_primary_single_sample_reused_for_val"
                     return manifest_ds, manifest_ds
+
         self.dataset_diagnostics = {}
-        return HumanStateTransitionDataset(samples=[]), HumanStateTransitionDataset(samples=[])
+        self.dataset_source = "synthetic_human_state_transition_bootstrap"
+
+        total = max(2, int(config.train_size) + int(config.val_size))
+        synthetic_samples: list[TrainingSample] = []
+        families = ["pose_transition", "garment_transition", "expression_transition", "interaction_transition",
+                    "visibility_transition"]
+        phases = ["prepare", "transition", "contact_or_reveal", "stabilize"]
+
+        for i in range(total):
+            family = families[i % len(families)]
+            phase = phases[i % len(phases)]
+
+            sample: TrainingSample = {
+                "source": "synthetic_human_state_transition_bootstrap",
+                "human_state_transition_features": [0.01 * float(i + j + 1) for j in range(160)],
+                "human_state_transition_target": {
+                    "family": family,
+                    "phase": phase,
+                    "target_profile": {
+                        "primary_regions": ["torso"],
+                        "secondary_regions": ["face"],
+                        "context_regions": ["legs"],
+                    },
+                    "region_state_targets": [0.25] * 8,
+                    "visibility_targets": [0.75] * 8,
+                    "reveal_memory_target": 0.35,
+                    "support_contact_target": 0.1,
+                },
+                "human_state_history": {
+                    "has_history": i > 0,
+                    "previous_state_hint": [0.0] * 24,
+                },
+            }
+            synthetic_samples.append(sample)
+
+        train_count = max(1, int(config.train_size))
+        val_count = max(1, int(config.val_size))
+
+        train_ds = HumanStateTransitionDataset(samples=synthetic_samples[:train_count])
+        val_ds = HumanStateTransitionDataset(samples=synthetic_samples[train_count: train_count + val_count])
+
+        train_ds.diagnostics = {
+            "source": self.dataset_source,
+            "split": "train",
+            "usable": len(train_ds.samples),
+            "invalid": 0,
+            "skipped": 0,
+        }
+        val_ds.diagnostics = {
+            "source": self.dataset_source,
+            "split": "val",
+            "usable": len(val_ds.samples),
+            "invalid": 0,
+            "skipped": 0,
+        }
+
+        return train_ds, val_ds
 
     def _iter_batches(self, dataset: HumanStateTransitionDataset) -> list[HumanStateTransitionBatch]:
         return [HumanStateTransitionDatasetAdapter.sample_to_batch(sample) for sample in dataset.samples]

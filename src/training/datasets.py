@@ -49,6 +49,22 @@ class TrainingSample(TypedDict, total=False):
     patch_synthesis_contract: dict[str, object]
     temporal_consistency_contract: dict[str, object]
 
+    temporal_transition_features: list[float]
+    temporal_transition_target: dict[str, object]
+
+    human_state_transition_features: list[float]
+    human_state_transition_target: dict[str, object]
+    human_state_history: dict[str, object]
+
+    renderer_batch_contract: dict[str, object]
+    temporal_roi_window: dict[str, object]
+    region_family: str
+
+    target_profile: dict[str, object]
+    phase_family: dict[str, object]
+    reveal_occlusion_support_cues: dict[str, float]
+    visibility_targets: list[float]
+
 
 @dataclass(slots=True)
 class BaseStageDataset:

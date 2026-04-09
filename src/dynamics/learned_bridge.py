@@ -58,38 +58,71 @@ class LearnedDynamicsTransitionModel(DynamicsTransitionModel):
         return base[:128]
 
     @staticmethod
-    def _apply_learned_contract_to_delta(delta: GraphDelta, contract: LearnedTemporalTransitionContract, human_contract: LearnedHumanStateContract | None = None) -> None:
+    def _apply_learned_contract_to_delta(
+            delta: GraphDelta,
+            contract: LearnedTemporalTransitionContract,
+            human_contract: LearnedHumanStateContract | None = None,
+    ) -> None:
         weak_phase = str(delta.transition_phase or "")
-        weak_target_profile = dict(delta.transition_diagnostics.get("target_profile", {})) if isinstance(delta.transition_diagnostics, dict) else {}
-        delta.transition_phase = contract.predicted_phase
+        weak_target_profile = dict(delta.transition_diagnostics.get("target_profile", {})) if isinstance(
+            delta.transition_diagnostics, dict) else {}
+
+        human_primary = human_contract is not None and human_contract.is_learned_primary
+
+        active_phase = human_contract.predicted_phase if human_primary else contract.predicted_phase
+        active_family = human_contract.predicted_family if human_primary else contract.predicted_family
+        active_profile = human_contract.target_profile if human_primary else contract.target_profile
+
+        if human_primary and human_contract.visibility_state_scores:
+            mean_visibility = float(np.mean(list(human_contract.visibility_state_scores.values())))
+            reveal_score = float(human_contract.visibility_state_scores.get("torso", mean_visibility))
+            occlusion_score = float(1.0 - mean_visibility)
+        else:
+            reveal_score = float(contract.reveal_score)
+            occlusion_score = float(contract.occlusion_score)
+
+        delta.transition_phase = active_phase
+
         if not isinstance(delta.transition_diagnostics, dict):
             delta.transition_diagnostics = {}
+
         delta.transition_diagnostics["weak_manifest_fallback"] = {
             "phase": weak_phase,
             "target_profile": weak_target_profile,
         }
-        selected_profile = human_contract.to_metadata()["target_profile"] if human_contract is not None and human_contract.is_learned_primary else contract.to_metadata()["target_profile"]
-        delta.transition_diagnostics["target_profile"] = selected_profile
+        delta.transition_diagnostics["target_profile"] = {
+            "primary_regions": list(active_profile.primary_regions),
+            "secondary_regions": list(active_profile.secondary_regions),
+            "context_regions": list(active_profile.context_regions),
+            "entity": active_profile.entity,
+            "entity_id": active_profile.entity_id,
+            "object_role": active_profile.object_role,
+            "support_target": active_profile.support_target,
+        }
         delta.transition_diagnostics["learned_temporal_primary"] = True
-        delta.transition_diagnostics["learned_human_state_primary"] = human_contract is not None and human_contract.is_learned_primary
-        delta.transition_diagnostics["teacher_source"] = contract.teacher_source
-        reveal_score = float(human_contract.visibility_state_scores.get("torso", contract.reveal_score)) if human_contract is not None else contract.reveal_score
-        occlusion_score = float(np.mean(list(human_contract.visibility_state_scores.values()))) if human_contract is not None and human_contract.visibility_state_scores else contract.occlusion_score
+        delta.transition_diagnostics["learned_human_state_primary"] = human_primary
+        delta.transition_diagnostics[
+            "teacher_source"] = human_contract.teacher_source if human_primary else contract.teacher_source
+
+        active_primary_regions = list(active_profile.primary_regions)
+
         if reveal_score >= max(occlusion_score, 0.55):
-            for region in contract.target_profile.primary_regions:
+            for region in active_primary_regions:
                 delta.region_transition_mode.setdefault(region, "garment_reveal")
         elif occlusion_score > 0.55:
-            for region in contract.target_profile.primary_regions:
+            for region in active_primary_regions:
                 delta.region_transition_mode.setdefault(region, "visibility_occlusion")
         else:
-            for region in contract.target_profile.primary_regions:
+            for region in active_primary_regions:
                 delta.region_transition_mode.setdefault(region, "pose_exposure")
-        primary_family = human_contract.predicted_family if human_contract is not None and human_contract.is_learned_primary else contract.predicted_family
-        delta.semantic_reasons = [primary_family] + [x for x in delta.semantic_reasons if x != primary_family]
-        if human_contract is not None and human_contract.is_learned_primary:
-            contract_regions = human_contract.target_profile.primary_regions + human_contract.target_profile.secondary_regions + human_contract.target_profile.context_regions
-        else:
-            contract_regions = contract.target_profile.primary_regions + contract.target_profile.secondary_regions + contract.target_profile.context_regions
+
+        delta.semantic_reasons = [active_family] + [x for x in delta.semantic_reasons if x != active_family]
+
+        contract_regions = (
+                list(active_profile.primary_regions)
+                + list(active_profile.secondary_regions)
+                + list(active_profile.context_regions)
+        )
         for region in contract_regions:
             if region not in delta.affected_regions:
                 delta.affected_regions.append(region)
