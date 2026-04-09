@@ -4,11 +4,25 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import numpy as np
+
 from dynamics.model import DynamicsInputs, DynamicsModel, DynamicsTargets, decode_prediction, featurize_runtime, targets_from_delta
+from dynamics.temporal_transition_encoder import PHASES, REGION_KEYS, TemporalTransitionEncoder
 from planning.transition_engine import PlannedState
 from training.base_trainer import BaseTrainer
 from training.datasets import DynamicsDataset, TrainingSample
 from training.types import StageResult, TrainingConfig
+
+
+@dataclass(slots=True)
+class TemporalContractConditioning:
+    source: str
+    predicted_family: str
+    predicted_phase: str
+    target_profile: dict[str, list[str]]
+    reveal_score: float
+    occlusion_score: float
+    support_contact_score: float
 
 
 @dataclass(slots=True)
@@ -22,26 +36,89 @@ class DynamicsBatch:
     target_transition_context: dict[str, object]
     memory_context: dict[str, object]
     delta_groups: dict[str, float]
+    temporal_contract_conditioning: TemporalContractConditioning
 
 
 class DynamicsDatasetAdapter:
     """Builds project-like dynamics batches from dataset samples (synthetic bootstrap + manifest-backed)."""
 
     @staticmethod
-    def sample_to_batch(sample: TrainingSample, step_index: int = 1) -> DynamicsBatch:
+    def _weak_contract(sample: TrainingSample, step_index: int) -> TemporalContractConditioning:
+        contract = sample.get("graph_transition_contract", {}) if isinstance(sample.get("graph_transition_contract"), dict) else {}
+        planner = contract.get("planner_context", {}) if isinstance(contract.get("planner_context"), dict) else {}
+        metadata = contract.get("metadata", {}) if isinstance(contract.get("metadata"), dict) else {}
+        tp = metadata.get("target_profile", {}) if isinstance(metadata.get("target_profile"), dict) else {}
+        ttarget = sample.get("temporal_transition_target", {}) if isinstance(sample.get("temporal_transition_target"), dict) else {}
+        return TemporalContractConditioning(
+            source="weak_manifest_bootstrap",
+            predicted_family=str(metadata.get("transition_family", ttarget.get("family", "pose_transition"))),
+            predicted_phase=str(planner.get("phase", ttarget.get("phase", "transition"))),
+            target_profile={
+                "primary_regions": [str(x) for x in tp.get("primary_regions", [])],
+                "secondary_regions": [str(x) for x in tp.get("secondary_regions", [])],
+                "context_regions": [str(x) for x in tp.get("context_regions", [])],
+            },
+            reveal_score=float(ttarget.get("reveal_score", 0.0)),
+            occlusion_score=float(ttarget.get("occlusion_score", 0.0)),
+            support_contact_score=float(ttarget.get("support_contact_score", 0.0)),
+        )
+
+    @classmethod
+    def sample_to_batch(cls, sample: TrainingSample, *, encoder: TemporalTransitionEncoder | None, conditioning_mode: str, step_index: int = 1) -> DynamicsBatch:
         graph_before = sample["graphs"][0]
         actions = sample.get("actions", [])
         action_tokens = [a.type for a in actions] or ["micro_adjust"]
         contract = sample.get("graph_transition_contract", {}) if isinstance(sample.get("graph_transition_contract"), dict) else {}
         base_ctx = contract.get("planner_context", {}) if isinstance(contract.get("planner_context"), dict) else {}
-        target_state = PlannedState(step_index=step_index, labels=action_tokens)
+        weak = cls._weak_contract(sample, step_index=step_index)
+
+        learned: TemporalContractConditioning | None = None
+        features = sample.get("temporal_transition_features")
+        if encoder is not None and isinstance(features, list) and features:
+            pred = encoder.forward(np.asarray(features, dtype=np.float64))
+            typed = encoder.to_typed_contract(pred)
+            learned = TemporalContractConditioning(
+                source="learned_temporal_contract",
+                predicted_family=typed.predicted_family,
+                predicted_phase=typed.predicted_phase,
+                target_profile={
+                    "primary_regions": list(typed.target_profile.primary_regions),
+                    "secondary_regions": list(typed.target_profile.secondary_regions),
+                    "context_regions": list(typed.target_profile.context_regions),
+                },
+                reveal_score=float(typed.reveal_score),
+                occlusion_score=float(typed.occlusion_score),
+                support_contact_score=float(typed.support_contact_score),
+            )
+
+        selected = weak
+        if conditioning_mode == "learned_contract_only":
+            selected = learned or weak
+        elif conditioning_mode == "mixed_contract_bootstrap" and learned is not None:
+            selected = learned
+        elif conditioning_mode == "weak_contract_only":
+            selected = weak
+
+        target_state = PlannedState(step_index=step_index, labels=action_tokens + [f"temporal_family={selected.predicted_family}", f"temporal_phase={selected.predicted_phase}"])
         planner_context = {
             "step_index": float(base_ctx.get("step_index", step_index)),
             "total_steps": float(base_ctx.get("total_steps", max(2, len(sample.get("graphs", [])) + 1))),
-            "phase": str(base_ctx.get("phase", "mid" if step_index > 1 else "early")),
+            "phase": str(selected.predicted_phase),
             "target_duration": float(base_ctx.get("target_duration", 1.5)),
+            "temporal_reveal": float(selected.reveal_score),
+            "temporal_occlusion": float(selected.occlusion_score),
+            "temporal_support": float(selected.support_contact_score),
         }
         inputs = featurize_runtime(graph_before, target_state, planner_context, None)
+        # explicit structured conditioning lane projected into target features tail.
+        phase_onehot = [1.0 if selected.predicted_phase == p else 0.0 for p in PHASES]
+        region_scores = [
+            1.0 if k in set(selected.target_profile.get("primary_regions", []) + selected.target_profile.get("secondary_regions", []) + selected.target_profile.get("context_regions", [])) else 0.0
+            for k in REGION_KEYS
+        ]
+        tail = phase_onehot + region_scores + [selected.reveal_score, selected.occlusion_score, selected.support_contact_score]
+        inputs.target_features = (inputs.target_features + tail)[: len(inputs.target_features)]
+
         delta = sample.get("deltas", [])[0]
         targets = targets_from_delta(delta)
         return DynamicsBatch(
@@ -61,6 +138,7 @@ class DynamicsDatasetAdapter:
                 "interaction": 1.0 if delta.interaction_deltas else 0.0,
                 "region": 1.0 if delta.region_transition_mode else 0.0,
             },
+            temporal_contract_conditioning=selected,
         )
 
 
@@ -68,6 +146,17 @@ class DynamicsTrainer(BaseTrainer):
     stage_name = "dynamics"
     dataset_source: str = "synthetic_dynamics_bootstrap"
     dataset_diagnostics: dict[str, object] = {}
+
+    def __init__(self) -> None:
+        self.temporal_encoder = TemporalTransitionEncoder()
+        self.contract_conditioning_mode = "weak_contract_only"
+
+    @staticmethod
+    def _resolve_conditioning_mode(config: TrainingConfig, has_manifest: bool) -> str:
+        raw = str(getattr(config, "contract_conditioning_mode", "auto") or "auto")
+        if raw in {"weak_contract_only", "learned_contract_only", "mixed_contract_bootstrap"}:
+            return raw
+        return "mixed_contract_bootstrap" if has_manifest else "weak_contract_only"
 
     def build_datasets(self, config: TrainingConfig) -> tuple[DynamicsDataset, DynamicsDataset]:
         self.dataset_source = "synthetic_dynamics_bootstrap"
@@ -94,7 +183,9 @@ class DynamicsTrainer(BaseTrainer):
         return train, val
 
     def _iter_batches(self, dataset: DynamicsDataset) -> list[DynamicsBatch]:
-        return [DynamicsDatasetAdapter.sample_to_batch(sample, step_index=max(1, idx + 1)) for idx, sample in enumerate(dataset.samples)]
+        has_temporal = bool(dataset.samples and isinstance(dataset.samples[0].get("temporal_transition_features"), list))
+        encoder = self.temporal_encoder if has_temporal else None
+        return [DynamicsDatasetAdapter.sample_to_batch(sample, encoder=encoder, conditioning_mode=self.contract_conditioning_mode, step_index=max(1, idx + 1)) for idx, sample in enumerate(dataset.samples)]
 
     def _evaluate(self, model: DynamicsModel, batches: list[DynamicsBatch]) -> dict[str, float]:
         metrics = {
@@ -119,6 +210,10 @@ class DynamicsTrainer(BaseTrainer):
             "region_coverage_count": 0.0,
             "phase_coverage_count": 0.0,
             "fallback_free_ratio": 0.0,
+            "learned_contract_usage_ratio": 0.0,
+            "weak_contract_usage_ratio": 0.0,
+            "temporal_to_dynamics_phase_consistency": 0.0,
+            "temporal_to_dynamics_region_consistency": 0.0,
         }
         if not batches:
             metrics["score"] = 0.0
@@ -134,7 +229,6 @@ class DynamicsTrainer(BaseTrainer):
             contract_ok = bool(decoded.pose_deltas and decoded.region_transition_mode and decoded.affected_regions)
             metrics["contract_valid_ratio"] += 1.0 if contract_ok else 0.0
 
-            # planner conditioning probe
             probe_ctx = dict(step_index=3.0, total_steps=4.0, phase="late", target_duration=2.0)
             probe_inputs = featurize_runtime(batch.graph_before, PlannedState(step_index=3, labels=batch.action_tokens + ["intensity=0.9"]), probe_ctx, None)
             probe_pred = model.forward(probe_inputs)
@@ -142,6 +236,18 @@ class DynamicsTrainer(BaseTrainer):
             metrics["usable_sample_count"] += 1.0
             for group, present in batch.delta_groups.items():
                 metrics[f"{group}_group_coverage"] += present
+            csrc = batch.temporal_contract_conditioning.source
+            metrics["learned_contract_usage_ratio"] += 1.0 if csrc == "learned_temporal_contract" else 0.0
+            metrics["weak_contract_usage_ratio"] += 1.0 if csrc != "learned_temporal_contract" else 0.0
+            metrics["temporal_to_dynamics_phase_consistency"] += 1.0 if batch.temporal_contract_conditioning.predicted_phase == str(batch.planner_context.get("phase", "")) else 0.0
+            target_regions = set(
+                batch.temporal_contract_conditioning.target_profile.get("primary_regions", [])
+                + batch.temporal_contract_conditioning.target_profile.get("secondary_regions", [])
+                + batch.temporal_contract_conditioning.target_profile.get("context_regions", [])
+            )
+            delta_regions = set(decoded.affected_regions)
+            overlap = float(len(target_regions & delta_regions)) / max(1.0, float(len(target_regions | delta_regions)))
+            metrics["temporal_to_dynamics_region_consistency"] += overlap
 
         denom = float(len(batches))
         for key in list(metrics):
@@ -161,6 +267,7 @@ class DynamicsTrainer(BaseTrainer):
 
     def train(self, config: TrainingConfig) -> StageResult:
         train_dataset, val_dataset = self.build_datasets(config)
+        self.contract_conditioning_mode = self._resolve_conditioning_mode(config, has_manifest=bool(config.learned_dataset_path and len(train_dataset) > 0 and self.dataset_source.startswith("manifest")))
         train_batches = self._iter_batches(train_dataset)
         val_batches = self._iter_batches(val_dataset)
         model = DynamicsModel()
@@ -168,15 +275,21 @@ class DynamicsTrainer(BaseTrainer):
         train_metrics: dict[str, float] = {}
         for _ in range(config.epochs):
             accum = {"pose_loss": 0.0, "garment_loss": 0.0, "visibility_loss": 0.0, "expression_loss": 0.0, "interaction_loss": 0.0, "region_loss": 0.0, "total_loss": 0.0}
+            learned_usage = 0.0
             for batch in train_batches:
                 losses = model.train_step(batch.inputs, batch.targets, lr=config.learning_rate)
                 for key in accum:
                     accum[key] += float(losses[key])
+                if batch.temporal_contract_conditioning.source == "learned_temporal_contract":
+                    learned_usage += 1.0
             denom = max(1.0, float(len(train_batches)))
             train_metrics = {k.replace("_loss", ""): round(v / denom, 6) for k, v in accum.items()}
+            train_metrics["learned_contract_usage_ratio"] = round(learned_usage / denom, 6)
+            train_metrics["weak_contract_usage_ratio"] = round(1.0 - train_metrics["learned_contract_usage_ratio"], 6)
 
         val_metrics = self._evaluate(model, val_batches)
         val_metrics["score"] = round(max(0.0, 1.0 - val_metrics["pose_mse"]), 6)
+        val_metrics["contract_conditioning_mode"] = self.contract_conditioning_mode
 
         stage_dir = Path(config.checkpoint_dir) / self.stage_name
         stage_dir.mkdir(parents=True, exist_ok=True)
@@ -196,6 +309,11 @@ class DynamicsTrainer(BaseTrainer):
                         "val_samples": len(val_dataset),
                         "source": self.dataset_source,
                         "diagnostics": self.dataset_diagnostics,
+                    },
+                    "contract_conditioning": {
+                        "mode": self.contract_conditioning_mode,
+                        "learned_contract_usage_ratio": val_metrics.get("learned_contract_usage_ratio", 0.0),
+                        "weak_contract_usage_ratio": val_metrics.get("weak_contract_usage_ratio", 0.0),
                     },
                 },
                 ensure_ascii=False,

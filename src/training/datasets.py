@@ -222,6 +222,20 @@ class DynamicsDataset(BaseStageDataset):
                 target_profile = rec.get("target_profile", {}) if isinstance(rec.get("target_profile"), dict) else {}
                 reveal_cov = 1 if any("revealed" in str(k) for k in delta.visibility_deltas.keys()) else 0
                 occlusion_cov = 1 if any("occluded" in str(k) for k in delta.visibility_deltas.keys()) else 0
+                temporal_features = _build_temporal_transition_features(
+                    graph_before=graph_before,
+                    graph_after=graph_after,
+                    roi_records=rec.get("roi_records", []) if isinstance(rec.get("roi_records"), list) else [],
+                    graph_delta_target=delta_raw,
+                    planner_context=planner_context,
+                    target_profile=target_profile,
+                    runtime_semantic_transition=str(rec.get("runtime_semantic_transition", family)),
+                    phase_estimate=phase,
+                    reveal_score=float(np.clip(rec.get("reveal_score", reveal_cov), 0.0, 1.0)),
+                    occlusion_score=float(np.clip(rec.get("occlusion_score", occlusion_cov), 0.0, 1.0)),
+                    support_score=float(np.clip((delta_raw.get("interaction_deltas", {}) or {}).get("support_contact", 0.0), 0.0, 1.0)),
+                    transition_confidence=float(np.clip(rec.get("transition_confidence", 1.0), 0.0, 1.0)),
+                )
                 out.append(
                     {
                         "graphs": [graph_before, graph_after],
@@ -229,6 +243,15 @@ class DynamicsDataset(BaseStageDataset):
                         "deltas": [delta],
                         "source": "manifest_video_dynamics_primary",
                         "delta_contract": _serialize_delta_contract(delta),
+                        "temporal_transition_features": temporal_features,
+                        "temporal_transition_target": {
+                            "family": family,
+                            "phase": phase,
+                            "target_profile": target_profile,
+                            "reveal_score": float(np.clip(rec.get("reveal_score", reveal_cov), 0.0, 1.0)),
+                            "occlusion_score": float(np.clip(rec.get("occlusion_score", occlusion_cov), 0.0, 1.0)),
+                            "support_contact_score": float(np.clip((delta_raw.get("interaction_deltas", {}) or {}).get("support_contact", 0.0), 0.0, 1.0)),
+                        },
                         "graph_transition_contract": {
                             "planner_context": {
                                 "step_index": float(planner_context.get("step_index", idx + 1)),
@@ -619,6 +642,20 @@ class RendererDataset(BaseStageDataset):
                         "target_profile": tp,
                         "heuristic_priors": roi_rec.get("priors", rec.get("heuristic_priors", {})),
                     }
+                    temporal_features = _build_temporal_transition_features(
+                        graph_before=_deserialize_graph(rec.get("scene_graph_before", {})),
+                        graph_after=_deserialize_graph(rec.get("scene_graph_after", {})),
+                        roi_records=roi_records,
+                        graph_delta_target=rec.get("graph_delta_target", {}) if isinstance(rec.get("graph_delta_target"), dict) else {},
+                        planner_context=rec.get("planner_context", {}) if isinstance(rec.get("planner_context"), dict) else {},
+                        target_profile=tp if isinstance(tp, dict) else {},
+                        runtime_semantic_transition=str(rec.get("runtime_semantic_transition", family)),
+                        phase_estimate=phase,
+                        reveal_score=float(np.clip(rec.get("reveal_score", float(np.mean(changed))), 0.0, 1.0)),
+                        occlusion_score=float(np.clip(rec.get("occlusion_score", float(np.mean(changed)) * 0.5), 0.0, 1.0)),
+                        support_score=float(np.clip((rec.get("graph_delta_target", {}) or {}).get("interaction_deltas", {}).get("support_contact", 0.0) if isinstance((rec.get("graph_delta_target", {}) or {}).get("interaction_deltas", {}), dict) else 0.0, 0.0, 1.0)),
+                        transition_confidence=float(np.clip(rec.get("transition_confidence", 1.0), 0.0, 1.0)),
+                    ) if isinstance(rec.get("scene_graph_before"), dict) and isinstance(rec.get("scene_graph_after"), dict) else [0.0] * 128
                     samples.append(
                         {
                             "frames": [roi_before, roi_after],
@@ -627,6 +664,15 @@ class RendererDataset(BaseStageDataset):
                             "region_family": family,
                             "renderer_batch_contract": renderer_contract,
                             "delta_contract": rec.get("graph_delta_target", {}),
+                            "temporal_transition_features": temporal_features,
+                            "temporal_transition_target": {
+                                "family": family,
+                                "phase": phase,
+                                "target_profile": tp if isinstance(tp, dict) else {},
+                                "reveal_score": float(np.clip(rec.get("reveal_score", float(np.mean(changed))), 0.0, 1.0)),
+                                "occlusion_score": float(np.clip(rec.get("occlusion_score", float(np.mean(changed)) * 0.5), 0.0, 1.0)),
+                                "support_contact_score": float(np.clip((rec.get("graph_delta_target", {}) or {}).get("interaction_deltas", {}).get("support_contact", 0.0) if isinstance((rec.get("graph_delta_target", {}) or {}).get("interaction_deltas", {}), dict) else 0.0, 0.0, 1.0)),
+                            },
                             "graph_transition_contract": {
                                 "planner_context": rec.get("planner_context", {}) if isinstance(rec.get("planner_context"), dict) else {},
                                 "target_transition_context": rec.get("target_transition_context", {}) if isinstance(rec.get("target_transition_context"), dict) else {},
