@@ -8,6 +8,7 @@ import numpy as np
 
 from core.region_ids import parse_region_id
 from core.schema import RegionRef
+from dynamics.transition_contracts import LearnedTemporalTransitionContract
 from learned.interfaces import PatchSynthesisOutput, PatchSynthesisRequest
 from utils_tensor import shape
 
@@ -171,6 +172,17 @@ def _default_profile_role(region_type: str, reason: str, delta_regions: list[str
 
 def _resolve_profile_role(request: PatchSynthesisRequest, region_type: str) -> str:
     ctx = request.transition_context if isinstance(request.transition_context, dict) else {}
+    learned_contract = LearnedTemporalTransitionContract.from_metadata(ctx.get("learned_temporal_contract"))
+    if learned_contract is not None and learned_contract.is_learned_primary:
+        primary = set(learned_contract.target_profile.primary_regions)
+        secondary = set(learned_contract.target_profile.secondary_regions)
+        context = set(learned_contract.target_profile.context_regions)
+        if region_type in primary:
+            return "primary"
+        if region_type in secondary:
+            return "secondary"
+        if region_type in context:
+            return "context"
     target_profile = ctx.get("target_profile", {}) if isinstance(ctx.get("target_profile", {}), dict) else {}
     rationale = ctx.get("region_selection_rationale", {}) if isinstance(ctx.get("region_selection_rationale", {}), dict) else {}
     delta = ctx.get("graph_delta")
@@ -199,11 +211,21 @@ def _resolve_profile_role(request: PatchSynthesisRequest, region_type: str) -> s
 
 def _build_render_profile(request: PatchSynthesisRequest) -> RenderConditioningProfile:
     ctx = request.transition_context if isinstance(request.transition_context, dict) else {}
+    learned_contract = LearnedTemporalTransitionContract.from_metadata(ctx.get("learned_temporal_contract"))
     delta = ctx.get("graph_delta")
     _, region_type = parse_region_id(request.region.region_id)
     raw_mode = ""
     if delta is not None:
         raw_mode = str(getattr(delta, "region_transition_mode", {}).get(region_type, ""))
+    if learned_contract is not None and learned_contract.is_learned_primary:
+        if learned_contract.occlusion_score > max(learned_contract.reveal_score, 0.55):
+            raw_mode = "visibility_occlusion"
+        elif learned_contract.reveal_score >= 0.5:
+            raw_mode = "garment_reveal"
+        elif learned_contract.predicted_family == "expression_transition":
+            raw_mode = "expression_refine"
+        elif learned_contract.predicted_family in {"pose_transition", "interaction_transition"}:
+            raw_mode = "pose_exposure"
     raw_mode = str(ctx.get("region_transition_mode", raw_mode))
     transition_mode = _canonical_transition_mode(raw_mode, region_type)
     profile_role = _resolve_profile_role(request, region_type)
@@ -644,6 +666,7 @@ def _semantic_embed(region_id: str, profile: RenderConditioningProfile) -> np.nd
 
 def _delta_features(request: PatchSynthesisRequest, profile: RenderConditioningProfile) -> tuple[np.ndarray, np.ndarray]:
     ctx = request.transition_context if isinstance(request.transition_context, dict) else {}
+    learned_contract = LearnedTemporalTransitionContract.from_metadata(ctx.get("learned_temporal_contract"))
     delta = ctx.get("graph_delta")
     transition_phase = str(ctx.get("transition_phase", "")).lower()
     step_index = _safe_float(ctx.get("step_index", 0.0))
@@ -687,6 +710,14 @@ def _delta_features(request: PatchSynthesisRequest, profile: RenderConditioningP
         ],
         dtype=np.float32,
     )
+    if learned_contract is not None and learned_contract.is_learned_primary:
+        delta_vec[5] = max(delta_vec[5], float(learned_contract.reveal_score))
+        delta_vec[6] = max(delta_vec[6], float(learned_contract.occlusion_score))
+        delta_vec[10] = max(delta_vec[10], 1.0 if learned_contract.reveal_score >= 0.5 else 0.0)
+        delta_vec[11] = max(delta_vec[11], 1.0 if learned_contract.occlusion_score >= 0.5 else 0.0)
+        planner[1] = 1.0 if learned_contract.predicted_phase == "prepare" else planner[1]
+        planner[2] = 1.0 if learned_contract.predicted_phase in {"transition", "contact_or_reveal"} else planner[2]
+        planner[3] = 1.0 if learned_contract.predicted_phase == "stabilize" else planner[3]
     return delta_vec, planner
 
 

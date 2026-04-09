@@ -7,6 +7,9 @@ from typing import Any
 
 import numpy as np
 
+from core.schema import TransitionTargetProfile
+from dynamics.transition_contracts import LearnedTemporalTransitionContract
+
 FAMILIES = [
     "pose_transition",
     "garment_transition",
@@ -188,29 +191,52 @@ class TemporalTransitionEncoder:
         self.b_in -= lr * grad_h
         return losses
 
-    def to_contract(self, prediction: TemporalTransitionPrediction) -> dict[str, object]:
+    def to_typed_contract(self, prediction: TemporalTransitionPrediction) -> LearnedTemporalTransitionContract:
         fam_probs = self._softmax(prediction.family_logits)
         phase_probs = self._softmax(prediction.phase_logits)
         family_idx = int(np.argmax(fam_probs))
         phase_idx = int(np.argmax(phase_probs))
         region_scores = {REGION_KEYS[i]: float(prediction.target_profile_scores[i]) for i in range(len(REGION_KEYS))}
         sorted_regions = sorted(region_scores, key=region_scores.get, reverse=True)
-        return {
-            "family_logits": prediction.family_logits.tolist(),
-            "phase_logits": prediction.phase_logits.tolist(),
-            "target_profile_scores": region_scores,
-            "reveal_score": float(prediction.reveal_score),
-            "occlusion_score": float(prediction.occlusion_score),
-            "support_contact_score": float(prediction.support_contact_score),
-            "transition_embedding": prediction.transition_embedding.tolist(),
-            "predicted_family": FAMILIES[family_idx],
-            "predicted_phase": PHASES[phase_idx],
-            "target_profile": {
-                "primary_regions": sorted_regions[:2],
-                "secondary_regions": sorted_regions[2:5],
-                "context_regions": [r for r in sorted_regions if r.startswith("outer") or r in {"garments", "legs"}][:3],
-            },
-        }
+        confidence = float(
+            np.clip(
+                0.45 * float(np.max(fam_probs))
+                + 0.35 * float(np.max(phase_probs))
+                + 0.20 * float(np.mean(prediction.target_profile_scores)),
+                0.0,
+                1.0,
+            )
+        )
+        return LearnedTemporalTransitionContract(
+            predicted_family=FAMILIES[family_idx],
+            predicted_phase=PHASES[phase_idx],
+            target_profile=TransitionTargetProfile(
+                primary_regions=sorted_regions[:2],
+                secondary_regions=sorted_regions[2:5],
+                context_regions=[r for r in sorted_regions if r.startswith("outer") or r in {"garments", "legs"}][:3],
+            ),
+            reveal_score=float(prediction.reveal_score),
+            occlusion_score=float(prediction.occlusion_score),
+            support_contact_score=float(prediction.support_contact_score),
+            transition_embedding=prediction.transition_embedding.tolist(),
+            confidence=confidence,
+            teacher_source="weak_manifest_bootstrap",
+            is_learned_primary=True,
+        )
+
+    def to_contract(self, prediction: TemporalTransitionPrediction) -> dict[str, object]:
+        typed = self.to_typed_contract(prediction)
+        serialized = typed.to_metadata()
+        serialized.update(
+            {
+                "family_logits": prediction.family_logits.tolist(),
+                "phase_logits": prediction.phase_logits.tolist(),
+                "target_profile_scores": {
+                    REGION_KEYS[i]: float(prediction.target_profile_scores[i]) for i in range(len(REGION_KEYS))
+                },
+            }
+        )
+        return serialized
 
     def save(self, path: str) -> None:
         payload: dict[str, Any] = {
