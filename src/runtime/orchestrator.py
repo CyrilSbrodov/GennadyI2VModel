@@ -232,6 +232,10 @@ class GennadyEngine:
             for region in changed_regions[: profile.max_roi_count]:
                 patch_channels = self.build_patch_memory_channels(memory_channels)
                 transition_metadata = transition_output.metadata if isinstance(transition_output.metadata, dict) else {}
+                learned_temporal_contract = transition_metadata.get("temporal_transition_contract", {})
+                learned_target_profile = {}
+                if isinstance(learned_temporal_contract, dict):
+                    learned_target_profile = learned_temporal_contract.get("target_profile", {}) if isinstance(learned_temporal_contract.get("target_profile", {}), dict) else {}
                 patch_request = PatchSynthesisRequest(
                     region=region,
                     scene_state=scene_graph,
@@ -241,14 +245,15 @@ class GennadyEngine:
                         "video_memory": memory,
                         "transition_phase": delta.transition_phase,
                         "step_index": planned_state.step_index,
-                        "target_profile": transition_metadata.get("target_profile", {}),
+                        "target_profile": learned_target_profile or transition_metadata.get("target_profile", {}),
+                        "learned_temporal_contract": learned_temporal_contract,
                         "region_selection_rationale": transition_metadata.get("region_selection_rationale", {}),
                         "semantic_families": transition_metadata.get("semantic_families", []),
                     },
                     retrieval_summary={
                         "backend": "learned_primary",
                         "identity_entity": entity_id,
-                        "target_profile": transition_metadata.get("target_profile", {}),
+                        "target_profile": learned_target_profile or transition_metadata.get("target_profile", {}),
                     },
                     current_frame=current_frame,
                     memory_channels=patch_channels,
@@ -430,13 +435,14 @@ class GennadyEngine:
                         "backend": self.backends.backend_names.get("dynamics_backend", "unknown"),
                         "confidence": transition_output.confidence,
                         "supervision_mode": parity_contract.get("transition_context", {}).get("supervision_mode", "inference"),
-                        "diagnostics_summary": {
-                            "delta_magnitude": transition_output.diagnostics.get("delta_magnitude"),
-                            "smoothness": transition_output.diagnostics.get("temporal_smoothness_proxy"),
-                            "violations": transition_output.diagnostics.get("constraint_violations"),
-                            "learned_ready": transition_output.metadata.get("learned_ready_usage", {}),
+                            "diagnostics_summary": {
+                                "delta_magnitude": transition_output.diagnostics.get("delta_magnitude"),
+                                "smoothness": transition_output.diagnostics.get("temporal_smoothness_proxy"),
+                                "violations": transition_output.diagnostics.get("constraint_violations"),
+                                "learned_ready": transition_output.metadata.get("learned_ready_usage", {}),
+                                "temporal_contract_alignment": transition_output.metadata.get("temporal_contract_alignment", {}),
+                            },
                         },
-                    },
                     "patch": patch_step_debug,
                     "hidden_reconstruction": {
                         "step_has_hidden_reconstruction": step_hidden_reconstruction,

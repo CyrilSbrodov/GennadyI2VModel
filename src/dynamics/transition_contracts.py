@@ -102,3 +102,68 @@ class TransitionDiagnostics:
     hidden_transition_uncertainty: float = 0.0
     fallback_usage: list[str] = field(default_factory=list)
     explainability_summary: str = ""
+
+
+@dataclass(slots=True)
+class LearnedTemporalTransitionContract:
+    """Typed learned transition contract used as primary downstream conditioning."""
+
+    predicted_family: str = "pose_transition"
+    predicted_phase: str = "transition"
+    target_profile: TransitionTargetProfile = field(default_factory=TransitionTargetProfile)
+    reveal_score: float = 0.0
+    occlusion_score: float = 0.0
+    support_contact_score: float = 0.0
+    transition_embedding: list[float] = field(default_factory=list)
+    confidence: float = 0.0
+    teacher_source: str = "weak_manifest_bootstrap"
+    is_learned_primary: bool = True
+
+    def to_metadata(self) -> dict[str, object]:
+        return {
+            "predicted_family": self.predicted_family,
+            "predicted_phase": self.predicted_phase,
+            "target_profile": {
+                "primary_regions": list(self.target_profile.primary_regions),
+                "secondary_regions": list(self.target_profile.secondary_regions),
+                "context_regions": list(self.target_profile.context_regions),
+                "entity": self.target_profile.entity,
+                "entity_id": self.target_profile.entity_id,
+                "object_role": self.target_profile.object_role,
+                "support_target": self.target_profile.support_target,
+            },
+            "reveal_score": float(self.reveal_score),
+            "occlusion_score": float(self.occlusion_score),
+            "support_contact_score": float(self.support_contact_score),
+            "transition_embedding": list(self.transition_embedding),
+            "confidence": float(self.confidence),
+            "teacher_source": self.teacher_source,
+            "is_learned_primary": bool(self.is_learned_primary),
+        }
+
+    @classmethod
+    def from_metadata(cls, payload: dict[str, object] | None) -> "LearnedTemporalTransitionContract | None":
+        if not isinstance(payload, dict):
+            return None
+        raw_target = payload.get("target_profile", {})
+        target = raw_target if isinstance(raw_target, dict) else {}
+        return cls(
+            predicted_family=str(payload.get("predicted_family", "pose_transition")),
+            predicted_phase=str(payload.get("predicted_phase", "transition")),
+            target_profile=TransitionTargetProfile(
+                primary_regions=[str(x) for x in target.get("primary_regions", []) if isinstance(x, str)],
+                secondary_regions=[str(x) for x in target.get("secondary_regions", []) if isinstance(x, str)],
+                context_regions=[str(x) for x in target.get("context_regions", []) if isinstance(x, str)],
+                entity=str(target.get("entity", "self")),
+                entity_id=str(target.get("entity_id")) if target.get("entity_id") is not None else None,
+                object_role=str(target.get("object_role")) if target.get("object_role") is not None else None,
+                support_target=str(target.get("support_target")) if target.get("support_target") is not None else None,
+            ),
+            reveal_score=float(payload.get("reveal_score", 0.0) or 0.0),
+            occlusion_score=float(payload.get("occlusion_score", 0.0) or 0.0),
+            support_contact_score=float(payload.get("support_contact_score", 0.0) or 0.0),
+            transition_embedding=[float(x) for x in payload.get("transition_embedding", []) if isinstance(x, (int, float))],
+            confidence=float(payload.get("confidence", 0.0) or 0.0),
+            teacher_source=str(payload.get("teacher_source", "weak_manifest_bootstrap")),
+            is_learned_primary=bool(payload.get("is_learned_primary", False)),
+        )
