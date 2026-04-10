@@ -9,6 +9,7 @@ class Compositor:
     @staticmethod
     def _effective_alpha(patch: RenderedPatch, roi_h: int, roi_w: int) -> list[list[float]]:
         alpha = [[float(v) for v in row[:roi_w]] for row in patch.alpha_mask[:roi_h]]
+        mode = str(patch.execution_trace.get("selection", {}).get("selected_render_mode", "")) if isinstance(patch.execution_trace, dict) else ""
         if not patch.uncertainty_map:
             return alpha
 
@@ -19,7 +20,8 @@ class Compositor:
             for x in range(roi_w):
                 unc = float(patch.uncertainty_map[y][x]) if y < len(patch.uncertainty_map) and x < len(patch.uncertainty_map[y]) else 0.0
                 edge = 1.0 - min(x, roi_w - 1 - x, y, roi_h - 1 - y) / max(1.0, min(roi_h, roi_w) / 2.0)
-                attenuation = 1.0 - unc * (0.22 + 0.28 * edge) - (1.0 - conf) * (0.10 + 0.08 * edge)
+                mode_boost = 0.1 if mode == "insert_new" else (0.06 if mode == "reveal" else 0.0)
+                attenuation = 1.0 - unc * (0.22 + 0.28 * edge) - (1.0 - conf) * (0.10 + 0.08 * edge) + mode_boost * (1.0 - edge)
                 row.append(max(0.0, min(1.0, alpha[y][x] * attenuation)))
             out.append(row)
         return out
@@ -27,7 +29,16 @@ class Compositor:
     def compose(self, current_frame: list, patches: list[RenderedPatch], delta: GraphDelta) -> list:
         _ = delta
         frame = [[px[:] for px in row] for row in current_frame]
-        ordered = sorted(patches, key=lambda p: p.z_index)
+        ordered = sorted(
+            patches,
+            key=lambda p: (
+                p.z_index,
+                int(p.execution_trace.get("layer_priority", 0)) if isinstance(p.execution_trace, dict) else 0,
+                1 if isinstance(p.execution_trace, dict) and p.execution_trace.get("selection", {}).get("selected_render_mode") == "insert_new" else 0,
+                1 if isinstance(p.execution_trace, dict) and p.execution_trace.get("selection", {}).get("selected_render_mode") == "reveal" else 0,
+                float(p.confidence),
+            ),
+        )
         h, w, _ = shape(frame)
 
         for p in ordered:

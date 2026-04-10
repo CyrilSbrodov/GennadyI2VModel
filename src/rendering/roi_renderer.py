@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from typing import Literal
 
 from core.region_ids import make_region_id, parse_region_id
-from core.schema import BBox, GarmentSemanticProfile, GraphDelta, RegionRef, SceneGraph, VideoMemory
+from core.schema import BBox, GarmentSemanticProfile, GraphDelta, RegionDescriptor, RegionRef, SceneGraph, VideoMemory
 from core.semantic_roi import SemanticROIHelper
 from memory.video_memory import MemoryManager
 from rendering.confidence import PatchConfidenceEstimator
+from rendering.contracts.mode_surfaces import InsertionPathContract, RevealPathContract, UpdatePathContract
 from rendering.contracts.synthesis_plan import PatchSynthesisPlan
 from representation.scene_graph_queries import SceneGraphQueries
 from utils_tensor import alpha_radial, crop, mean_color, shape, zeros
@@ -25,6 +27,20 @@ class RenderedPatch:
     z_index: int = 0
     debug_trace: list[str] = field(default_factory=list)
     execution_trace: dict[str, object] = field(default_factory=dict)
+
+
+RenderMode = Literal["keep", "warp", "deform", "refine", "reveal", "insert_new"]
+EntityLifecycle = Literal["already_existing", "newly_inserted", "previously_hidden_now_revealed", "still_hidden", "interaction_boundary", "stable_context"]
+
+
+@dataclass(slots=True)
+class RenderRouteDecision:
+    mode: RenderMode
+    lifecycle: EntityLifecycle
+    reason_trace: list[str] = field(default_factory=list)
+    memory_dependency: dict[str, object] = field(default_factory=dict)
+    plan: PatchSynthesisPlan | None = None
+    insertion_context: dict[str, object] = field(default_factory=dict)
 
 
 class ROISelector:
@@ -106,12 +122,233 @@ def _is_empty_roi(value) -> bool:
     return len(dims) < 3 or dims[0] <= 0 or dims[1] <= 0 or dims[2] <= 0
 
 
+class RegionModeRouter:
+    """Structured роутер режимов рендера."""
+
+    def route(self, renderer: "PatchRenderer", *, scene_graph: SceneGraph, delta: GraphDelta, memory: VideoMemory, region: RegionRef, roi: list[list[list[float]]]) -> RenderRouteDecision:
+        entity_id, region_type = parse_region_id(region.region_id)
+        transition_mode = str(delta.region_transition_mode.get(region_type, "stable") or "stable")
+        in_reveal = any(r.region_id == region.region_id for r in delta.newly_revealed_regions)
+        slot = memory.hidden_region_slots.get(region.region_id)
+        slot_hidden = bool(slot and slot.hidden_type in {"known_hidden", "unknown_hidden", "decayed_unknown"})
+        exists_in_graph = any(p.person_id == entity_id for p in scene_graph.persons) or any(o.object_id == entity_id for o in scene_graph.objects)
+        exists_in_memory = entity_id in memory.identity_memory or entity_id in memory.garment_memory
+        insertion_ctx = delta.transition_diagnostics.get("insertion_context", {}) if isinstance(delta.transition_diagnostics, dict) else {}
+        explicit_insert = bool(insertion_ctx.get(region.region_id) or insertion_ctx.get(entity_id))
+
+        if explicit_insert or (not exists_in_graph and not exists_in_memory):
+            mode: RenderMode = "insert_new"
+            lifecycle: EntityLifecycle = "newly_inserted"
+            reasons = ["entity_absent_in_scene_and_memory"]
+        elif in_reveal or (slot_hidden and transition_mode in {"garment_reveal", "visibility_reveal", "pose_exposure"}):
+            mode = "reveal"
+            lifecycle = "previously_hidden_now_revealed"
+            reasons = ["region_marked_revealed_or_hidden_slot_exists"]
+        else:
+            lifecycle = "already_existing"
+            if transition_mode in {"stable", ""}:
+                mode = "keep"
+            elif transition_mode in {"expression_refine"} or region_type in {"face", "head"}:
+                mode = "refine"
+            elif transition_mode in {"pose_exposure", "pose_deform", "deform_relation_aware"}:
+                mode = "deform"
+            elif transition_mode in {"garment_surface", "open_front", "remove_outer"}:
+                mode = "warp"
+            else:
+                mode = "refine"
+            reasons = [f"existing_region_mode={mode}"]
+
+        plan = renderer._build_plan(scene_graph, delta, memory, region, roi)
+        reasons.append(f"transition_mode={transition_mode}")
+        return RenderRouteDecision(
+            mode=mode,
+            lifecycle=lifecycle,
+            reason_trace=reasons,
+            memory_dependency={
+                "has_hidden_slot": bool(slot),
+                "hidden_type": slot.hidden_type if slot else "none",
+                "texture_patch_count": len(memory.texture_patches),
+                "region_descriptor_exists": region.region_id in memory.region_descriptors,
+                "retrieval_top_score": float(plan.retrieval_summary.get("top_score", 0.0)),
+            },
+            plan=plan,
+            insertion_context=insertion_ctx.get(region.region_id, insertion_ctx.get(entity_id, {})),
+        )
+
+
+class ExistingRegionUpdater:
+    def update(self, renderer: "PatchRenderer", *, roi: list[list[list[float]]], delta: GraphDelta, plan: PatchSynthesisPlan, mode: RenderMode) -> tuple[list[list[list[float]]], dict[str, object], UpdatePathContract]:
+        if mode == "keep":
+            contract = UpdatePathContract(mode="keep", reuse_fraction=1.0, synth_fraction=0.0, refinement_fraction=0.0, target_consistency=0.98, training_tags=["update", "preserve"])
+            return roi, {"module": "existing_updater", "operation": "keep", "reuse_ratio": 1.0}, contract
+        proposal, proposal_trace = renderer._build_proposal(roi, renderer._active_memory or VideoMemory(), plan, delta)
+        if mode == "warp":
+            contract = UpdatePathContract(mode="warp", reuse_fraction=0.82, synth_fraction=0.1, refinement_fraction=0.08, target_consistency=0.9, training_tags=["update", "warp"])
+            return proposal, {"module": "existing_updater", "operation": "warp", "reuse_ratio": 0.82, **proposal_trace}, contract
+        if mode == "deform":
+            deform_trace = renderer._apply_pose_deform(proposal, plan.region_type)
+            if "proposal" in deform_trace:
+                proposal = deform_trace.pop("proposal")
+            contract = UpdatePathContract(mode="deform", reuse_fraction=0.74, synth_fraction=0.16, refinement_fraction=0.1, target_consistency=0.86, training_tags=["update", "deform"])
+            return proposal, {"module": "existing_updater", "operation": "deform", "reuse_ratio": 0.74, **proposal_trace, **deform_trace}, contract
+        refined, refine_trace = renderer._refine_proposal(proposal, plan)
+        contract = UpdatePathContract(mode="refine", reuse_fraction=0.66, synth_fraction=0.12, refinement_fraction=0.22, target_consistency=0.91, training_tags=["update", "refine"])
+        return refined, {"module": "existing_updater", "operation": "refine", "reuse_ratio": 0.66, **proposal_trace, **refine_trace}, contract
+
+
+class RevealRegionSynthesizer:
+    def _reveal_type(self, delta: GraphDelta, plan: PatchSynthesisPlan) -> str:
+        mode = str(plan.transition_mode)
+        if mode in {"garment_reveal", "open_front", "remove_outer"}:
+            return "garment_change_reveal"
+        if mode in {"pose_exposure", "pose_deform"}:
+            return "pose_exposure_reveal"
+        if "occlusion" in " ".join(delta.semantic_reasons):
+            return "occlusion_reveal"
+        return "generic_reveal"
+
+    def synthesize(self, renderer: "PatchRenderer", *, roi: list[list[list[float]]], delta: GraphDelta, plan: PatchSynthesisPlan) -> tuple[list[list[list[float]]], dict[str, object], RevealPathContract, float, list[list[float]]]:
+        memory = renderer._active_memory or VideoMemory()
+        proposal, proposal_trace = renderer._build_proposal(roi, memory, plan, delta)
+        hidden_mode = plan.hidden_reconstruction_mode
+        retrieval_top = float(plan.retrieval_summary.get("top_score", 0.0))
+        h, w, c = shape(proposal)
+        out = zeros(h, w, c)
+
+        if hidden_mode == "known_hidden":
+            blend = min(0.78, 0.45 + 0.35 * retrieval_top)
+            for y in range(h):
+                for x in range(w):
+                    for k in range(c):
+                        out[y][x][k] = max(0.0, min(1.0, proposal[y][x][k] * blend + roi[y][x][k] * (1.0 - blend)))
+            uncertainty = [[max(0.08, 0.28 - 0.18 * retrieval_top) for _ in range(w)] for _ in range(h)]
+        else:
+            mc = mean_color(roi)
+            for y in range(h):
+                for x in range(w):
+                    edge = min(x, w - 1 - x, y, h - 1 - y) / max(1, min(h, w))
+                    noise = (((x * 92821) ^ (y * 68917)) % 23) / 22.0
+                    for k in range(c):
+                        out[y][x][k] = max(0.0, min(1.0, proposal[y][x][k] * 0.56 + mc[k] * 0.3 + 0.08 * noise + 0.06 * edge))
+            uncertainty = [[0.42 + 0.18 * (1.0 - min(x, w - 1 - x, y, h - 1 - y) / max(1, min(h, w) / 2)) for x in range(w)] for y in range(h)]
+
+        refined, refinement_trace = renderer._refine_proposal(out, plan)
+        reveal_type = self._reveal_type(delta, plan)
+        contract = RevealPathContract(
+            reveal_type=reveal_type,
+            hidden_mode=hidden_mode,
+            memory_usage_ratio=1.0 if hidden_mode == "known_hidden" else 0.45,
+            reconstruction_bias=0.78 if hidden_mode == "known_hidden" else 0.52,
+            hallucination_budget=0.14 if hidden_mode == "known_hidden" else 0.42,
+            training_tags=["reveal", hidden_mode, reveal_type],
+        )
+        confidence = max(0.35, min(0.89, 0.52 + 0.32 * retrieval_top - (0.16 if hidden_mode != "known_hidden" else 0.0)))
+        return refined, {
+            "module": "reveal_synthesizer",
+            "operation": "reveal",
+            "hidden_region_slots_used": bool(memory.hidden_region_slots.get(plan.region_id)),
+            "texture_patch_memory_used": bool(plan.retrieval_summary.get("candidates")),
+            "reveal_type": reveal_type,
+            "hidden_mode": hidden_mode,
+            "reveal_confidence_semantics": "retrieval_weighted" if hidden_mode == "known_hidden" else "hypothesis_weighted",
+            "reveal_uncertainty_semantics": "low_center_known_hidden" if hidden_mode == "known_hidden" else "high_edge_unknown_hidden",
+            **proposal_trace,
+            **refinement_trace,
+        }, contract, confidence, uncertainty
+
+
+class NewEntityInserter:
+    def _ctx_color(self, ctx: dict[str, object], fallback: list[float]) -> list[float]:
+        app = ctx.get("appearance_conditioning", {}) if isinstance(ctx.get("appearance_conditioning", {}), dict) else {}
+        palette = app.get("palette_rgb", [])
+        if isinstance(palette, list) and palette:
+            seed = palette[0]
+            if isinstance(seed, list) and len(seed) >= 3:
+                return [max(0.0, min(1.0, float(seed[0]))), max(0.0, min(1.0, float(seed[1]))), max(0.0, min(1.0, float(seed[2])))]
+        return fallback
+
+    def insert(self, *, roi: list[list[list[float]]], decision: RenderRouteDecision, region: RegionRef) -> tuple[list[list[list[float]]], list[list[float]], list[list[float]], dict[str, object], float, InsertionPathContract]:
+        h, w, c = shape(roi)
+        out = zeros(h, w, c)
+        base = mean_color(roi)
+        ctx = decision.insertion_context if isinstance(decision.insertion_context, dict) else {}
+        entity_type = str(ctx.get("entity_type", "generic_entity"))
+        pose_role = str(ctx.get("initial_pose_role", "neutral"))
+        rel = ctx.get("relation_context", {}) if isinstance(ctx.get("relation_context", {}), dict) else {}
+        primary = self._ctx_color(ctx, base)
+        accent = [max(0.0, min(1.0, primary[2] + 0.1)), max(0.0, min(1.0, primary[0] + 0.08)), max(0.0, min(1.0, primary[1] + 0.05))]
+        silhouette_alpha = [[0.0 for _ in range(w)] for _ in range(h)]
+        for y in range(h):
+            yn = y / max(1, h - 1)
+            for x in range(w):
+                xn = x / max(1, w - 1)
+                cx = abs(xn - 0.5)
+                if entity_type == "person":
+                    body = 1.0 - min(1.0, ((cx / 0.30) ** 2 + ((yn - 0.60) / 0.42) ** 2))
+                    head = 1.0 - min(1.0, ((cx / 0.16) ** 2 + ((yn - 0.20) / 0.18) ** 2))
+                    mask = max(0.0, max(body, head))
+                else:
+                    rect = 1.0 if (0.18 <= xn <= 0.82 and 0.16 <= yn <= 0.84) else 0.0
+                    round_corner = max(0.0, 1.0 - min(1.0, ((cx / 0.42) ** 4 + (abs(yn - 0.5) / 0.42) ** 4)))
+                    mask = max(rect * 0.8, round_corner * 0.75)
+                stripe = 0.15 * (1.0 if ((x // max(1, w // 8)) % 2 == 0) else -1.0)
+                pose_bias = 0.06 if pose_role in {"standing", "active"} else 0.02
+                rel_bias = 0.05 if rel.get("supported_by") else 0.0
+                texture = max(0.0, mask) * (0.82 + pose_bias + rel_bias)
+                silhouette_alpha[y][x] = max(0.0, min(1.0, texture))
+                for k in range(c):
+                    col = primary[k] * (0.68 + 0.2 * (1.0 - yn)) + accent[k] * 0.22 + stripe * 0.04
+                    out[y][x][k] = max(0.0, min(1.0, roi[y][x][k] * (1.0 - silhouette_alpha[y][x]) + col * silhouette_alpha[y][x]))
+        radial = alpha_radial(h, w)
+        alpha = [[max(0.0, min(1.0, silhouette_alpha[y][x] * 0.92 + radial[y][x] * 0.08)) for x in range(w)] for y in range(h)]
+        uncertainty = [[0.22 + 0.48 * (1.0 - silhouette_alpha[y][x]) for x in range(w)] for y in range(h)]
+        ctx_score = 0.25 + 0.2 * bool(ctx.get("appearance_conditioning")) + 0.2 * bool(rel) + 0.15 * bool(ctx.get("initial_pose_role")) + 0.2 * bool(ctx.get("entity_type"))
+        confidence = max(0.38, min(0.86, ctx_score))
+        contract = InsertionPathContract(
+            entity_type=entity_type,
+            pose_role=pose_role,
+            context_conditioning_score=ctx_score,
+            reusable_artifact_expected=True,
+            alpha_semantics="silhouette_composite_alpha",
+            uncertainty_semantics="background_high_entity_core_low",
+            training_tags=["insert", entity_type, pose_role],
+        )
+        trace = {
+            "module": "new_entity_inserter",
+            "operation": "insert_new",
+            "bootstrap_mode": "renderer_local_insert_bootstrap",
+            "learned_ready_interface": True,
+            "insert_confidence_semantics": "context_conditioned_local_renderer",
+            "insert_uncertainty_semantics": "silhouette_aware",
+            "insertion_metadata": {
+                "entity_type": entity_type,
+                "target_region": region.region_id,
+                "relation_context": rel,
+                "initial_pose_role": pose_role,
+                "appearance_conditioning": ctx.get("appearance_conditioning", {}),
+                "context_score": ctx_score,
+            },
+        }
+        return out, alpha, uncertainty, trace, confidence, contract
+
+
+class LayeredCompositingSupport:
+    def z_index_for_mode(self, mode: RenderMode) -> int:
+        return {"keep": 1, "warp": 2, "deform": 2, "refine": 3, "reveal": 4, "insert_new": 5}.get(mode, 1)
+
+
 class PatchRenderer:
     """Plan-driven ROI renderer с property-driven hidden policy и explainability."""
 
     def __init__(self) -> None:
         self.memory_manager = MemoryManager()
         self.confidence_estimator = PatchConfidenceEstimator()
+        self.mode_router = RegionModeRouter()
+        self.existing_updater = ExistingRegionUpdater()
+        self.reveal_synthesizer = RevealRegionSynthesizer()
+        self.new_entity_inserter = NewEntityInserter()
+        self.layering = LayeredCompositingSupport()
+        self._active_memory: VideoMemory | None = None
 
     def _bbox_to_pixels(self, bbox: BBox, frame: list) -> tuple[int, int, int, int]:
         h, w, _ = shape(frame)
@@ -594,6 +831,75 @@ class PatchRenderer:
             strategy=plan.selected_strategy,
         )
 
+    def _register_inserted_entity(
+        self,
+        *,
+        memory: VideoMemory,
+        scene_graph: SceneGraph,
+        region: RegionRef,
+        patch: list[list[list[float]]],
+        confidence: float,
+        insertion_meta: dict[str, object],
+    ) -> dict[str, object]:
+        entity_id, region_type = parse_region_id(region.region_id)
+        memory.region_descriptors[region.region_id] = RegionDescriptor(
+            region_id=region.region_id,
+            entity_id=entity_id,
+            region_type=region_type,
+            bbox=region.bbox,
+            visibility="visible",
+            confidence=confidence,
+            last_update_frame=scene_graph.frame_index,
+        )
+        patch_id = f"insert::{region.region_id}:{scene_graph.frame_index}"
+        desc = self.memory_manager._patch_descriptor(patch)
+        memory.patch_cache[patch_id] = patch
+        from core.schema import TexturePatchMemory
+
+        memory.texture_patches[patch_id] = TexturePatchMemory(
+            patch_id=patch_id,
+            region_type=region_type,
+            entity_id=entity_id,
+            source_frame=scene_graph.frame_index,
+            patch_ref=f"insert://{region.region_id}",
+            confidence=confidence,
+            descriptor=desc,
+            evidence_score=confidence,
+            semantic_family="inserted_entity",
+            coverage_targets=[region_type],
+            attachment_targets=[],
+            suitable_for_reveal=True,
+        )
+        slot = memory.hidden_region_slots.get(region.region_id)
+        if slot is None:
+            from core.schema import HiddenRegionSlot
+
+            slot = HiddenRegionSlot(slot_id=region.region_id, region_type=region_type, owner_entity=entity_id, hidden_type="known_hidden")
+            memory.hidden_region_slots[region.region_id] = slot
+        slot.candidate_patch_ids = [patch_id] + [pid for pid in slot.candidate_patch_ids if pid != patch_id][:4]
+        slot.confidence = max(slot.confidence, confidence)
+        slot.evidence_score = max(slot.evidence_score, confidence)
+        slot.last_transition_reason = "inserted_entity_seed"
+        if entity_id not in memory.identity_memory:
+            from core.schema import MemoryEntry
+
+            memory.identity_memory[entity_id] = MemoryEntry(
+                entity_id=entity_id,
+                entry_type="inserted_entity_identity_seed",
+                embedding=self.memory_manager._descriptor_to_embedding(desc),
+                confidence=max(0.35, confidence),
+                last_seen_frames=[scene_graph.frame_index],
+            )
+        memory.last_transition_context["last_inserted_entity"] = entity_id
+        return {
+            "patch_id": patch_id,
+            "registered_region_descriptor": True,
+            "registered_texture_patch": True,
+            "registered_hidden_slot": True,
+            "registered_identity_seed": True,
+            "provenance": insertion_meta,
+        }
+
     def render(
         self,
         current_frame: list,
@@ -609,21 +915,53 @@ class PatchRenderer:
         roi = crop(current_frame, x0, y0, x1, y1)
         if _is_empty_roi(roi):
             roi = zeros(32, 32, 3)
-
-        plan = self._build_plan(scene_graph, delta, memory, region, roi)
-        proposal, proposal_trace = self._build_proposal(roi, memory, plan, delta)
-        refined, refinement_trace = self._refine_proposal(proposal, plan)
+        self._active_memory = memory
+        decision = self.mode_router.route(self, scene_graph=scene_graph, delta=delta, memory=memory, region=region, roi=roi)
+        plan = decision.plan or self._build_plan(scene_graph, delta, memory, region, roi)
         confidence_payload = self._estimate_confidence(plan)
+        learnable_surface: dict[str, object] = {}
+        registration_summary: dict[str, object] = {"registered": False}
+
+        if decision.mode == "insert_new":
+            refined, alpha, uncertainty, module_trace, confidence, insert_contract = self.new_entity_inserter.insert(roi=roi, decision=decision, region=region)
+            registration_summary = self._register_inserted_entity(
+                memory=memory,
+                scene_graph=scene_graph,
+                region=region,
+                patch=refined,
+                confidence=confidence,
+                insertion_meta=module_trace.get("insertion_metadata", {}),
+            )
+            registration_summary["registered"] = True
+            learnable_surface = {"insertion_path_contract": asdict(insert_contract)}
+        elif decision.mode == "reveal":
+            refined, module_trace, reveal_contract, reveal_confidence, uncertainty = self.reveal_synthesizer.synthesize(self, roi=roi, delta=delta, plan=plan)
+            rh, rw, _ = shape(refined)
+            alpha = alpha_radial(rh, rw)
+            confidence = max(float(confidence_payload["confidence"]) * 0.55 + reveal_confidence * 0.45, reveal_confidence * 0.85)
+            learnable_surface = {"reveal_path_contract": asdict(reveal_contract)}
+        else:
+            refined, module_trace, update_contract = self.existing_updater.update(self, roi=roi, delta=delta, plan=plan, mode=decision.mode)
+            rh, rw, _ = shape(refined)
+            alpha = alpha_radial(rh, rw)
+            confidence = float(confidence_payload["confidence"])
+            uncertainty = [[1.0 - confidence for _ in range(rw)] for _ in range(rh)]
+            learnable_surface = {"update_path_contract": asdict(update_contract)}
+
+        selected_strategy = "EXISTING_REGION_UPDATE"
+        if decision.mode == "reveal":
+            selected_strategy = "KNOWN_HIDDEN_REVEAL" if plan.hidden_reconstruction_mode == "known_hidden" else "UNKNOWN_HIDDEN_SYNTHESIS"
+        elif decision.mode == "insert_new":
+            selected_strategy = "NEW_ENTITY_INSERTION"
 
         h, w, ch = shape(refined)
-        alpha = alpha_radial(h, w)
-        confidence = float(confidence_payload["confidence"])
-        uncertainty = [[1.0 - confidence for _ in range(w)] for _ in range(h)]
-
         structured_trace = {
             "selection": {
                 "selected_family": plan.selected_family,
                 "selected_strategy": plan.selected_strategy,
+                "selected_render_mode": decision.mode,
+                "entity_lifecycle": decision.lifecycle,
+                "mode_reasons": decision.reason_trace,
                 "retrieval_mode": plan.retrieval_mode,
                 "transition_mode": plan.transition_mode,
                 "proposal_mode": plan.proposal_mode,
@@ -640,19 +978,41 @@ class PatchRenderer:
                 "candidates": plan.retrieval_summary.get("candidate_summaries", []),
                 "top_candidate_score_breakdown": plan.retrieval_summary.get("top_score_breakdown", {}),
             },
-            "proposal": proposal_trace,
-            "refinement": refinement_trace,
+            "module_trace": module_trace,
+            "memory_dependency_summary": decision.memory_dependency,
+            "entity_registration_summary": registration_summary,
             "confidence": confidence_payload["decomposition"],
             "risks": confidence_payload["risks"],
+            "selected_render_strategy": selected_strategy,
             "fallback_reason": plan.retrieval_summary.get("fallback_reason", "none"),
+            "synthesis_mode": "insertion" if decision.mode == "insert_new" else ("retrieval" if decision.mode == "reveal" else "deterministic"),
+            "layer_priority": self.layering.z_index_for_mode(decision.mode),
+            "confidence_semantics_by_mode": {
+                "mode": decision.mode,
+                "confidence": confidence,
+                "semantic": "context_conditioned_insert" if decision.mode == "insert_new" else ("reveal_memory_conditioned" if decision.mode == "reveal" else "update_consistency_conditioned"),
+            },
+            "uncertainty_semantics_by_mode": {
+                "mode": decision.mode,
+                "mean_uncertainty": sum(sum(row) for row in uncertainty) / max(1, len(uncertainty) * len(uncertainty[0]) if uncertainty else 1),
+                "semantic": "entity_core_low_uncertainty" if decision.mode == "insert_new" else ("reveal_hidden_uncertainty" if decision.mode == "reveal" else "confidence_inverse_uniform"),
+            },
+            "reusable_output": {
+                "reusable_next_frame": True,
+                "reuse_reason": "seeded_texture_memory" if decision.mode == "insert_new" else ("hidden_reveal_candidate" if decision.mode == "reveal" else "existing_region_carry"),
+            },
+            "learnable_mode_surface": learnable_surface,
         }
 
         debug_trace = [
             f"region={region.region_id}",
             f"family={plan.selected_family}",
-            f"strategy={plan.selected_strategy}",
+            f"strategy={selected_strategy.lower()}",
+            f"render_mode={decision.mode}",
+            f"lifecycle={decision.lifecycle}",
             f"hidden_mode={plan.hidden_reconstruction_mode}",
             f"retrieval_mode={plan.retrieval_mode}",
             f"proposal_mode={plan.proposal_mode}",
+            f"retrieval_debug={plan.retrieval_summary.get('debug', plan.retrieval_summary.get('summary', {}))}",
         ]
-        return RenderedPatch(region, refined, alpha, h, w, ch, uncertainty, confidence, 1, debug_trace, structured_trace)
+        return RenderedPatch(region, refined, alpha, h, w, ch, uncertainty, confidence, self.layering.z_index_for_mode(decision.mode), debug_trace, structured_trace)
