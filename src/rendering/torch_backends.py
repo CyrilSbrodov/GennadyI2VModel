@@ -159,7 +159,11 @@ class TorchNewEntityInserter:
         return _run_model(self.model, self.device, batch, module="torch_new_entity_inserter")
 
 
-def _run_model(model: _TorchPathModule, device: torch.device, batch: RendererTensorBatch, *, module: str) -> TorchBackendResult:
+def tensor_batch_to_torch_inputs(
+    batch: RendererTensorBatch,
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     roi = torch.tensor(batch.roi, dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
     changed = torch.tensor(batch.changed_mask, dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
     alpha_hint = torch.tensor(batch.alpha_hint, dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
@@ -176,9 +180,14 @@ def _run_model(model: _TorchPathModule, device: torch.device, batch: RendererTen
         [roi, changed, alpha_hint, memory_hint, conditioning_map[:, :1, ...], reveal_signal, insertion_signal, ctx_bias, geom[:, :3, ...], yy[None, None, ...], xx[None, None, ...]],
         dim=1,
     )
+    return inp, roi, alpha_hint, ctx.unsqueeze(0)
+
+
+def _run_model(model: _TorchPathModule, device: torch.device, batch: RendererTensorBatch, *, module: str) -> TorchBackendResult:
+    inp, roi, alpha_hint, context = tensor_batch_to_torch_inputs(batch, device=device)
     model.eval()
     with torch.no_grad():
-        rgb, alpha, unc, conf = model(inp, roi, alpha_hint, ctx.unsqueeze(0))
+        rgb, alpha, unc, conf = model(inp, roi, alpha_hint, context)
     return TorchBackendResult(
         rgb=rgb[0].detach().cpu().permute(1, 2, 0).tolist(),
         alpha=alpha[0, 0].detach().cpu().tolist(),
@@ -309,6 +318,13 @@ class TorchRendererBackendBundle:
                 self.checkpoint_status[path_name] = "checkpoint_invalid"
                 self.checkpoint_details[path_name] = {"checkpoint_file": str(path), "error": str(exc)}
         return trace
+
+    def get_path_module(self, path_name: TorchPathName) -> _TorchPathModule | None:
+        if path_name == "existing_update":
+            return self.existing.model if self.existing is not None else None
+        if path_name == "reveal":
+            return self.reveal.model if self.reveal is not None else None
+        return self.insertion.model if self.insertion is not None else None
 
 
 def build_renderer_tensor_batch(
