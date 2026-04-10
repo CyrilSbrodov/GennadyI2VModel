@@ -203,6 +203,12 @@ class LearnedDynamicsTransitionModel(DynamicsTransitionModel):
             },
             metadata={
                 "backend": "learned_graph_delta_predictor",
+                "requested_family": delta.transition_diagnostics.get("requested_family"),
+                "selected_family": delta.transition_diagnostics.get("selected_family"),
+                "checkpoint_status": delta.transition_diagnostics.get("checkpoint_status", "unknown"),
+                "backend_status": delta.transition_diagnostics.get("backend_status", "unknown"),
+                "usable_for_inference": bool(delta.transition_diagnostics.get("usable_for_inference", False)),
+                "fallback_reason": delta.transition_diagnostics.get("fallback_reason"),
                 "runtime_path": delta.transition_diagnostics.get("runtime_path", "learned_primary"),
                 "temporal_transition_contract": temporal_contract,
                 "human_state_contract": human_contract,
