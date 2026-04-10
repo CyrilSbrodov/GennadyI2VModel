@@ -10,6 +10,7 @@ from memory.video_memory import MemoryManager
 from rendering.confidence import PatchConfidenceEstimator
 from rendering.contracts.mode_surfaces import InsertionPathContract, RevealPathContract, UpdatePathContract
 from rendering.contracts.synthesis_plan import PatchSynthesisPlan
+from rendering.torch_backends import TorchRendererBackendBundle, build_renderer_tensor_batch, serialize_tensor_batch
 from representation.scene_graph_queries import SceneGraphQueries
 from utils_tensor import alpha_radial, crop, mean_color, shape, zeros
 
@@ -178,22 +179,47 @@ class RegionModeRouter:
 
 class ExistingRegionUpdater:
     def update(self, renderer: "PatchRenderer", *, roi: list[list[list[float]]], delta: GraphDelta, plan: PatchSynthesisPlan, mode: RenderMode) -> tuple[list[list[list[float]]], dict[str, object], UpdatePathContract]:
+        backend_used = "bootstrap_fallback"
+        fallback_reason = "mode_not_torch_eligible"
+        if renderer.learnable_backend_mode == "torch_learned":
+            if renderer.torch_backends.available and renderer.torch_backends.existing is not None:
+                batch = build_renderer_tensor_batch(
+                    roi=roi,
+                    path_type="existing_update",
+                    transition_mode=plan.transition_mode,
+                    hidden_mode=plan.hidden_reconstruction_mode,
+                    retrieval_top_score=float(plan.retrieval_summary.get("top_score", 0.0)),
+                    memory_hint_strength=float(plan.retrieval_summary.get("top_score", 0.0)),
+                )
+                out = renderer.torch_backends.existing.forward(batch)
+                contract = UpdatePathContract(mode=mode, reuse_fraction=0.58, synth_fraction=0.24, refinement_fraction=0.18, target_consistency=0.88, training_tags=["update", "torch_learned", mode])
+                return out.rgb, {
+                    "module": "existing_updater",
+                    "operation": mode,
+                    "backend_selection": "torch_learned_primary",
+                    "backend_type": "torch_learned",
+                    "backend_fallback_reason": "none",
+                    "tensor_batch_surface": serialize_tensor_batch(batch),
+                    **out.backend_trace,
+                }, contract
+            backend_used = "torch_learned_missing_checkpoint_fallback"
+            fallback_reason = "torch_unavailable_or_uninitialized"
         if mode == "keep":
             contract = UpdatePathContract(mode="keep", reuse_fraction=1.0, synth_fraction=0.0, refinement_fraction=0.0, target_consistency=0.98, training_tags=["update", "preserve"])
-            return roi, {"module": "existing_updater", "operation": "keep", "reuse_ratio": 1.0}, contract
+            return roi, {"module": "existing_updater", "operation": "keep", "reuse_ratio": 1.0, "backend_selection": backend_used, "backend_type": "bootstrap", "backend_fallback_reason": fallback_reason}, contract
         proposal, proposal_trace = renderer._build_proposal(roi, renderer._active_memory or VideoMemory(), plan, delta)
         if mode == "warp":
             contract = UpdatePathContract(mode="warp", reuse_fraction=0.82, synth_fraction=0.1, refinement_fraction=0.08, target_consistency=0.9, training_tags=["update", "warp"])
-            return proposal, {"module": "existing_updater", "operation": "warp", "reuse_ratio": 0.82, **proposal_trace}, contract
+            return proposal, {"module": "existing_updater", "operation": "warp", "reuse_ratio": 0.82, "backend_selection": backend_used, "backend_type": "bootstrap", "backend_fallback_reason": fallback_reason, **proposal_trace}, contract
         if mode == "deform":
             deform_trace = renderer._apply_pose_deform(proposal, plan.region_type)
             if "proposal" in deform_trace:
                 proposal = deform_trace.pop("proposal")
             contract = UpdatePathContract(mode="deform", reuse_fraction=0.74, synth_fraction=0.16, refinement_fraction=0.1, target_consistency=0.86, training_tags=["update", "deform"])
-            return proposal, {"module": "existing_updater", "operation": "deform", "reuse_ratio": 0.74, **proposal_trace, **deform_trace}, contract
+            return proposal, {"module": "existing_updater", "operation": "deform", "reuse_ratio": 0.74, "backend_selection": backend_used, "backend_type": "bootstrap", "backend_fallback_reason": fallback_reason, **proposal_trace, **deform_trace}, contract
         refined, refine_trace = renderer._refine_proposal(proposal, plan)
         contract = UpdatePathContract(mode="refine", reuse_fraction=0.66, synth_fraction=0.12, refinement_fraction=0.22, target_consistency=0.91, training_tags=["update", "refine"])
-        return refined, {"module": "existing_updater", "operation": "refine", "reuse_ratio": 0.66, **proposal_trace, **refine_trace}, contract
+        return refined, {"module": "existing_updater", "operation": "refine", "reuse_ratio": 0.66, "backend_selection": backend_used, "backend_type": "bootstrap", "backend_fallback_reason": fallback_reason, **proposal_trace, **refine_trace}, contract
 
 
 class RevealRegionSynthesizer:
@@ -208,6 +234,36 @@ class RevealRegionSynthesizer:
         return "generic_reveal"
 
     def synthesize(self, renderer: "PatchRenderer", *, roi: list[list[list[float]]], delta: GraphDelta, plan: PatchSynthesisPlan) -> tuple[list[list[list[float]]], dict[str, object], RevealPathContract, float, list[list[float]]]:
+        if renderer.learnable_backend_mode == "torch_learned" and renderer.torch_backends.available and renderer.torch_backends.reveal is not None:
+            batch = build_renderer_tensor_batch(
+                roi=roi,
+                path_type="reveal",
+                transition_mode=plan.transition_mode,
+                hidden_mode=plan.hidden_reconstruction_mode,
+                retrieval_top_score=float(plan.retrieval_summary.get("top_score", 0.0)),
+                memory_hint_strength=float(plan.retrieval_summary.get("top_score", 0.0)),
+            )
+            out = renderer.torch_backends.reveal.forward(batch)
+            reveal_type = self._reveal_type(delta, plan)
+            contract = RevealPathContract(
+                reveal_type=reveal_type,
+                hidden_mode=plan.hidden_reconstruction_mode,
+                memory_usage_ratio=0.72,
+                reconstruction_bias=0.73,
+                hallucination_budget=0.22,
+                training_tags=["reveal", "torch_learned", reveal_type],
+            )
+            return out.rgb, {
+                "module": "reveal_synthesizer",
+                "operation": "reveal",
+                "backend_selection": "torch_learned_primary",
+                "backend_type": "torch_learned",
+                "backend_fallback_reason": "none",
+                "reveal_type": reveal_type,
+                "hidden_mode": plan.hidden_reconstruction_mode,
+                "tensor_batch_surface": serialize_tensor_batch(batch),
+                **out.backend_trace,
+            }, contract, out.confidence, out.uncertainty
         memory = renderer._active_memory or VideoMemory()
         proposal, proposal_trace = renderer._build_proposal(roi, memory, plan, delta)
         hidden_mode = plan.hidden_reconstruction_mode
@@ -246,6 +302,9 @@ class RevealRegionSynthesizer:
         return refined, {
             "module": "reveal_synthesizer",
             "operation": "reveal",
+            "backend_selection": "bootstrap_fallback" if renderer.learnable_backend_mode != "torch_learned" else "torch_learned_missing_checkpoint_fallback",
+            "backend_type": "bootstrap",
+            "backend_fallback_reason": "legacy_reveal_path",
             "hidden_region_slots_used": bool(memory.hidden_region_slots.get(plan.region_id)),
             "texture_patch_memory_used": bool(plan.retrieval_summary.get("candidates")),
             "reveal_type": reveal_type,
@@ -268,6 +327,39 @@ class NewEntityInserter:
         return fallback
 
     def insert(self, *, roi: list[list[list[float]]], decision: RenderRouteDecision, region: RegionRef) -> tuple[list[list[list[float]]], list[list[float]], list[list[float]], dict[str, object], float, InsertionPathContract]:
+        renderer = decision.insertion_context.get("_renderer")
+        if isinstance(renderer, PatchRenderer) and renderer.learnable_backend_mode == "torch_learned" and renderer.torch_backends.available and renderer.torch_backends.insertion is not None:
+            plan = decision.plan
+            batch = build_renderer_tensor_batch(
+                roi=roi,
+                path_type="insertion",
+                transition_mode=plan.transition_mode if plan else "stable",
+                hidden_mode=plan.hidden_reconstruction_mode if plan else "not_hidden",
+                retrieval_top_score=float((plan.retrieval_summary if plan else {}).get("top_score", 0.0)),
+                memory_hint_strength=0.5,
+            )
+            out = renderer.torch_backends.insertion.forward(batch)
+            contract = InsertionPathContract(
+                entity_type="torch_conditioned_entity",
+                pose_role="contextual",
+                context_conditioning_score=0.66,
+                reusable_artifact_expected=True,
+                alpha_semantics="torch_predicted_alpha",
+                uncertainty_semantics="torch_predicted_uncertainty",
+                training_tags=["insert", "torch_learned"],
+            )
+            trace = {
+                "module": "new_entity_inserter",
+                "operation": "insert_new",
+                "backend_selection": "torch_learned_primary",
+                "backend_type": "torch_learned",
+                "backend_fallback_reason": "none",
+                "learned_ready_interface": True,
+                "tensor_batch_surface": serialize_tensor_batch(batch),
+                "insertion_metadata": {"target_region": region.region_id, "context_score": 0.66},
+                **out.backend_trace,
+            }
+            return out.rgb, out.alpha, out.uncertainty, trace, out.confidence, contract
         h, w, c = shape(roi)
         out = zeros(h, w, c)
         base = mean_color(roi)
@@ -316,6 +408,9 @@ class NewEntityInserter:
         trace = {
             "module": "new_entity_inserter",
             "operation": "insert_new",
+            "backend_selection": "bootstrap_fallback" if not isinstance(renderer, PatchRenderer) or renderer.learnable_backend_mode != "torch_learned" else "torch_learned_missing_checkpoint_fallback",
+            "backend_type": "bootstrap",
+            "backend_fallback_reason": "legacy_insert_path",
             "bootstrap_mode": "renderer_local_insert_bootstrap",
             "learned_ready_interface": True,
             "insert_confidence_semantics": "context_conditioned_local_renderer",
@@ -340,7 +435,7 @@ class LayeredCompositingSupport:
 class PatchRenderer:
     """Plan-driven ROI renderer с property-driven hidden policy и explainability."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, learnable_backend_mode: str = "bootstrap", torch_checkpoint_dir: str | None = None, torch_device: str = "cpu") -> None:
         self.memory_manager = MemoryManager()
         self.confidence_estimator = PatchConfidenceEstimator()
         self.mode_router = RegionModeRouter()
@@ -348,6 +443,11 @@ class PatchRenderer:
         self.reveal_synthesizer = RevealRegionSynthesizer()
         self.new_entity_inserter = NewEntityInserter()
         self.layering = LayeredCompositingSupport()
+        self.learnable_backend_mode = learnable_backend_mode
+        self.torch_backends = TorchRendererBackendBundle(device=torch_device)
+        self.torch_checkpoint_trace = {"loaded": [], "missing": [], "mode": learnable_backend_mode}
+        if learnable_backend_mode == "torch_learned" and torch_checkpoint_dir:
+            self.torch_checkpoint_trace = self.torch_backends.load_checkpoint(torch_checkpoint_dir)
         self._active_memory: VideoMemory | None = None
 
     def _bbox_to_pixels(self, bbox: BBox, frame: list) -> tuple[int, int, int, int]:
@@ -917,6 +1017,7 @@ class PatchRenderer:
             roi = zeros(32, 32, 3)
         self._active_memory = memory
         decision = self.mode_router.route(self, scene_graph=scene_graph, delta=delta, memory=memory, region=region, roi=roi)
+        decision.insertion_context["_renderer"] = self
         plan = decision.plan or self._build_plan(scene_graph, delta, memory, region, roi)
         confidence_payload = self._estimate_confidence(plan)
         learnable_surface: dict[str, object] = {}
@@ -979,6 +1080,14 @@ class PatchRenderer:
                 "top_candidate_score_breakdown": plan.retrieval_summary.get("top_score_breakdown", {}),
             },
             "module_trace": module_trace,
+            "learnable_backend": {
+                "requested_mode": self.learnable_backend_mode,
+                "available": self.torch_backends.available,
+                "checkpoint_trace": self.torch_checkpoint_trace,
+                "selected_backend": module_trace.get("backend_selection", "bootstrap_fallback"),
+                "backend_type": module_trace.get("backend_type", "bootstrap"),
+                "fallback_reason": module_trace.get("backend_fallback_reason", "none"),
+            },
             "memory_dependency_summary": decision.memory_dependency,
             "entity_registration_summary": registration_summary,
             "confidence": confidence_payload["decomposition"],
