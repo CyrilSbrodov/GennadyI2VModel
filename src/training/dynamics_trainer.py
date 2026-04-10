@@ -257,7 +257,11 @@ class DynamicsTrainer(BaseTrainer):
 
         for batch in batches:
             family = str(batch.temporal_contract_conditioning.predicted_family if batch.temporal_contract_conditioning.predicted_family in FAMILIES else "pose_transition")
-            prediction = model.forward(dynamics_inputs_from_tensor_batch(batch.tensor_batch), family=family)
+            prediction = model.predict(
+                dynamics_inputs_from_tensor_batch(batch.tensor_batch),
+                family=family,
+                phase=batch.tensor_batch.phase,
+            )
             losses = model.compute_losses(prediction, batch.targets)
             for head in ("pose", "garment", "visibility", "expression", "interaction", "region"):
                 metrics[f"{head}_mse"] += float(losses[f"{head}_loss"])
@@ -269,7 +273,11 @@ class DynamicsTrainer(BaseTrainer):
             probe_ctx = dict(step_index=3.0, total_steps=4.0, phase="late", target_duration=2.0)
             probe_inputs = featurize_runtime(batch.graph_before, PlannedState(step_index=3, labels=batch.action_tokens + ["intensity=0.9"]), probe_ctx, None)
             probe_tensor = tensorize_dynamics_inputs(probe_inputs, family=family, phase="transition")
-            probe_pred = model.forward(dynamics_inputs_from_tensor_batch(probe_tensor), family=family)
+            probe_pred = model.predict(
+                dynamics_inputs_from_tensor_batch(probe_tensor),
+                family=family,
+                phase="transition",
+            )
             metrics["conditioning_sensitivity"] += float(abs(probe_pred.pose[0] - prediction.pose[0]))
             metrics["usable_sample_count"] += 1.0
             for group, present in batch.delta_groups.items():
