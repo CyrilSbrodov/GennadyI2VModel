@@ -126,7 +126,7 @@ def test_manifest_backed_dynamics_dataset_and_diagnostics(tmp_path: Path) -> Non
     ds = DynamicsDataset.from_transition_manifest(str(manifest), strict=False)
     assert len(ds) == 1
     assert ds.diagnostics["invalid_records"] == 1
-    assert ds.diagnostics["family_counts"]["pose"] == 1
+    assert ds.diagnostics["family_counts"]["pose_transition"] == 1
     sample = ds[0]
     batch = DynamicsDatasetAdapter.sample_to_batch(sample, step_index=2)
     assert batch.planner_context["phase"] == "transition"
