@@ -315,12 +315,12 @@ class DynamicsTrainer(BaseTrainer):
         train_surface = DynamicsDatasetSurface(
             samples=[DynamicsTrainingSample(tensor_batch=b.tensor_batch, targets=b.targets, graph_before=b.graph_before, action_tokens=b.action_tokens, source=b.graph_before_source) for b in train_batches],
             source=self.dataset_source,
-            diagnostics={"mode": "family_aware_surface", "bootstrap": self.dataset_source.startswith("synthetic")},
+            diagnostics={"mode": "family_aware_surface", "bootstrap": self.dataset_source.startswith("synthetic"), **(self.dataset_diagnostics or {})},
         )
         val_surface = DynamicsDatasetSurface(
             samples=[DynamicsTrainingSample(tensor_batch=b.tensor_batch, targets=b.targets, graph_before=b.graph_before, action_tokens=b.action_tokens, source=b.graph_before_source) for b in val_batches],
             source=self.dataset_source,
-            diagnostics={"mode": "family_aware_surface", "bootstrap": self.dataset_source.startswith("synthetic")},
+            diagnostics={"mode": "family_aware_surface", "bootstrap": self.dataset_source.startswith("synthetic"), **(self.dataset_diagnostics or {})},
         )
         train_metrics: dict[str, float] = {}
         for _ in range(config.epochs):

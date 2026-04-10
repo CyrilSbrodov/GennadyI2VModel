@@ -24,7 +24,6 @@ from core.schema import (
     SceneGraph,
     SceneObjectNode,
 )
-from dynamics.graph_delta_predictor import GraphDeltaPredictor
 from memory.video_memory import MemoryManager
 from perception.pipeline import ObjectFacts, PerceptionOutput, PerceptionPipeline, PersonFacts
 from representation.graph_builder import SceneGraphBuilder
@@ -366,97 +365,245 @@ class DynamicsDataset(BaseStageDataset):
 
     @classmethod
     def from_transition_manifest(cls, manifest_path: str, strict: bool = False) -> "DynamicsDataset":
-        records = json.loads(Path(manifest_path).read_text(encoding="utf-8")).get("records", [])
-        predictor = GraphDeltaPredictor()
+        payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        records = payload.get("records", [])
         out: list[TrainingSample] = []
         diagnostics: dict[str, object] = {
-            "source": "manifest_dynamics_transition",
+            "source": "manifest_dynamics_transition_primary",
             "manifest_path": manifest_path,
+            "manifest_type": payload.get("manifest_type", "dynamics_transition_manifest"),
             "total_records": len(records),
-            "loaded_records": 0,
+            "usable_samples": 0,
             "invalid_records": 0,
             "skipped_records": 0,
             "invalid_examples": [],
-            "family_counts": {"pose": 0, "garment": 0, "visibility": 0, "expression": 0, "interaction": 0, "region": 0},
-            "tag_counts": {},
+            "family_counts": {},
+            "phase_counts": {},
+            "transition_mode_counts": {},
+            "affected_region_coverage": {},
+            "region_coverage": {},
+            "source_modes": {"manifest_explicit": 0, "manifest_derived": 0},
+            "supervision_mode_counts": {"explicit": 0, "derived": 0},
+            "missing_optional_fields": {},
+            "notes_preview": [],
         }
         for idx, rec in enumerate(records):
             try:
                 if not isinstance(rec, dict):
                     raise ValueError("record must be json object")
-                if rec.get("memory_context") is not None and not isinstance(rec.get("memory_context"), dict):
-                    raise ValueError("memory_context must be object")
-                if rec.get("target_transition_context") is not None and not isinstance(rec.get("target_transition_context"), dict):
-                    raise ValueError("target_transition_context must be object")
-                person = PersonNode(person_id="person_1", track_id="track_1", bbox=BBox(0.2, 0.1, 0.6, 0.8), mask_ref=None)
-                sg_raw = rec.get("scene_graph")
-                if isinstance(sg_raw, dict):
-                    persons = sg_raw.get("persons", [])
-                    if isinstance(persons, list) and persons and isinstance(persons[0], dict):
-                        p0 = persons[0]
-                        bb = p0.get("bbox", {"x": 0.2, "y": 0.1, "w": 0.6, "h": 0.8})
-                        person = PersonNode(person_id=str(p0.get("person_id", "person_1")), track_id=str(p0.get("track_id", "track_1")), bbox=BBox(float(bb.get("x", 0.2)), float(bb.get("y", 0.1)), float(bb.get("w", 0.6)), float(bb.get("h", 0.8))), mask_ref=None)
-                prev = SceneGraph(frame_index=idx, persons=[person])
-                nxt = SceneGraph(frame_index=idx + 1, persons=[person])
-                action_labels = rec.get("labels", ["micro_adjust"])
-                if isinstance(rec.get("actions"), list) and rec["actions"]:
-                    action_labels = [str(a.get("type", "micro_adjust")) for a in rec["actions"] if isinstance(a, dict)]
-                if not isinstance(action_labels, list) or not action_labels:
-                    action_labels = ["micro_adjust"]
-                actions = [ActionStep(type=str(label), priority=i + 1) for i, label in enumerate(action_labels)]
+                legacy_upgraded = False
+                required = ("sample_id", "video_id", "frame_before_index", "frame_after_index", "family", "transition_mode", "phase")
+                missing_required = [field for field in required if field not in rec]
+                if missing_required:
+                    legacy_compatible = isinstance(rec.get("scene_graph"), dict) or isinstance(rec.get("graph_delta_target"), dict)
+                    if not legacy_compatible:
+                        raise ValueError(f"missing required fields: {', '.join(missing_required)}")
+                    graph_delta = rec.get("graph_delta_target", {}) if isinstance(rec.get("graph_delta_target"), dict) else {}
+                    inferred_family = "pose_transition"
+                    if graph_delta.get("garment_deltas"):
+                        inferred_family = "garment_transition"
+                    elif graph_delta.get("interaction_deltas"):
+                        inferred_family = "interaction_transition"
+                    elif graph_delta.get("expression_deltas"):
+                        inferred_family = "expression_transition"
+                    rec = dict(rec)
+                    rec.setdefault("sample_id", str(rec.get("record_id", f"legacy_{idx}")))
+                    rec.setdefault("video_id", str(rec.get("video_id", "legacy_video")))
+                    rec.setdefault("frame_before_index", int(idx))
+                    rec.setdefault("frame_after_index", int(idx + 1))
+                    rec.setdefault("family", inferred_family)
+                    rec.setdefault("transition_mode", "deform")
+                    rec.setdefault("phase", str((rec.get("planner_context") or {}).get("phase", "transition")) if isinstance(rec.get("planner_context"), dict) else "transition")
+                    rec.setdefault("state_before", {})
+                    rec.setdefault("state_after", {})
+                    legacy_upgraded = True
+                    diagnostics["missing_optional_fields"]["legacy_schema_upgrade"] = int(diagnostics["missing_optional_fields"].get("legacy_schema_upgrade", 0)) + 1
+                for field in ("memory_context", "target_transition_context", "planner_context"):
+                    if rec.get(field) is not None and not isinstance(rec.get(field), dict):
+                        raise ValueError(f"{field} must be object")
+
+                supervision_mode = str(rec.get("supervision_mode", "explicit" if isinstance(rec.get("graph_delta_target"), dict) else "derived")).strip().lower()
+                if supervision_mode not in {"explicit", "derived"}:
+                    raise ValueError(f"supervision_mode must be explicit|derived, got {supervision_mode}")
+
+                family = str(rec["family"]).strip().lower()
+                if family not in {"pose_transition", "garment_transition", "interaction_transition", "expression_transition"}:
+                    raise ValueError(f"family must be canonical, got {family}")
+                phase = str(rec["phase"]).strip().lower()
+                if phase not in cls.CANONICAL_PHASES:
+                    raise ValueError(f"phase must be canonical, got {phase}")
+                transition_mode = str(rec["transition_mode"]).strip().lower()
+                if not transition_mode:
+                    raise ValueError("transition_mode must be non-empty")
+
+                state_before = rec.get("state_before")
+                state_after = rec.get("state_after")
+                if not isinstance(state_before, dict) or not isinstance(state_after, dict):
+                    raise ValueError("state_before/state_after must be objects")
                 delta_raw = rec.get("graph_delta_target")
-                if isinstance(delta_raw, dict):
-                    delta = GraphDelta(
-                        pose_deltas={str(k): float(v) for k, v in (delta_raw.get("pose_deltas", {}) or {}).items()},
-                        garment_deltas={str(k): float(v) for k, v in (delta_raw.get("garment_deltas", {}) or {}).items()},
-                        visibility_deltas={str(k): str(v) for k, v in (delta_raw.get("visibility_deltas", {}) or {}).items()},
-                        expression_deltas={str(k): float(v) for k, v in (delta_raw.get("expression_deltas", {}) or {}).items()},
-                        interaction_deltas={str(k): float(v) for k, v in (delta_raw.get("interaction_deltas", {}) or {}).items()},
-                        affected_entities=[str(x) for x in delta_raw.get("affected_entities", [person.person_id])],
-                        affected_regions=[str(x) for x in delta_raw.get("affected_regions", [])],
-                        semantic_reasons=[str(x) for x in delta_raw.get("semantic_reasons", action_labels)],
-                        region_transition_mode={str(k): str(v) for k, v in (delta_raw.get("region_transition_mode", {}) or {}).items()},
-                        transition_phase=str(delta_raw.get("transition_phase", "mid")),
-                    )
-                    if not delta.region_transition_mode:
-                        delta.region_transition_mode = {"global": "stable"}
-                    if not delta.affected_regions:
-                        delta.affected_regions = ["torso"]
-                    if not (delta.pose_deltas or delta.garment_deltas or delta.visibility_deltas or delta.expression_deltas or delta.interaction_deltas):
-                        raise ValueError("graph_delta_target requires at least one delta group")
+                if supervision_mode == "explicit" and not isinstance(delta_raw, dict):
+                    raise ValueError("explicit mode requires graph_delta_target object")
+                if supervision_mode == "derived":
+                    delta_raw = _derive_graph_delta_target(state_before=state_before, state_after=state_after, family=family, phase=phase, transition_mode=transition_mode, record=rec)
+                if not isinstance(delta_raw, dict):
+                    raise ValueError("graph_delta_target must be object after derivation")
+
+                graph_before_raw = rec.get("scene_graph_before") if isinstance(rec.get("scene_graph_before"), dict) else rec.get("source_graph_before")
+                graph_after_raw = rec.get("scene_graph_after") if isinstance(rec.get("scene_graph_after"), dict) else rec.get("source_graph_after")
+                if isinstance(graph_before_raw, dict) and isinstance(graph_after_raw, dict):
+                    prev = _deserialize_graph(graph_before_raw)
+                    nxt = _deserialize_graph(graph_after_raw)
                 else:
-                    planned_state = type("_PS", (), {"labels": action_labels, "step_index": idx + 1})()
-                    delta, _ = predictor.predict(prev, planned_state)
+                    tracked_entity = str(rec.get("tracked_entity_id", "person_1"))
+                    person = PersonNode(person_id=tracked_entity, track_id=str(rec.get("track_id", f"track_{tracked_entity}")), bbox=BBox(0.2, 0.1, 0.6, 0.8), mask_ref=None)
+                    prev = SceneGraph(frame_index=int(rec.get("frame_before_index", idx)), persons=[person])
+                    nxt = SceneGraph(frame_index=int(rec.get("frame_after_index", idx + 1)), persons=[person])
+
+                action_tokens = rec.get("action_tokens")
+                if not isinstance(action_tokens, list) or not action_tokens:
+                    action_tokens = rec.get("labels", [])
+                if isinstance(rec.get("actions"), list) and rec["actions"]:
+                    action_tokens = [str(a.get("type", "micro_adjust")) for a in rec["actions"] if isinstance(a, dict)]
+                action_tokens = [str(x) for x in action_tokens] if isinstance(action_tokens, list) and action_tokens else ["micro_adjust"]
+                actions = [ActionStep(type=str(label), priority=i + 1) for i, label in enumerate(action_tokens)]
+
+                delta = GraphDelta(
+                    pose_deltas={str(k): float(v) for k, v in (delta_raw.get("pose_deltas", {}) or {}).items()},
+                    garment_deltas={str(k): float(v) for k, v in (delta_raw.get("garment_deltas", {}) or {}).items()},
+                    visibility_deltas={str(k): str(v) for k, v in (delta_raw.get("visibility_deltas", {}) or {}).items()},
+                    expression_deltas={str(k): float(v) for k, v in (delta_raw.get("expression_deltas", {}) or {}).items()},
+                    interaction_deltas={str(k): float(v) for k, v in (delta_raw.get("interaction_deltas", {}) or {}).items()},
+                    predicted_visibility_changes={str(k): str(v) for k, v in (delta_raw.get("predicted_visibility_changes", delta_raw.get("visibility_deltas", {})) or {}).items()},
+                    affected_entities=[str(x) for x in delta_raw.get("affected_entities", rec.get("affected_entities", [str(rec.get("tracked_entity_id", "scene"))]))],
+                    affected_regions=[str(x) for x in delta_raw.get("affected_regions", rec.get("affected_regions", []))],
+                    semantic_reasons=[str(x) for x in delta_raw.get("semantic_reasons", action_tokens)],
+                    region_transition_mode={str(k): str(v) for k, v in (delta_raw.get("region_transition_mode", rec.get("region_transition_mode", {})) or {}).items()},
+                    transition_phase=phase,
+                    state_before={str(k): str(v) for k, v in state_before.items()},
+                    state_after={str(k): str(v) for k, v in state_after.items()},
+                    transition_diagnostics={"supervision_mode": supervision_mode, "transition_mode": transition_mode},
+                )
+                delta.newly_revealed_regions = [RegionRef(region_id=str(x), bbox=BBox(0.0, 0.0, 1.0, 1.0), reason="manifest") for x in rec.get("newly_revealed_regions", []) if isinstance(x, str)]
+                delta.newly_occluded_regions = [RegionRef(region_id=str(x), bbox=BBox(0.0, 0.0, 1.0, 1.0), reason="manifest") for x in rec.get("newly_occluded_regions", []) if isinstance(x, str)]
+                if not delta.affected_regions:
+                    raise ValueError("affected_regions must be provided")
+                if not delta.region_transition_mode:
+                    raise ValueError("region_transition_mode must be provided")
+                family_group_checks = {
+                    "pose_transition": bool(delta.pose_deltas),
+                    "garment_transition": bool(delta.garment_deltas),
+                    "interaction_transition": bool(delta.interaction_deltas),
+                    "expression_transition": bool(delta.expression_deltas),
+                }
+                if not family_group_checks[family]:
+                    raise ValueError(f"{family} requires corresponding deltas")
+
+                planner_context = rec.get("planner_context", {}) if isinstance(rec.get("planner_context"), dict) else {}
+                target_profile = rec.get("target_profile", {}) if isinstance(rec.get("target_profile"), dict) else {}
+                reveal_score = float(rec.get("reveal_score", 1.0 if delta.newly_revealed_regions else 0.0))
+                occlusion_score = float(rec.get("occlusion_score", 1.0 if delta.newly_occluded_regions else 0.0))
+                support_contact_score = float(rec.get("support_contact_score", delta.interaction_deltas.get("support_contact", 0.0)))
+                temporal_features = rec.get("precomputed_temporal_transition_features")
+                if not isinstance(temporal_features, list):
+                    temporal_features = _build_temporal_transition_features(
+                        graph_before=prev,
+                        graph_after=nxt,
+                        roi_records=rec.get("roi_records", []) if isinstance(rec.get("roi_records"), list) else [],
+                        graph_delta_target=delta_raw,
+                        planner_context=planner_context,
+                        target_profile=target_profile,
+                        runtime_semantic_transition=family,
+                        phase_estimate=phase,
+                        reveal_score=reveal_score,
+                        occlusion_score=occlusion_score,
+                        support_score=support_contact_score,
+                        transition_confidence=float(rec.get("transition_confidence", 1.0)),
+                    )
+                human_features, human_target, human_history = _build_human_state_transition_payload(
+                    record=rec,
+                    graph_before=prev,
+                    graph_after=nxt,
+                    family=family,
+                    phase=phase,
+                    target_profile=target_profile,
+                    roi_records=rec.get("roi_records", []) if isinstance(rec.get("roi_records"), list) else [],
+                    planner_context=planner_context,
+                    graph_delta_target=delta_raw,
+                    has_previous_in_sequence=idx > 0,
+                )
                 graph_contract = {
                     "planner_context": {
-                        "step_index": float((rec.get("planner_context") or {}).get("step_index", idx + 1)) if isinstance(rec.get("planner_context"), dict) else float(idx + 1),
-                        "total_steps": float((rec.get("planner_context") or {}).get("total_steps", max(2, idx + 2))) if isinstance(rec.get("planner_context"), dict) else float(max(2, idx + 2)),
-                        "phase": str((rec.get("planner_context") or {}).get("phase", "mid")) if isinstance(rec.get("planner_context"), dict) else "mid",
-                        "target_duration": float((rec.get("planner_context") or {}).get("target_duration", 1.5)) if isinstance(rec.get("planner_context"), dict) else 1.5,
+                        "step_index": float(planner_context.get("step_index", idx + 1)),
+                        "total_steps": float(planner_context.get("total_steps", max(2, idx + 2))),
+                        "phase": phase,
+                        "target_duration": float(planner_context.get("target_duration", 1.5)),
                     },
                     "target_transition_context": rec.get("target_transition_context", {}) if isinstance(rec.get("target_transition_context"), dict) else {},
                     "memory_context": rec.get("memory_context", {}) if isinstance(rec.get("memory_context"), dict) else {},
-                    "metadata": {"record_id": rec.get("record_id", f"record_{idx}"), "tags": rec.get("tags", []), "notes": rec.get("notes", "")},
+                    "metadata": {
+                        "record_id": rec.get("sample_id", rec.get("record_id", f"record_{idx}")),
+                        "video_id": rec.get("video_id"),
+                        "transition_family": family,
+                        "transition_mode": transition_mode,
+                        "target_profile": target_profile,
+                        "supervision_mode": supervision_mode,
+                        "tags": rec.get("tags", []),
+                        "notes": rec.get("notes", ""),
+                        "source_graph_paths": {
+                            "before": rec.get("source_graph_path_before"),
+                            "after": rec.get("source_graph_path_after"),
+                            "before_frame": rec.get("source_frame_path_before"),
+                            "after_frame": rec.get("source_frame_path_after"),
+                        },
+                    },
                 }
-                out.append({"graphs": [prev, nxt], "actions": actions, "deltas": [delta], "source": rec.get("source", "transition_manifest"), "delta_contract": _serialize_delta_contract(delta), "graph_transition_contract": graph_contract})
-                diagnostics["loaded_records"] = int(diagnostics["loaded_records"]) + 1
-                diagnostics["family_counts"]["pose"] = int(diagnostics["family_counts"]["pose"]) + (1 if delta.pose_deltas else 0)
-                diagnostics["family_counts"]["garment"] = int(diagnostics["family_counts"]["garment"]) + (1 if delta.garment_deltas else 0)
-                diagnostics["family_counts"]["visibility"] = int(diagnostics["family_counts"]["visibility"]) + (1 if delta.visibility_deltas else 0)
-                diagnostics["family_counts"]["expression"] = int(diagnostics["family_counts"]["expression"]) + (1 if delta.expression_deltas else 0)
-                diagnostics["family_counts"]["interaction"] = int(diagnostics["family_counts"]["interaction"]) + (1 if delta.interaction_deltas else 0)
-                diagnostics["family_counts"]["region"] = int(diagnostics["family_counts"]["region"]) + (1 if delta.region_transition_mode else 0)
-                if isinstance(rec.get("tags"), list):
-                    for tag in rec["tags"]:
-                        k = str(tag).strip().lower()
-                        if k:
-                            diagnostics["tag_counts"][k] = int(diagnostics["tag_counts"].get(k, 0)) + 1
-            except ValueError as exc:
+                out.append(
+                    {
+                        "graphs": [prev, nxt],
+                        "actions": actions,
+                        "deltas": [delta],
+                        "source": rec.get("source", "manifest_dynamics_transition_primary"),
+                        "delta_contract": _serialize_delta_contract(delta),
+                        "graph_transition_contract": graph_contract,
+                        "temporal_transition_features": [float(x) for x in temporal_features],
+                        "temporal_transition_target": {
+                            "family": family,
+                            "phase": phase,
+                            "target_profile": target_profile,
+                            "reveal_score": reveal_score,
+                            "occlusion_score": occlusion_score,
+                            "support_contact_score": support_contact_score,
+                        },
+                        "human_state_transition_features": human_features,
+                        "human_state_transition_target": human_target,
+                        "human_state_history": human_history,
+                    }
+                )
+                diagnostics["usable_samples"] = int(diagnostics["usable_samples"]) + 1
+                diagnostics["family_counts"][family] = int(diagnostics["family_counts"].get(family, 0)) + 1
+                diagnostics["phase_counts"][phase] = int(diagnostics["phase_counts"].get(phase, 0)) + 1
+                diagnostics["transition_mode_counts"][transition_mode] = int(diagnostics["transition_mode_counts"].get(transition_mode, 0)) + 1
+                diagnostics["supervision_mode_counts"][supervision_mode] = int(diagnostics["supervision_mode_counts"].get(supervision_mode, 0)) + 1
+                sm_key = "manifest_explicit" if supervision_mode == "explicit" else "manifest_derived"
+                diagnostics["source_modes"][sm_key] = int(diagnostics["source_modes"].get(sm_key, 0)) + 1
+                if legacy_upgraded:
+                    diagnostics["source_modes"]["legacy_schema_upgrade"] = int(diagnostics["source_modes"].get("legacy_schema_upgrade", 0)) + 1
+                for region in delta.affected_regions:
+                    diagnostics["affected_region_coverage"][region] = int(diagnostics["affected_region_coverage"].get(region, 0)) + 1
+                    diagnostics["region_coverage"][region] = int(diagnostics["region_coverage"].get(region, 0)) + 1
+                for optional in ("planner_context", "target_profile", "planner_context_summary", "memory_context_summary", "planner_context", "segment_id"):
+                    if rec.get(optional) is None:
+                        diagnostics["missing_optional_fields"][optional] = int(diagnostics["missing_optional_fields"].get(optional, 0)) + 1
+                if len(diagnostics["notes_preview"]) < 5 and rec.get("notes"):
+                    diagnostics["notes_preview"].append(str(rec.get("notes")))
+            except Exception as exc:
                 diagnostics["invalid_records"] = int(diagnostics["invalid_records"]) + 1
+                diagnostics["skipped_records"] = int(diagnostics["skipped_records"]) + 1
                 if len(diagnostics["invalid_examples"]) < 8:
                     diagnostics["invalid_examples"].append({"index": idx, "reason": str(exc)})
                 if strict:
                     raise ValueError(f"dynamics manifest record {idx} invalid: {exc}") from exc
+        diagnostics["loaded_records"] = int(diagnostics["usable_samples"])
         ds = cls(samples=out)
         ds.diagnostics = diagnostics
         return ds
@@ -1499,6 +1646,60 @@ def _build_human_state_transition_payload(
             "previous_state_hint": prev_hint,
         },
     )
+
+
+def _derive_graph_delta_target(
+    *,
+    state_before: dict[str, object],
+    state_after: dict[str, object],
+    family: str,
+    phase: str,
+    transition_mode: str,
+    record: dict[str, object],
+) -> dict[str, object]:
+    def _float_delta(key: str) -> float:
+        before = state_before.get(key, 0.0)
+        after = state_after.get(key, before)
+        try:
+            return float(after) - float(before)
+        except Exception:
+            return 0.0
+
+    pose_deltas = {"torso_pitch": _float_delta("torso_pitch"), "head_yaw": _float_delta("head_yaw")}
+    garment_deltas = {"attachment_delta": _float_delta("garment_attachment"), "coverage_delta": _float_delta("garment_coverage"), "layer_shift": _float_delta("garment_layer_shift")}
+    expression_deltas = {"smile_intensity": _float_delta("smile_intensity"), "eye_openness": _float_delta("eye_openness")}
+    interaction_deltas = {
+        "support_contact": max(0.0, min(1.0, _float_delta("support_contact") + float(state_before.get("support_contact", 0.0)))),
+        "hand_contact": max(0.0, min(1.0, _float_delta("hand_contact") + float(state_before.get("hand_contact", 0.0)))),
+    }
+    visibility_after = state_after.get("visibility", {})
+    visibility_before = state_before.get("visibility", {})
+    visibility_deltas = visibility_after if isinstance(visibility_after, dict) else (visibility_before if isinstance(visibility_before, dict) else {})
+    predicted_visibility_changes = state_after.get("predicted_visibility_changes", visibility_deltas)
+    affected_regions = record.get("affected_regions", [])
+    if not isinstance(affected_regions, list) or not affected_regions:
+        affected_regions = (
+            ["face", "head"]
+            if family == "expression_transition"
+            else (["garments", "torso", "inner_garment"] if family == "garment_transition" else (["arms", "torso"] if family == "interaction_transition" else ["torso", "legs"]))
+        )
+    region_transition_mode = record.get("region_transition_mode", {})
+    if not isinstance(region_transition_mode, dict) or not region_transition_mode:
+        default_mode = "reveal" if transition_mode in {"reveal", "contact_or_reveal"} else ("occlude" if transition_mode in {"occlusion", "hide"} else "deform")
+        region_transition_mode = {str(region): default_mode for region in affected_regions}
+    return {
+        "pose_deltas": pose_deltas if family in {"pose_transition", "expression_transition"} else {},
+        "garment_deltas": garment_deltas if family == "garment_transition" else {},
+        "expression_deltas": expression_deltas if family == "expression_transition" else {},
+        "interaction_deltas": interaction_deltas if family == "interaction_transition" else {},
+        "visibility_deltas": {str(k): str(v) for k, v in visibility_deltas.items()},
+        "predicted_visibility_changes": {str(k): str(v) for k, v in predicted_visibility_changes.items()} if isinstance(predicted_visibility_changes, dict) else {},
+        "affected_entities": [str(x) for x in record.get("affected_entities", [str(record.get("tracked_entity_id", "scene"))])],
+        "affected_regions": [str(x) for x in affected_regions],
+        "semantic_reasons": [str(x) for x in record.get("action_tokens", [family])],
+        "region_transition_mode": {str(k): str(v) for k, v in region_transition_mode.items()},
+        "transition_phase": phase,
+    }
 
 
 def _build_temporal_transition_features(
