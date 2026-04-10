@@ -56,7 +56,11 @@ class FamilyAwareDynamicsTrainingModule:
         fam_counts: dict[str, float] = {}
         for sample in surface.samples:
             family = sample.tensor_batch.family
-            pred = model.forward(dynamics_inputs_from_tensor_batch(sample.tensor_batch), family=family)
+            pred = model.predict(
+                dynamics_inputs_from_tensor_batch(sample.tensor_batch),
+                family=family,
+                phase=sample.tensor_batch.phase,
+            )
             losses = model.compute_losses(pred, sample.targets)
             decoded = decode_prediction(pred, sample.graph_before, phase=sample.tensor_batch.phase, semantic_reasons=sample.action_tokens)
             fam_counts[family] = fam_counts.get(family, 0.0) + 1.0
