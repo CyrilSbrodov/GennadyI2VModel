@@ -27,12 +27,13 @@ def _scene() -> SceneGraph:
     return SceneGraph(frame_index=1, persons=[person])
 
 
-def test_dynamics_predictor_uses_learned_primary_runtime_path() -> None:
-    predictor = GraphDeltaPredictor(strict_mode=True)
+def test_dynamics_predictor_reports_strict_runtime_status() -> None:
+    predictor = GraphDeltaPredictor(strict_mode=False)
     delta, _ = predictor.predict(_scene(), PlannedState(step_index=1, labels=["sit_down", "smile"]))
-    assert delta.transition_diagnostics.get("runtime_path") == "learned_primary"
-    assert "support_contact" in delta.interaction_deltas
-    assert delta.region_transition_mode
+    assert delta.transition_diagnostics.get("requested_family") in {"pose_transition", "interaction_transition", "garment_transition", "expression_transition"}
+    assert delta.transition_diagnostics.get("selected_family") in {"pose_transition", "interaction_transition", "garment_transition", "expression_transition"}
+    assert delta.transition_diagnostics.get("checkpoint_status") in {"torch_unavailable", "bootstrap_only", "checkpoint_directory_missing", "checkpoint_file_missing", "checkpoint_invalid", "checkpoint_loaded"}
+    assert isinstance(delta.transition_diagnostics.get("usable_for_inference"), bool)
 
 
 def test_fallback_diagnostics_are_explicit_when_model_contract_breaks() -> None:

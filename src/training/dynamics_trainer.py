@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dynamics.model import DynamicsInputs, DynamicsModel, DynamicsTargets, decode_prediction, featurize_runtime, targets_from_delta
+from dynamics.model import FAMILIES, DynamicsInputs, DynamicsModel, DynamicsTargets, decode_prediction, dynamics_inputs_from_tensor_batch, featurize_runtime, targets_from_delta, tensorize_dynamics_inputs
 from dynamics.human_state_transition import HumanStateTransitionModel
 from dynamics.temporal_transition_encoder import PHASES, REGION_KEYS, TemporalTransitionEncoder
 from planning.transition_engine import PlannedState
@@ -15,6 +15,7 @@ from training.base_trainer import BaseTrainer
 from training.datasets import DynamicsDataset, TrainingSample
 from training.rollout_eval import evaluate_rollout_modes_on_video_manifest
 from training.types import StageResult, TrainingConfig
+from training.dynamics_family_training import DynamicsDatasetSurface, DynamicsTrainingSample, FamilyAwareDynamicsTrainingModule
 
 
 @dataclass(slots=True)
@@ -40,6 +41,7 @@ class DynamicsBatch:
     memory_context: dict[str, object]
     delta_groups: dict[str, float]
     temporal_contract_conditioning: TemporalContractConditioning
+    tensor_batch: object
 
 
 class DynamicsDatasetAdapter:
@@ -143,14 +145,16 @@ class DynamicsDatasetAdapter:
         inputs.target_features = (inputs.target_features + tail)[: len(inputs.target_features)]
 
         delta = sample.get("deltas", [])[0]
-        targets = targets_from_delta(delta)
+        family = str(selected.predicted_family if selected.predicted_family in FAMILIES else "pose_transition")
+        targets = targets_from_delta(delta, family=family)
+        tensor_batch = tensorize_dynamics_inputs(inputs, family=family, phase=str(selected.predicted_phase))
         return DynamicsBatch(
             inputs=inputs,
             targets=targets,
             graph_before=graph_before,
             graph_before_source=str(sample.get("source", "unknown")),
             action_tokens=action_tokens,
-            planner_context=planner_context,
+            planner_context=dict(planner_context, transition_family=family),
             target_transition_context=contract.get("target_transition_context", {}) if isinstance(contract, dict) else {},
             memory_context=contract.get("memory_context", {}) if isinstance(contract, dict) else {},
             delta_groups={
@@ -162,6 +166,7 @@ class DynamicsDatasetAdapter:
                 "region": 1.0 if delta.region_transition_mode else 0.0,
             },
             temporal_contract_conditioning=selected,
+            tensor_batch=tensor_batch,
         )
 
 
@@ -174,6 +179,7 @@ class DynamicsTrainer(BaseTrainer):
         self.temporal_encoder = TemporalTransitionEncoder()
         self.human_state_encoder = HumanStateTransitionModel()
         self.contract_conditioning_mode = "weak_contract_only"
+        self.family_trainer = FamilyAwareDynamicsTrainingModule()
 
     @staticmethod
     def _resolve_conditioning_mode(config: TrainingConfig, has_manifest: bool) -> str:
@@ -240,13 +246,18 @@ class DynamicsTrainer(BaseTrainer):
             "weak_contract_usage_ratio": 0.0,
             "temporal_to_dynamics_phase_consistency": 0.0,
             "temporal_to_dynamics_region_consistency": 0.0,
+            "pose_transition_samples": 0.0,
+            "garment_transition_samples": 0.0,
+            "interaction_transition_samples": 0.0,
+            "expression_transition_samples": 0.0,
         }
         if not batches:
             metrics["score"] = 0.0
             return metrics
 
         for batch in batches:
-            prediction = model.forward(batch.inputs)
+            family = str(batch.temporal_contract_conditioning.predicted_family if batch.temporal_contract_conditioning.predicted_family in FAMILIES else "pose_transition")
+            prediction = model.forward(dynamics_inputs_from_tensor_batch(batch.tensor_batch), family=family)
             losses = model.compute_losses(prediction, batch.targets)
             for head in ("pose", "garment", "visibility", "expression", "interaction", "region"):
                 metrics[f"{head}_mse"] += float(losses[f"{head}_loss"])
@@ -257,12 +268,14 @@ class DynamicsTrainer(BaseTrainer):
 
             probe_ctx = dict(step_index=3.0, total_steps=4.0, phase="late", target_duration=2.0)
             probe_inputs = featurize_runtime(batch.graph_before, PlannedState(step_index=3, labels=batch.action_tokens + ["intensity=0.9"]), probe_ctx, None)
-            probe_pred = model.forward(probe_inputs)
+            probe_tensor = tensorize_dynamics_inputs(probe_inputs, family=family, phase="transition")
+            probe_pred = model.forward(dynamics_inputs_from_tensor_batch(probe_tensor), family=family)
             metrics["conditioning_sensitivity"] += float(abs(probe_pred.pose[0] - prediction.pose[0]))
             metrics["usable_sample_count"] += 1.0
             for group, present in batch.delta_groups.items():
                 metrics[f"{group}_group_coverage"] += present
             csrc = batch.temporal_contract_conditioning.source
+            metrics[f"{family}_samples"] += 1.0
             is_learned = csrc in {"learned_temporal_contract", "learned_human_state_contract"}
             metrics["learned_contract_usage_ratio"] += 1.0 if is_learned else 0.0
             metrics["weak_contract_usage_ratio"] += 1.0 if csrc == "weak_manifest_bootstrap" else 0.0
@@ -299,23 +312,29 @@ class DynamicsTrainer(BaseTrainer):
         val_batches = self._iter_batches(val_dataset)
         model = DynamicsModel()
 
+        train_surface = DynamicsDatasetSurface(
+            samples=[DynamicsTrainingSample(tensor_batch=b.tensor_batch, targets=b.targets, graph_before=b.graph_before, action_tokens=b.action_tokens, source=b.graph_before_source) for b in train_batches],
+            source=self.dataset_source,
+            diagnostics={"mode": "family_aware_surface", "bootstrap": self.dataset_source.startswith("synthetic")},
+        )
+        val_surface = DynamicsDatasetSurface(
+            samples=[DynamicsTrainingSample(tensor_batch=b.tensor_batch, targets=b.targets, graph_before=b.graph_before, action_tokens=b.action_tokens, source=b.graph_before_source) for b in val_batches],
+            source=self.dataset_source,
+            diagnostics={"mode": "family_aware_surface", "bootstrap": self.dataset_source.startswith("synthetic")},
+        )
         train_metrics: dict[str, float] = {}
         for _ in range(config.epochs):
-            accum = {"pose_loss": 0.0, "garment_loss": 0.0, "visibility_loss": 0.0, "expression_loss": 0.0, "interaction_loss": 0.0, "region_loss": 0.0, "total_loss": 0.0}
-            learned_usage = 0.0
-            for batch in train_batches:
-                losses = model.train_step(batch.inputs, batch.targets, lr=config.learning_rate)
-                for key in accum:
-                    accum[key] += float(losses[key])
-                if batch.temporal_contract_conditioning.source in {"learned_temporal_contract", "learned_human_state_contract"}:
-                    learned_usage += 1.0
+            train_metrics = self.family_trainer.train_epoch(model, train_surface, lr=config.learning_rate)
+            learned_usage = float(sum(1.0 for b in train_batches if b.temporal_contract_conditioning.source in {"learned_temporal_contract", "learned_human_state_contract"}))
             weak_usage = float(sum(1.0 for b in train_batches if b.temporal_contract_conditioning.source == "weak_manifest_bootstrap"))
             denom = max(1.0, float(len(train_batches)))
-            train_metrics = {k.replace("_loss", ""): round(v / denom, 6) for k, v in accum.items()}
             train_metrics["learned_contract_usage_ratio"] = round(learned_usage / denom, 6)
             train_metrics["weak_contract_usage_ratio"] = round(weak_usage / denom, 6)
+            for fam in FAMILIES:
+                train_metrics[f"{fam}_batch_ratio"] = round(sum(1.0 for b in train_batches if b.targets.family == fam) / denom, 6)
 
         val_metrics = self._evaluate(model, val_batches)
+        val_metrics.update(self.family_trainer.validate_epoch(model, val_surface))
         val_metrics["score"] = round(max(0.0, 1.0 - val_metrics["pose_mse"]), 6)
         val_metrics["contract_conditioning_mode"] = self.contract_conditioning_mode
         if config.learned_dataset_path and self.dataset_source.startswith("manifest_video_dynamics_primary"):
@@ -354,7 +373,10 @@ class DynamicsTrainer(BaseTrainer):
                     "train_metrics": train_metrics,
                     "val_metrics": val_metrics,
                     "weights_path": str(weights_path),
+                    "runtime_compatible": True,
+                    "checkpoint_status": "trained",
                     "dataset_profile": {
+                        "surface_type": "DynamicsDatasetSurface",
                         "train_samples": len(train_dataset),
                         "val_samples": len(val_dataset),
                         "source": self.dataset_source,
