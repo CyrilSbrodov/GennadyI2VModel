@@ -11,7 +11,7 @@ from perception.frame_context import FrameLike, ensure_frame_context, unwrap_fra
 from perception.face import EmoNetFaceAnalyzerAdapter, FaceAnalyzer, FacePrediction
 from perception.objects import MonoDepthEstimator, ObjectDetector, ObjectPrediction, YoloObjectDetectorAdapter
 from perception.parser import HumanParser, ParserStackConfig, ParsingPrediction, SegFormerHumanParserAdapter
-from perception.pose import PoseEstimator, PosePrediction, VitPoseAdapter
+from perception.pose import MediaPipePoseAdapter, PoseEstimator, PosePrediction, VitPoseAdapter, YoloPoseAdapter
 from perception.profiling import StageTimer
 from perception.tracker import ByteTrackAdapter, PersonTracker, TrackPrediction
 from utils_tensor import shape
@@ -21,7 +21,7 @@ T = TypeVar("T")
 
 @dataclass(slots=True)
 class PerceptionBackendsConfig:
-    detector: BackendConfig = field(default_factory=lambda: BackendConfig(backend="builtin", checkpoint="yolov8n.pt"))
+    detector: BackendConfig = field(default_factory=lambda: BackendConfig(backend="builtin", checkpoint="yolov8n-seg.pt"))
     pose: BackendConfig = field(default_factory=lambda: BackendConfig(backend="builtin", checkpoint=""))
     parser: ParserStackConfig | BackendConfig = field(default_factory=ParserStackConfig)
     objects: BackendConfig = field(default_factory=lambda: BackendConfig(backend="builtin", checkpoint="yolov8n.pt"))
@@ -102,7 +102,14 @@ class PerceptionPipeline:
     ) -> None:
         cfg = backends or PerceptionBackendsConfig()
         self.detector = detector or YoloPersonDetectorAdapter(cfg.detector)
-        self.pose = pose or VitPoseAdapter(cfg.pose)
+        if pose is not None:
+            self.pose = pose
+        elif cfg.pose.backend in {"ultralytics", "yolo_pose"}:
+            self.pose = YoloPoseAdapter(cfg.pose)
+        elif cfg.pose.backend == "mediapipe":
+            self.pose = MediaPipePoseAdapter(cfg.pose)
+        else:
+            self.pose = VitPoseAdapter(cfg.pose)
         self.parser = parser or SegFormerHumanParserAdapter(cfg.parser)
         self.face = face or EmoNetFaceAnalyzerAdapter(cfg.face)
         self.objects = objects or YoloObjectDetectorAdapter(cfg.objects)
@@ -235,6 +242,7 @@ class PerceptionPipeline:
             out=out,
             success_mode=self._module_success_mode(self.parser),
         )
+        parser_module_confidence = max((pred.mask_confidence for pred in parsing_predictions.values()), default=0.0)
         face_predictions: dict[str, FacePrediction] = self._safe_module_call(
             lambda: self.face.analyze(frame_ctx, detection_out.persons),
             fallback_fn=(lambda: self._get_builtin_face_fallback().analyze(frame_ctx, detection_out.persons)) if self._backend_fallback_enabled(self.face) else None,
@@ -310,9 +318,9 @@ class PerceptionPipeline:
                     bbox=person.bbox,
                     bbox_confidence=person.confidence,
                     bbox_source=person.source,
-                    mask_ref=parsed.mask_ref if parsed else None,
-                    mask_confidence=parsed.mask_confidence if parsed else 0.0,
-                    mask_source=parsed.source if parsed else "fallback",
+                    mask_ref=(parsed.mask_ref if (parsed and parsed.mask_ref) else person.mask_ref),
+                    mask_confidence=(parsed.mask_confidence if (parsed and parsed.mask_ref) else person.mask_confidence),
+                    mask_source=(parsed.source if (parsed and parsed.mask_ref) else (person.mask_source or "fallback")),
                     pose=pose.pose if pose else PoseState(),
                     pose_confidence=pose.confidence if pose else 0.0,
                     pose_source=pose.source if pose else "fallback",
@@ -327,7 +335,7 @@ class PerceptionPipeline:
                     track_source=tracked.source if tracked else "fallback",
                     garments=garments,
                     hand_landmarks=pose.hand_landmarks if pose else {},
-                    face_landmarks=face.face_landmarks if face else [],
+                    face_landmarks=face.face_landmarks if face else (pose.face_landmarks if pose else []),
                     depth_order=person_depth,
                     occlusion_hints=(parsed.occlusion_hints if parsed else []),
                     body_parts=body_parts,
@@ -359,6 +367,7 @@ class PerceptionPipeline:
         out.module_confidence = {
             "detector": max([p.bbox_confidence for p in out.persons], default=0.0),
             "pose": max([p.pose_confidence for p in out.persons], default=0.0),
+            "parser": parser_module_confidence,
             "face": max([p.expression_confidence for p in out.persons], default=0.0),
             "tracker": max([p.track_confidence for p in out.persons], default=0.0),
             "objects": max([o.confidence for o in out.objects], default=0.0),

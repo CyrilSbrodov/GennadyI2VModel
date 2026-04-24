@@ -586,6 +586,7 @@ class ParserFusionEngine:
                 continue
             body_parts.append(BodyPartMaskPrediction(part, ref, conf, "visible" if conf >= 0.5 else "partially_visible", source))
             enriched.body_part_masks[part] = ref
+            enriched.visibility_hints[f"body:{part}"] = "visible" if conf >= 0.5 else "partially_visible"
             enriched.provenance_by_region[f"body:{part}"] = source
 
         garment_candidates = {
@@ -633,6 +634,7 @@ class ParserFusionEngine:
                 if ref:
                     enriched.garment_masks[g] = ref
                     enriched.coverage_hints[g] = [target]
+                    enriched.visibility_hints[f"garment:{g}"] = "visible" if conf >= 0.5 else "partially_visible"
                     enriched.provenance_by_region[f"garment:{g}"] = src
 
         for acc in ("bag", "hat", "glasses", "jewelry", "scarf", "belt"):
@@ -651,6 +653,7 @@ class ParserFusionEngine:
                 )
                 if ref:
                     enriched.accessory_masks[acc] = ref
+                    enriched.visibility_hints[f"accessory:{acc}"] = "visible" if conf >= 0.5 else "partially_visible"
                     enriched.provenance_by_region[f"accessory:{acc}"] = "parser:fashn"
 
         face_source = facer if facer.masks else AdapterSegmentationOutput(
@@ -676,6 +679,7 @@ class ParserFusionEngine:
                 continue
             face_regions.append(FaceRegionPrediction(canonical, ref, conf, src))
             enriched.face_region_masks[canonical] = ref
+            enriched.visibility_hints[f"face:{canonical}"] = "visible" if conf >= 0.5 else "partially_visible"
             enriched.provenance_by_region[f"face:{canonical}"] = src
 
         occlusion_hints = ["torso_visible" if "torso" in topology else "torso_hidden"]
