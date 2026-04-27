@@ -38,11 +38,32 @@ class HiddenRegionSummary:
 
 
 @dataclass(slots=True)
+class CanonicalRegionMemorySummary:
+    record_id: str
+    canonical_region: str
+    memory_kind: str
+    visibility_state: str
+    confidence: float
+    evidence_score: float
+    evidence_quality: str
+    observed_directly: bool
+    inferred: bool
+    generated: bool
+    reliable_for_reuse: bool
+    suitable_for_reveal: bool
+    freshness_frames: int
+    reveal_lifecycle: str
+    source_frame: int
+    last_transition: str
+
+
+@dataclass(slots=True)
 class AppearanceMemorySummary:
     identity: dict[str, IdentitySummary] = field(default_factory=dict)
     garments: dict[str, GarmentSummary] = field(default_factory=dict)
     body_regions: dict[str, BodyRegionSummary] = field(default_factory=dict)
     hidden_regions: dict[str, HiddenRegionSummary] = field(default_factory=dict)
+    canonical_regions: dict[str, CanonicalRegionMemorySummary] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -50,6 +71,7 @@ class AppearanceMemorySummary:
             "garments": {k: asdict(v) for k, v in self.garments.items()},
             "body_regions": {k: asdict(v) for k, v in self.body_regions.items()},
             "hidden_regions": {k: asdict(v) for k, v in self.hidden_regions.items()},
+            "canonical_regions": {k: asdict(v) for k, v in self.canonical_regions.items()},
         }
 
 
@@ -83,4 +105,31 @@ class AppearanceMemorySummarizer:
             )
             for region_id, slot in memory.hidden_region_slots.items()
         }
-        return AppearanceMemorySummary(identity=identity, garments=garments, body_regions=body_regions, hidden_regions=hidden_regions)
+        canonical_regions = {
+            rec_id: CanonicalRegionMemorySummary(
+                record_id=rec.record_id,
+                canonical_region=rec.canonical_region,
+                memory_kind=rec.memory_kind,
+                visibility_state=str(rec.visibility_state),
+                confidence=rec.confidence,
+                evidence_score=rec.evidence_score,
+                evidence_quality=rec.evidence_quality,
+                observed_directly=rec.observed_directly,
+                inferred=rec.inferred,
+                generated=rec.generated,
+                reliable_for_reuse=rec.reliable_for_reuse,
+                suitable_for_reveal=rec.suitable_for_reveal,
+                freshness_frames=rec.freshness_frames,
+                reveal_lifecycle=rec.reveal_lifecycle,
+                source_frame=rec.source_frame,
+                last_transition=rec.last_transition,
+            )
+            for rec_id, rec in memory.canonical_region_memory.items()
+        }
+        return AppearanceMemorySummary(
+            identity=identity,
+            garments=garments,
+            body_regions=body_regions,
+            hidden_regions=hidden_regions,
+            canonical_regions=canonical_regions,
+        )
