@@ -339,6 +339,32 @@ class HiddenRegionSlot:
     last_transition_reason: str = "none"
 
 
+
+
+@dataclass(slots=True)
+class CanonicalRegionMemoryEntry:
+    record_id: str
+    entity_id: str
+    canonical_region: str
+    memory_kind: str
+    mask_ref: str | None = None
+    region_ref: str | None = None
+    confidence: float = 0.0
+    visibility_state: VisibilityState | str = "unknown_expected_region"
+    provenance: str = "unknown"
+    source_frame: int = 0
+    evidence_score: float = 0.0
+    evidence_quality: str = "weak"
+    observed_directly: bool = False
+    inferred: bool = False
+    generated: bool = False
+    reliable_for_reuse: bool = False
+    suitable_for_reveal: bool = False
+    freshness_frames: int = 0
+    last_observed_frame: int | None = None
+    reveal_lifecycle: str = "unknown"
+    last_transition: str = "stable"
+
 @dataclass(slots=True)
 class PlannerDiagnostics:
     skipped_actions: list[str] = field(default_factory=list)
@@ -357,4 +383,5 @@ class VideoMemory:
     texture_patches: dict[str, TexturePatchMemory] = field(default_factory=dict)
     region_descriptors: dict[str, RegionDescriptor] = field(default_factory=dict)
     hidden_region_slots: dict[str, HiddenRegionSlot] = field(default_factory=dict)
+    canonical_region_memory: dict[str, CanonicalRegionMemoryEntry] = field(default_factory=dict)
     last_transition_context: dict[str, str] = field(default_factory=dict)

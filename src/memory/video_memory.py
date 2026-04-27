@@ -8,6 +8,7 @@ from core.semantic_roi import SemanticROIHelper
 from core.region_ids import make_region_id, parse_region_id
 from core.schema import (
     BBox,
+    CanonicalRegionMemoryEntry,
     GarmentSemanticProfile,
     HiddenRegionSlot,
     MemoryEntry,
@@ -20,7 +21,39 @@ from utils_tensor import crop, mean_color, shape
 
 
 class MemoryManager:
+    _CANONICAL_MEMORY_REGIONS = (
+        "face",
+        "hair",
+        "head",
+        "neck",
+        "torso",
+        "left_arm",
+        "right_arm",
+        "left_hand",
+        "right_hand",
+        "pelvis",
+        "left_leg",
+        "right_leg",
+        "upper_garment",
+        "lower_garment",
+        "outer_garment",
+        "inner_garment",
+        "accessories",
+    )
     _SEMANTIC_REGIONS = ("face", "torso", "sleeves", "garments", "left_arm", "right_arm", "pelvis", "legs")
+    _PROVENANCE_RELIABILITY = {
+        "parser": 0.9,
+        "segformer": 0.88,
+        "schp": 0.84,
+        "fashn": 0.8,
+        "face": 0.78,
+        "canonical_reasoner": 0.72,
+        "visibility_reasoner": 0.7,
+        "heuristic": 0.62,
+        "frame_observation": 0.82,
+        "generated": 0.35,
+        "unknown": 0.5,
+    }
 
     def __init__(self) -> None:
         self.roi = SemanticROIHelper()
@@ -173,6 +206,7 @@ class MemoryManager:
         for person in scene_graph.persons:
             memory.identity_memory[person.person_id] = MemoryEntry(entity_id=person.person_id, entry_type="identity", embedding=self._encode_visual(f"identity:{person.person_id}"), confidence=person.confidence, last_seen_frames=[scene_graph.frame_index])
             self._seed_person_semantic_regions(memory, person.person_id, person.bbox, scene_graph.frame_index)
+            self._update_canonical_region_memory(memory, person, scene_graph.frame_index)
             for garment in person.garments:
                 memory.garment_memory[garment.garment_id] = MemoryEntry(entity_id=garment.garment_id, entry_type="garment", embedding=self._encode_visual(f"garment:{garment.garment_id}"), confidence=garment.confidence, last_seen_frames=[scene_graph.frame_index])
         return memory
@@ -182,6 +216,9 @@ class MemoryManager:
 
     def update_from_graph(self, memory: VideoMemory, scene_graph: SceneGraph) -> VideoMemory:
         memory.temporal_history.append(scene_graph)
+        for record in memory.canonical_region_memory.values():
+            record.freshness_frames += 1
+            self._refresh_reuse_policy(record)
         observed_entities: set[str] = set()
         visible_regions: set[str] = set()
         for person in scene_graph.persons:
@@ -189,6 +226,7 @@ class MemoryManager:
             identity = memory.identity_memory.get(person.person_id)
             if identity is not None:
                 self._refresh_entry(identity, scene_graph.frame_index)
+            self._update_canonical_region_memory(memory, person, scene_graph.frame_index)
             for part in person.body_parts:
                 region_id = make_region_id(person.person_id, part.part_type)
                 if part.visibility in ("visible", "partially_visible"):
@@ -263,6 +301,16 @@ class MemoryManager:
                 if descriptor:
                     descriptor.last_update_frame = scene_graph.frame_index
                     descriptor.confidence = min(1.0, descriptor.confidence * (1.0 - 0.2 * confidence_boost) + 0.2 * evidence)
+                self._refresh_canonical_memory_from_descriptor(
+                    memory=memory,
+                    entity_id=person.person_id,
+                    canonical_region=region_type,
+                    source_frame=scene_graph.frame_index,
+                    evidence_score=min(1.0, evidence),
+                    confidence=min(1.0, 0.35 + person.confidence * 0.25 + evidence * confidence_boost),
+                    observed_directly=True,
+                    generated=False,
+                )
 
                 identity = memory.identity_memory.get(person.person_id)
                 if identity is not None:
@@ -352,6 +400,21 @@ class MemoryManager:
             slot.stale_frames += 1
             target_state = "unknown_hidden" if not slot.candidate_patch_ids else slot.hidden_type
             self.transition_hidden_slot(slot, target_state, reason=f"hidden:{transition_reason}")
+        canonical_region = self._canonical_from_region_type(region_type)
+        if canonical_region:
+            record = memory.canonical_region_memory.get(make_region_id(owner, canonical_region))
+            if record is not None:
+                previous = str(record.visibility_state)
+                if visibility == "revealed":
+                    record.visibility_state = "visible"
+                    record.reveal_lifecycle = "newly_revealed" if previous not in {"visible", "partially_visible"} else "visible"
+                    record.last_transition = "hidden_to_visible"
+                    record.freshness_frames = 0
+                elif visibility == "hidden":
+                    record.visibility_state = "hidden"
+                    record.reveal_lifecycle = "newly_occluded" if previous in {"visible", "partially_visible"} else "currently_hidden"
+                    record.last_transition = "visible_to_hidden"
+                self._refresh_reuse_policy(record)
         self._promote_or_decay_hidden_slot(slot)
 
     def retrieve(self, memory: VideoMemory, query_embedding: list[float], bank: str = "texture", top_k: int = 3) -> list[dict[str, object]]:
@@ -386,6 +449,64 @@ class MemoryManager:
         if not candidates:
             return None
         return max(candidates, key=lambda c: (c.confidence, c.evidence_score))
+
+    def get_region_memory_entries(
+        self,
+        memory: VideoMemory,
+        entity_id: str | None = None,
+        canonical_region: str | None = None,
+    ) -> list[CanonicalRegionMemoryEntry]:
+        entries = list(memory.canonical_region_memory.values())
+        if entity_id is not None:
+            entries = [e for e in entries if e.entity_id == entity_id]
+        if canonical_region is not None:
+            entries = [e for e in entries if e.canonical_region == canonical_region]
+        return sorted(entries, key=lambda e: (e.entity_id, e.canonical_region, e.source_frame))
+
+    def get_best_region_memory(
+        self,
+        memory: VideoMemory,
+        entity_id: str,
+        canonical_region: str,
+        *,
+        for_reveal: bool = False,
+    ) -> CanonicalRegionMemoryEntry | None:
+        rid = make_region_id(entity_id, canonical_region)
+        entry = memory.canonical_region_memory.get(rid)
+        if entry is None:
+            return None
+        if for_reveal and not entry.suitable_for_reveal:
+            return None
+        return entry
+
+    def debug_canonical_memory(self, memory: VideoMemory, entity_id: str | None = None) -> dict[str, object]:
+        entries = self.get_region_memory_entries(memory, entity_id=entity_id)
+        return {
+            "regions": [
+                {
+                    "record_id": e.record_id,
+                    "entity_id": e.entity_id,
+                    "canonical_region": e.canonical_region,
+                    "kind": e.memory_kind,
+                    "visibility_state": e.visibility_state,
+                    "reveal_lifecycle": e.reveal_lifecycle,
+                    "confidence": round(e.confidence, 4),
+                    "evidence_score": round(e.evidence_score, 4),
+                    "evidence_quality": e.evidence_quality,
+                    "observed_directly": e.observed_directly,
+                    "inferred": e.inferred,
+                    "generated": e.generated,
+                    "reliable_for_reuse": e.reliable_for_reuse,
+                    "suitable_for_reveal": e.suitable_for_reveal,
+                    "freshness_frames": e.freshness_frames,
+                    "source_frame": e.source_frame,
+                    "last_observed_frame": e.last_observed_frame,
+                    "provenance": e.provenance,
+                    "last_transition": e.last_transition,
+                }
+                for e in entries
+            ]
+        }
 
     def route_region_retrieval(
             self,
@@ -602,6 +723,8 @@ class MemoryManager:
             memory.texture_patches[key] = TexturePatchMemory(**value)
         for key, value in (payload.get("hidden_region_slots") or {}).items():
             memory.hidden_region_slots[key] = HiddenRegionSlot(**value)
+        for key, value in (payload.get("canonical_region_memory") or {}).items():
+            memory.canonical_region_memory[key] = CanonicalRegionMemoryEntry(**value)
         for key, value in (payload.get("region_descriptors") or {}).items():
             bbox = BBox(**value["bbox"])
             memory.region_descriptors[key] = RegionDescriptor(**{**value, "bbox": bbox})
@@ -651,6 +774,285 @@ class MemoryManager:
             patch_id = f"patch::{region_id}"
             memory.texture_patches[patch_id] = TexturePatchMemory(patch_id=patch_id, region_type=region_type, entity_id=person_id, source_frame=frame_index, patch_ref=f"seed://{region_id}", confidence=0.5, descriptor={}, evidence_score=0.2)
             memory.hidden_region_slots[region_id] = HiddenRegionSlot(slot_id=region_id, region_type=region_type, owner_entity=person_id, candidate_patch_ids=[patch_id], confidence=0.45, hidden_type="known_hidden" if region_type in {"sleeves", "garments", "legs"} else "unknown_hidden", evidence_score=0.2)
+
+    def _canonical_from_region_type(self, region_type: str) -> str | None:
+        direct = {
+            "face": "face",
+            "hair": "hair",
+            "head": "head",
+            "neck": "neck",
+            "torso": "torso",
+            "left_arm": "left_arm",
+            "right_arm": "right_arm",
+            "left_hand": "left_hand",
+            "right_hand": "right_hand",
+            "pelvis": "pelvis",
+            "left_leg": "left_leg",
+            "right_leg": "right_leg",
+            "upper_garment": "upper_garment",
+            "lower_garment": "lower_garment",
+            "outer_garment": "outer_garment",
+            "inner_garment": "inner_garment",
+            "accessories": "accessories",
+            "garments": "upper_garment",
+            "sleeves": "upper_garment",
+            "legs": "left_leg",
+        }
+        canonical = direct.get(region_type)
+        if canonical in self._CANONICAL_MEMORY_REGIONS:
+            return canonical
+        return None
+
+    def _memory_kind_for_region(self, canonical_region: str) -> str:
+        if canonical_region in {"face", "hair", "head", "neck"}:
+            return "identity"
+        if canonical_region in {"upper_garment", "lower_garment", "outer_garment", "inner_garment"}:
+            return "garment"
+        if canonical_region == "accessories":
+            return "accessory"
+        return "body"
+
+    def _visibility_to_reveal_lifecycle(self, visibility: str) -> str:
+        if visibility in {"visible", "partially_visible"}:
+            return "currently_visible"
+        if visibility in {"hidden", "hidden_by_garment", "hidden_by_object", "hidden_by_self", "out_of_frame"}:
+            return "currently_hidden"
+        if visibility == "unknown_expected_region":
+            return "expected_unknown"
+        return "unknown"
+
+    def _evidence_quality(self, evidence_score: float, visibility: str, observed_directly: bool) -> str:
+        if not observed_directly:
+            return "inferred"
+        if visibility == "visible" and evidence_score >= 0.72:
+            return "strong"
+        if visibility in {"visible", "partially_visible"} and evidence_score >= 0.45:
+            return "medium"
+        return "weak"
+
+    def _provenance_reliability(self, provenance: str) -> float:
+        key = provenance.lower().split(":")[0] if provenance else "unknown"
+        return float(self._PROVENANCE_RELIABILITY.get(key, self._PROVENANCE_RELIABILITY["unknown"]))
+
+    def _resolve_visibility_state(
+        self,
+        *,
+        existing_visibility: str | None,
+        observed_visibility: str,
+        evidence_score: float,
+        observed_directly: bool,
+    ) -> str:
+        prev = existing_visibility or "unknown_expected_region"
+        vis = observed_visibility
+        if observed_directly and vis in {"visible", "partially_visible"}:
+            return vis
+        if prev in {"hidden", "hidden_by_garment", "hidden_by_object", "hidden_by_self"} and vis in {"visible", "partially_visible"} and evidence_score >= 0.42:
+            return vis
+        if vis in {"hidden", "hidden_by_garment", "hidden_by_object", "hidden_by_self", "out_of_frame"} and evidence_score >= 0.4:
+            return vis
+        if vis == "unknown_expected_region" and prev in {"visible", "partially_visible"} and evidence_score < 0.35:
+            return prev
+        if evidence_score >= 0.5:
+            return vis
+        return prev
+
+    def _refresh_reuse_policy(self, entry: CanonicalRegionMemoryEntry) -> None:
+        visibility_ok = str(entry.visibility_state) in {"visible", "partially_visible"}
+        fresh_bonus = 1.0 if entry.freshness_frames <= 2 else (0.75 if entry.freshness_frames <= 6 else 0.45)
+        stale_penalty = 0.22 if entry.freshness_frames > 8 else 0.0
+        inferred_penalty = 0.24 if entry.inferred else 0.0
+        generated_penalty = 0.35 if entry.generated else 0.0
+        lifecycle_penalty = 0.18 if entry.reveal_lifecycle in {"newly_occluded", "currently_hidden", "expected_unknown"} else 0.0
+        provenance_factor = self._provenance_reliability(entry.provenance)
+        reuse_score = (
+            0.42 * entry.confidence
+            + 0.35 * entry.evidence_score
+            + 0.16 * provenance_factor
+            + 0.12 * fresh_bonus
+            - stale_penalty
+            - inferred_penalty
+            - generated_penalty
+            - lifecycle_penalty
+        )
+        entry.reliable_for_reuse = bool(
+            visibility_ok
+            and entry.observed_directly
+            and not entry.generated
+            and not entry.inferred
+            and reuse_score >= 0.66
+        )
+        entry.suitable_for_reveal = bool(
+            entry.reliable_for_reuse
+            and entry.evidence_score >= 0.52
+            and entry.freshness_frames <= 8
+            and entry.reveal_lifecycle not in {"newly_occluded", "expected_unknown"}
+        )
+
+    def _derive_observation_semantics(
+        self,
+        *,
+        canonical_name: str,
+        visibility: str,
+        confidence: float,
+        provenance: str,
+        mask_ref: str | None,
+        source_regions: list[str],
+        source_signals: list[str],
+    ) -> tuple[bool, bool, float]:
+        provenance_rel = self._provenance_reliability(provenance)
+        has_mask = bool(mask_ref)
+        has_specific_source_region = any(str(s).strip().lower() not in {"", canonical_name, "unknown", "aggregate"} for s in source_regions)
+        has_signal = bool(source_signals)
+        visibility_factor = 1.0 if visibility == "visible" else (0.72 if visibility == "partially_visible" else 0.38)
+        direct_support = (
+            0.34 * confidence
+            + 0.24 * provenance_rel
+            + (0.2 if has_mask else 0.0)
+            + (0.12 if has_specific_source_region else 0.0)
+            + (0.08 if has_signal else 0.0)
+            + (0.1 if visibility == "visible" else 0.0)
+        )
+        observed_directly = bool(
+            visibility in {"visible", "partially_visible"}
+            and has_mask
+            and provenance_rel >= 0.6
+            and direct_support >= (0.72 if visibility == "visible" else 0.82)
+        )
+        inferred = not observed_directly
+        evidence_score = min(1.0, max(0.0, confidence * visibility_factor * (0.75 + 0.25 * provenance_rel) + (0.12 if has_mask else 0.0)))
+        if inferred:
+            evidence_score *= 0.78
+        return observed_directly, inferred, evidence_score
+
+    def _entry_strength(self, entry: CanonicalRegionMemoryEntry) -> float:
+        quality_bonus = {"strong": 0.35, "medium": 0.2, "weak": 0.08, "inferred": 0.02}.get(entry.evidence_quality, 0.0)
+        visibility_bonus = {"visible": 0.3, "partially_visible": 0.15, "hidden": -0.15, "unknown_expected_region": -0.25}.get(str(entry.visibility_state), 0.0)
+        return float(entry.confidence + 0.7 * entry.evidence_score + quality_bonus + visibility_bonus - 0.06 * entry.freshness_frames)
+
+    def _update_canonical_region_memory(self, memory: VideoMemory, person: object, frame_index: int) -> None:
+        canonical_regions = getattr(person, "canonical_regions", {}) or {}
+        for canonical_name in self._CANONICAL_MEMORY_REGIONS:
+            raw = canonical_regions.get(canonical_name, {}) if isinstance(canonical_regions, dict) else {}
+            visibility = str(raw.get("visibility_state", "unknown_expected_region"))
+            confidence = float(raw.get("confidence", 0.0))
+            provenance = str(raw.get("provenance", "unknown"))
+            source_regions = [str(v) for v in raw.get("source_regions", [])] if isinstance(raw.get("source_regions", []), list) else []
+            source_signals = [str(v) for v in raw.get("raw_sources", [])] if isinstance(raw.get("raw_sources", []), list) else []
+            observed_directly, inferred, evidence_score = self._derive_observation_semantics(
+                canonical_name=canonical_name,
+                visibility=visibility,
+                confidence=confidence,
+                provenance=provenance,
+                mask_ref=raw.get("mask_ref"),
+                source_regions=source_regions,
+                source_signals=source_signals,
+            )
+            existing = memory.canonical_region_memory.get(make_region_id(person.person_id, canonical_name))
+            resolved_visibility = self._resolve_visibility_state(
+                existing_visibility=(str(existing.visibility_state) if existing else None),
+                observed_visibility=visibility,
+                evidence_score=evidence_score,
+                observed_directly=observed_directly,
+            )
+            entry = CanonicalRegionMemoryEntry(
+                record_id=make_region_id(person.person_id, canonical_name),
+                entity_id=person.person_id,
+                canonical_region=canonical_name,
+                memory_kind=self._memory_kind_for_region(canonical_name),
+                mask_ref=raw.get("mask_ref"),
+                region_ref=make_region_id(person.person_id, canonical_name),
+                confidence=confidence,
+                visibility_state=resolved_visibility,
+                provenance=provenance,
+                source_frame=frame_index,
+                evidence_score=evidence_score,
+                evidence_quality=self._evidence_quality(evidence_score, resolved_visibility, observed_directly),
+                observed_directly=observed_directly,
+                inferred=inferred,
+                generated=False,
+                reliable_for_reuse=False,
+                suitable_for_reveal=False,
+                freshness_frames=0,
+                last_observed_frame=(frame_index if observed_directly else None),
+                reveal_lifecycle=self._visibility_to_reveal_lifecycle(resolved_visibility),
+                last_transition="stable",
+            )
+            self._refresh_reuse_policy(entry)
+            self._upsert_canonical_memory(memory, entry)
+
+    def _upsert_canonical_memory(self, memory: VideoMemory, candidate: CanonicalRegionMemoryEntry) -> None:
+        current = memory.canonical_region_memory.get(candidate.record_id)
+        if current is None:
+            memory.canonical_region_memory[candidate.record_id] = candidate
+            return
+        candidate_strength = self._entry_strength(candidate)
+        current_strength = self._entry_strength(current)
+        current.freshness_frames = max(0, candidate.source_frame - current.source_frame)
+        if candidate_strength >= current_strength + 0.02 or (
+            candidate.source_frame > current.source_frame and candidate.observed_directly and current.generated
+        ) or (
+            str(current.visibility_state) in {"hidden", "hidden_by_garment", "hidden_by_object", "hidden_by_self", "unknown_expected_region"}
+            and str(candidate.visibility_state) in {"visible", "partially_visible"}
+            and candidate.observed_directly
+            and candidate.evidence_score >= 0.45
+        ):
+            candidate.last_transition = "refresh"
+            memory.canonical_region_memory[candidate.record_id] = candidate
+        else:
+            current.freshness_frames = max(0, candidate.source_frame - current.source_frame)
+            self._refresh_reuse_policy(current)
+
+    def _refresh_canonical_memory_from_descriptor(
+        self,
+        memory: VideoMemory,
+        entity_id: str,
+        canonical_region: str,
+        source_frame: int,
+        evidence_score: float,
+        confidence: float,
+        observed_directly: bool,
+        generated: bool,
+    ) -> None:
+        canonical = self._canonical_from_region_type(canonical_region)
+        if not canonical:
+            return
+        record_id = make_region_id(entity_id, canonical)
+        existing = memory.canonical_region_memory.get(record_id)
+        observed_visibility = str(existing.visibility_state if existing is not None else "visible")
+        if existing is not None and str(existing.visibility_state) in {"hidden", "hidden_by_garment", "hidden_by_object", "unknown_expected_region"} and observed_directly and evidence_score >= 0.45:
+            observed_visibility = "visible"
+        visibility = self._resolve_visibility_state(
+            existing_visibility=(str(existing.visibility_state) if existing else None),
+            observed_visibility=observed_visibility,
+            evidence_score=evidence_score,
+            observed_directly=observed_directly,
+        )
+        quality = self._evidence_quality(evidence_score, visibility, observed_directly)
+        candidate = CanonicalRegionMemoryEntry(
+            record_id=record_id,
+            entity_id=entity_id,
+            canonical_region=canonical,
+            memory_kind=self._memory_kind_for_region(canonical),
+            mask_ref=(existing.mask_ref if existing is not None else None),
+            region_ref=record_id,
+            confidence=confidence,
+            visibility_state=visibility,
+            provenance=(existing.provenance if existing is not None else "frame_observation"),
+            source_frame=source_frame,
+            evidence_score=evidence_score,
+            evidence_quality=quality,
+            observed_directly=observed_directly,
+            inferred=not observed_directly,
+            generated=generated,
+            reliable_for_reuse=False,
+            suitable_for_reveal=False,
+            freshness_frames=0,
+            last_observed_frame=(source_frame if observed_directly else (existing.last_observed_frame if existing else None)),
+            reveal_lifecycle=(self._visibility_to_reveal_lifecycle(visibility) if observed_directly else (existing.reveal_lifecycle if existing else self._visibility_to_reveal_lifecycle(visibility))),
+            last_transition="refresh_from_frame",
+        )
+        self._refresh_reuse_policy(candidate)
+        self._upsert_canonical_memory(memory, candidate)
 
     def _semantic_region_types(self, person: object) -> list[str]:
         region_types = {"face", "torso", "garments", "sleeves", "pelvis", "legs"}
