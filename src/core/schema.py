@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 
-VisibilityState = Literal["visible", "partially_visible", "hidden", "unknown"]
+VisibilityState = Literal["visible", "partially_visible", "hidden", "hidden_by_self", "hidden_by_garment", "hidden_by_object", "out_of_frame", "unknown", "unknown_expected_region"]
 RelationType = Literal[
     "part_of",
     "attached_to",
@@ -18,7 +18,31 @@ RelationType = Literal[
     "in_front_of",
     "behind",
     "held_by",
+    "adjacent_to",
+    "overlaps",
 ]
+
+
+class CanonicalRegionPayload(TypedDict):
+    canonical_name: str
+    raw_sources: list[str]
+    source_regions: list[str]
+    mask_ref: str | None
+    confidence: float
+    visibility_state: VisibilityState | str
+    provenance: str
+    attachment_hints: list[str]
+    ownership_hints: list[str]
+    coverage_hints: list[str]
+
+
+class CanonicalRelationPayload(TypedDict):
+    source: str
+    relation: RelationType | str
+    target: str
+    confidence: float
+    provenance: str
+    evidence: list[str]
 
 
 @dataclass(slots=True)
@@ -129,6 +153,8 @@ class PersonNode:
     frame_index: int = 0
     timestamp: float | None = None
     alternatives: list[str] = field(default_factory=list)
+    canonical_regions: dict[str, CanonicalRegionPayload] = field(default_factory=dict)
+    region_relations: list[CanonicalRelationPayload] = field(default_factory=list)
 
 
 @dataclass(slots=True)

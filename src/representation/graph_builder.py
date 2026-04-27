@@ -2,50 +2,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from core.schema import (
-    BodyPartNode,
-    GarmentNode,
-    GlobalSceneContext,
-    PersonNode,
-    RelationEdge,
-    SceneGraph,
-    SceneObjectNode,
-)
+from core.schema import BodyPartNode, GarmentNode, GlobalSceneContext, PersonNode, RelationEdge, SceneGraph, SceneObjectNode
 from perception.pipeline import PerceptionOutput
-
-
-class VisibilityOcclusionReasoner:
-    def infer(self, persons: list[PersonNode], objects: list[SceneObjectNode]) -> list[RelationEdge]:
-        relations: list[RelationEdge] = []
-        for person in persons:
-            for part in person.body_parts:
-                if part.confidence < 0.35:
-                    part.visibility = "hidden"
-                elif part.confidence < 0.6:
-                    part.visibility = "partially_visible"
-                else:
-                    part.visibility = "visible"
-            for garment in person.garments:
-                if garment.confidence < 0.3:
-                    garment.visibility = "hidden"
-                elif garment.confidence < 0.58:
-                    garment.visibility = "partially_visible"
-                else:
-                    garment.visibility = "visible"
-
-                if garment.visibility in {"hidden", "partially_visible"} and objects:
-                    relations.append(
-                        RelationEdge(
-                            source=objects[0].object_id,
-                            relation="occludes",
-                            target=garment.garment_id,
-                            confidence=0.65,
-                            provenance="visibility_reasoner",
-                            frame_index=garment.frame_index,
-                            alternatives=["in_front_of"],
-                        )
-                    )
-        return relations
+from representation.canonical_human_state import CanonicalHumanSceneProcessor, canonical_relations_to_edges, canonical_state_to_dict
 
 
 class SceneGraphBuilder:
@@ -70,97 +29,78 @@ class SceneGraphBuilder:
             "fallback": 2,
             "unknown": 1,
             "visibility_reasoner": 4,
+            "canonical_relation_reasoner": 4,
         }
-        self._visibility = VisibilityOcclusionReasoner()
+        self._canonical = CanonicalHumanSceneProcessor()
 
     def build(self, perception: PerceptionOutput, frame_index: int = 0) -> SceneGraph:
         persons: list[PersonNode] = []
         objects: list[SceneObjectNode] = []
-
-        taxonomy = [
-            "head",
-            "neck",
-            "torso",
-            "pelvis",
-            "left_upper_arm",
-            "left_lower_arm",
-            "right_upper_arm",
-            "right_lower_arm",
-            "left_hand",
-            "right_hand",
-            "left_upper_leg",
-            "left_lower_leg",
-            "right_upper_leg",
-            "right_lower_leg",
-            "left_foot",
-            "right_foot",
-        ]
+        canonical_states = []
 
         for idx, p in enumerate(perception.persons, start=1):
             person_id = f"person_{idx}"
-            parsed_parts = [part for part in getattr(p, "body_parts", []) if isinstance(part, dict) and part.get("part_type")]
-            if parsed_parts:
-                body_parts = [
-                    BodyPartNode(
-                        part_id=f"{person_id}_{str(part['part_type'])}",
-                        part_type=str(part["part_type"]),
-                        mask_ref=part.get("mask_ref"),
-                        confidence=self._calibrate_confidence(float(part.get("confidence", 0.0)), str(part.get("source", "unknown"))),
-                        visibility=str(part.get("visibility", "unknown")),
-                        source=str(part.get("source", "unknown")),
-                        frame_index=frame_index,
-                        alternatives=["parser_dense", "torso" if "torso" in str(part["part_type"]) else "limb"],
-                    )
-                    for part in parsed_parts
-                ]
-            else:
-                body_parts = [
-                    BodyPartNode(
-                        part_id=f"{person_id}_{part_type}",
-                        part_type=part_type,
-                        confidence=self._calibrate_confidence(0.82, p.pose_source),
-                        visibility="visible",
-                        source=p.pose_source,
-                        frame_index=frame_index,
-                        alternatives=["torso", "limb"],
-                    )
-                    for part_type in taxonomy
-                ]
+            canonical = self._canonical.process(p, person_id=person_id, frame_size=perception.frame_size, objects=perception.objects)
+            canonical_states.append(canonical)
+            canonical_regions = canonical.regions
+
+            body_part_order = [
+                "head",
+                "face",
+                "hair",
+                "neck",
+                "torso",
+                "left_arm",
+                "right_arm",
+                "left_hand",
+                "right_hand",
+                "pelvis",
+                "left_leg",
+                "right_leg",
+                "upper_body",
+                "lower_body",
+            ]
+            body_parts = [
+                BodyPartNode(
+                    part_id=f"{person_id}_{part_name}",
+                    part_type=part_name,
+                    mask_ref=canonical_regions[part_name].mask_ref,
+                    confidence=self._calibrate_confidence(canonical_regions[part_name].confidence, canonical_regions[part_name].provenance),
+                    visibility=canonical_regions[part_name].visibility_state,
+                    source=canonical_regions[part_name].provenance,
+                    frame_index=frame_index,
+                    alternatives=[
+                        f"raw:{','.join(canonical_regions[part_name].source_regions) or 'none'}",
+                        f"attachment:{','.join(canonical_regions[part_name].attachment_hints) or 'none'}",
+                    ],
+                )
+                for part_name in body_part_order
+            ]
+
             garments: list[GarmentNode] = []
-            for g_idx, garment in enumerate(p.garments, start=1):
-                garment_id = f"{garment['type']}_{idx}_{g_idx}"
-                garment_type = str(garment["type"])
-                layering = str(garment.get("layer_hint", "outerwear" if garment["type"] in {"coat", "jacket", "hoodie"} else "innerwear"))
-                coverage_raw = garment.get("coverage_targets", [])
-                coverage = [f"{person_id}_{c}" for c in coverage_raw] if coverage_raw else [f"{person_id}_torso"]
-                if garment["type"] in {"coat", "jacket", "shirt", "hoodie", "top"} and not coverage_raw:
-                    coverage.extend([f"{person_id}_left_upper_arm", f"{person_id}_right_upper_arm"])
-                attachment_raw = garment.get("attachment_targets", [])
-                attachments = [f"{person_id}_{a}" for a in attachment_raw] if attachment_raw else [f"{person_id}_torso"]
+            garment_regions = ["upper_garment", "lower_garment", "outer_garment", "inner_garment", "accessories"]
+            for g_name in garment_regions:
+                region = canonical_regions[g_name]
                 garments.append(
                     GarmentNode(
-                        garment_id=garment_id,
-                        garment_type=garment_type,
-                        mask_ref=garment.get("mask_ref"),
-                        garment_state=garment.get("state", "worn"),
-                        coverage_targets=coverage,
-                        attachment_targets=attachments,
-                        confidence=self._calibrate_confidence(
-                            float(garment.get("confidence", 0.5)),
-                            garment.get("source", "unknown"),
-                        ),
-                        visibility="visible",
-                        source=garment.get("source", "unknown"),
+                        garment_id=f"{person_id}_{g_name}",
+                        garment_type=g_name,
+                        mask_ref=region.mask_ref,
+                        garment_state="worn" if region.confidence >= 0.25 else "uncertain",
+                        coverage_targets=[f"{person_id}_{x}" for x in region.coverage_hints] if region.coverage_hints else [f"{person_id}_torso"],
+                        attachment_targets=[f"{person_id}_{x}" for x in region.attachment_hints] if region.attachment_hints else [f"{person_id}_torso"],
+                        confidence=self._calibrate_confidence(region.confidence, region.provenance),
+                        visibility=region.visibility_state,
+                        source=region.provenance,
                         frame_index=frame_index,
                         alternatives=[
-                            layering,
-                            "sleeve_linked",
-                            f"coverage:{','.join(coverage_raw)}" if coverage_raw else "coverage:heuristic",
-                            f"provenance:{p.provenance_by_region.get(f'garment:{garment_type}', garment.get('source', 'unknown'))}",
+                            f"source_regions:{','.join(region.source_regions) or 'none'}",
+                            f"ownership:{','.join(region.ownership_hints) or 'person'}",
                         ],
                     )
                 )
 
+            canonical_payload = canonical_state_to_dict(canonical)
             persons.append(
                 PersonNode(
                     person_id=person_id,
@@ -175,7 +115,9 @@ class SceneGraphBuilder:
                     confidence=self._calibrate_confidence(p.bbox_confidence, p.bbox_source),
                     source=p.bbox_source,
                     frame_index=frame_index,
-                    alternatives=["scene_object", "partial_person"],
+                    alternatives=["scene_object", "canonical_human_state"],
+                    canonical_regions=canonical_payload["regions"],
+                    region_relations=canonical_payload["relations"],
                 )
             )
 
@@ -194,7 +136,20 @@ class SceneGraphBuilder:
             )
 
         relations = self._infer_relations(persons=persons, objects=objects, frame_index=frame_index)
-        relations.extend(self._visibility.infer(persons=persons, objects=objects))
+        for state in canonical_states:
+            relations.extend(
+                RelationEdge(
+                    source=rel.source,
+                    relation=rel.relation,
+                    target=rel.target,
+                    confidence=rel.confidence,
+                    provenance=rel.provenance,
+                    frame_index=frame_index,
+                    alternatives=["canonical_reasoning"],
+                )
+                for rel in canonical_relations_to_edges(state, frame_index=frame_index)
+            )
+
         relations = self._resolve_relation_conflicts(relations)
 
         scene_graph = SceneGraph(
@@ -283,6 +238,11 @@ class SceneGraphBuilder:
             if current is None:
                 winners[key] = relation
                 continue
+            if current.provenance.endswith(":dangling") and not relation.provenance.endswith(":dangling"):
+                winners[key] = relation
+                continue
+            if relation.provenance.endswith(":dangling") and not current.provenance.endswith(":dangling"):
+                continue
             if relation.confidence > current.confidence:
                 winners[key] = relation
                 continue
@@ -291,4 +251,5 @@ class SceneGraphBuilder:
                 right_priority = self._source_priority.get(current.provenance.lower().split(":")[0], 0) + priority.get(current.relation, 0)
                 if left_priority > right_priority:
                     winners[key] = relation
-        return [replace(v, confidence=round(v.confidence, 4)) for v in winners.values()]
+        ordered = sorted(winners.values(), key=lambda r: (r.source, r.relation, r.target))
+        return [replace(v, confidence=round(v.confidence, 4)) for v in ordered]
