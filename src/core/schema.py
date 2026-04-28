@@ -371,6 +371,8 @@ class CanonicalRegionMemoryEntry:
     inferred: bool = False
     generated: bool = False
     reliable_for_reuse: bool = False
+    reliable_as_reference: bool = False
+    reference_kind: str = "none"
     suitable_for_reveal: bool = False
     freshness_frames: int = 0
     last_observed_frame: int | None = None
