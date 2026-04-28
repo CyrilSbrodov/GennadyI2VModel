@@ -21,6 +21,10 @@ from utils_tensor import crop, mean_color, shape
 
 
 class MemoryManager:
+    IDENTITY_SENSITIVE_REGIONS = {"face", "hair", "head"}
+    APPEARANCE_SENSITIVE_REGIONS = {"face", "hair", "head", "torso", "upper_garment", "outer_garment", "inner_garment"}
+    GARMENT_SENSITIVE_REGIONS = {"upper_garment", "outer_garment", "inner_garment", "lower_garment"}
+
     _CANONICAL_MEMORY_REGIONS = (
         "face",
         "hair",
@@ -51,6 +55,7 @@ class MemoryManager:
         "visibility_reasoner": 0.7,
         "heuristic": 0.62,
         "frame_observation": 0.82,
+        "graph_delta_state_update": 0.38,
         "generated": 0.35,
         "unknown": 0.5,
     }
@@ -936,7 +941,41 @@ class MemoryManager:
     def _entry_strength(self, entry: CanonicalRegionMemoryEntry) -> float:
         quality_bonus = {"strong": 0.35, "medium": 0.2, "weak": 0.08, "inferred": 0.02}.get(entry.evidence_quality, 0.0)
         visibility_bonus = {"visible": 0.3, "partially_visible": 0.15, "hidden": -0.15, "unknown_expected_region": -0.25}.get(str(entry.visibility_state), 0.0)
-        return float(entry.confidence + 0.7 * entry.evidence_score + quality_bonus + visibility_bonus - 0.06 * entry.freshness_frames)
+        direct_bonus = 0.24 if entry.observed_directly else -0.08
+        generated_penalty = 0.35 if entry.generated else 0.0
+        inferred_penalty = 0.22 if entry.inferred else 0.0
+        provenance_bonus = 0.2 * self._provenance_reliability(entry.provenance)
+        freshness_bonus = 0.16 if entry.freshness_frames <= 1 else (0.08 if entry.freshness_frames <= 4 else -0.04 * min(8, entry.freshness_frames))
+        lifecycle_penalty = 0.28 if entry.reveal_lifecycle == "newly_revealed" and entry.evidence_score <= 0.55 else 0.0
+        lifecycle_penalty += 0.16 if entry.reveal_lifecycle in {"newly_occluded", "currently_hidden"} else 0.0
+        identity_guard = 0.0
+        if entry.canonical_region in self.IDENTITY_SENSITIVE_REGIONS:
+            identity_guard += 0.18 if (entry.observed_directly and not entry.generated and not entry.inferred) else -0.14
+        return float(
+            entry.confidence
+            + 0.8 * entry.evidence_score
+            + quality_bonus
+            + visibility_bonus
+            + direct_bonus
+            + provenance_bonus
+            + freshness_bonus
+            + identity_guard
+            - generated_penalty
+            - inferred_penalty
+            - lifecycle_penalty
+        )
+
+    def _is_protected_identity_memory(self, entry: CanonicalRegionMemoryEntry) -> bool:
+        return bool(
+            entry.canonical_region in self.IDENTITY_SENSITIVE_REGIONS
+            and str(entry.visibility_state) in {"visible", "partially_visible"}
+            and entry.reliable_for_reuse
+            and entry.observed_directly
+            and not entry.generated
+            and not entry.inferred
+            and entry.evidence_score >= 0.65
+            and entry.confidence >= 0.7
+        )
 
     def _update_canonical_region_memory(self, memory: VideoMemory, person: object, frame_index: int) -> None:
         canonical_regions = getattr(person, "canonical_regions", {}) or {}
@@ -1082,6 +1121,24 @@ class MemoryManager:
         current = memory.canonical_region_memory.get(candidate.record_id)
         if current is None:
             memory.canonical_region_memory[candidate.record_id] = candidate
+            return
+        if (
+            current.canonical_region in self.IDENTITY_SENSITIVE_REGIONS
+            and self._is_protected_identity_memory(current)
+            and (
+                candidate.generated
+                or candidate.inferred
+                or not candidate.observed_directly
+                or self._provenance_reliability(candidate.provenance) < 0.55
+                or candidate.evidence_score + 0.12 < current.evidence_score
+                or candidate.confidence + 0.12 < current.confidence
+            )
+        ):
+            current.freshness_frames = max(0, candidate.source_frame - current.source_frame)
+            if str(current.visibility_state) in {"visible", "partially_visible"} and str(candidate.visibility_state) in {"hidden", "hidden_by_garment", "hidden_by_object", "hidden_by_self"}:
+                current.reveal_lifecycle = "newly_occluded"
+                current.last_transition = "preserve_identity_on_occlusion"
+            self._refresh_reuse_policy(current)
             return
         candidate_strength = self._entry_strength(candidate)
         current_strength = self._entry_strength(current)
