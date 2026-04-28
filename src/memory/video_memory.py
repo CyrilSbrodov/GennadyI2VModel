@@ -863,6 +863,8 @@ class MemoryManager:
         inferred_penalty = 0.24 if entry.inferred else 0.0
         generated_penalty = 0.35 if entry.generated else 0.0
         lifecycle_penalty = 0.18 if entry.reveal_lifecycle in {"newly_occluded", "currently_hidden", "expected_unknown"} else 0.0
+        if entry.reveal_lifecycle == "newly_revealed":
+            lifecycle_penalty += 0.08
         provenance_factor = self._provenance_reliability(entry.provenance)
         reuse_score = (
             0.42 * entry.confidence
@@ -880,6 +882,7 @@ class MemoryManager:
             and not entry.generated
             and not entry.inferred
             and reuse_score >= 0.66
+            and (entry.reveal_lifecycle != "newly_revealed" or entry.evidence_score >= 0.62)
         )
         entry.suitable_for_reveal = bool(
             entry.reliable_for_reuse
@@ -934,6 +937,11 @@ class MemoryManager:
         for canonical_name in self._CANONICAL_MEMORY_REGIONS:
             raw = canonical_regions.get(canonical_name, {}) if isinstance(canonical_regions, dict) else {}
             visibility = str(raw.get("visibility_state", "unknown_expected_region"))
+            lifecycle_state = str(raw.get("lifecycle_state", "") or "").strip().lower()
+            last_transition_mode = str(raw.get("last_transition_mode", "") or "").strip()
+            last_transition_phase = str(raw.get("last_transition_phase", "") or "").strip()
+            last_semantic_reasons = [str(v) for v in raw.get("last_semantic_reasons", [])] if isinstance(raw.get("last_semantic_reasons", []), list) else []
+            last_update_source = str(raw.get("last_update_source", "") or "").strip()
             confidence = float(raw.get("confidence", 0.0))
             provenance = str(raw.get("provenance", "unknown"))
             source_regions = [str(v) for v in raw.get("source_regions", [])] if isinstance(raw.get("source_regions", []), list) else []
@@ -974,11 +982,90 @@ class MemoryManager:
                 suitable_for_reveal=False,
                 freshness_frames=0,
                 last_observed_frame=(frame_index if observed_directly else None),
-                reveal_lifecycle=self._visibility_to_reveal_lifecycle(resolved_visibility),
+                reveal_lifecycle=lifecycle_state if lifecycle_state in {"newly_revealed", "newly_occluded", "visibility_changed"} else self._visibility_to_reveal_lifecycle(resolved_visibility),
                 last_transition="stable",
             )
+            transition_parts = [lifecycle_state or "stable"]
+            if last_transition_mode:
+                transition_parts.append(last_transition_mode)
+            if last_transition_phase:
+                transition_parts.append(last_transition_phase)
+            if last_semantic_reasons:
+                transition_parts.append("+".join(last_semantic_reasons))
+            if last_update_source:
+                transition_parts.append(last_update_source)
+            entry.last_transition = "|".join(transition_parts)
+
+            trace_region_id = make_region_id(person.person_id, canonical_name)
+            memory.last_transition_context[f"{trace_region_id}:lifecycle_state"] = lifecycle_state or "stable"
+            if last_transition_mode:
+                memory.last_transition_context[f"{trace_region_id}:transition_mode"] = last_transition_mode
+            if last_transition_phase:
+                memory.last_transition_context[f"{trace_region_id}:transition_phase"] = last_transition_phase
+            if last_semantic_reasons:
+                memory.last_transition_context[f"{trace_region_id}:semantic_reasons"] = ",".join(last_semantic_reasons)
+            if last_update_source:
+                memory.last_transition_context[f"{trace_region_id}:update_source"] = last_update_source
             self._refresh_reuse_policy(entry)
             self._upsert_canonical_memory(memory, entry)
+            self._sync_hidden_slot_with_graph_lifecycle(
+                memory=memory,
+                entity_id=person.person_id,
+                canonical_name=canonical_name,
+                lifecycle_state=lifecycle_state,
+                visibility_state=visibility,
+                transition_mode=last_transition_mode,
+                transition_phase=last_transition_phase,
+                semantic_reasons=last_semantic_reasons,
+                update_source=last_update_source,
+            )
+
+    def _sync_hidden_slot_with_graph_lifecycle(
+        self,
+        *,
+        memory: VideoMemory,
+        entity_id: str,
+        canonical_name: str,
+        lifecycle_state: str,
+        visibility_state: str,
+        transition_mode: str,
+        transition_phase: str,
+        semantic_reasons: list[str],
+        update_source: str,
+    ) -> None:
+        if lifecycle_state not in {"newly_revealed", "newly_occluded"}:
+            return
+        region_id = make_region_id(entity_id, canonical_name)
+        slot = memory.hidden_region_slots.get(region_id)
+        if slot is None:
+            slot = HiddenRegionSlot(
+                slot_id=region_id,
+                region_type=canonical_name,
+                owner_entity=entity_id,
+                candidate_patch_ids=[],
+                hidden_type="unknown_hidden",
+            )
+            memory.hidden_region_slots[region_id] = slot
+        slot.stale_frames = 0
+        transition_bits = [lifecycle_state]
+        if visibility_state:
+            transition_bits.append(visibility_state)
+        if transition_mode:
+            transition_bits.append(transition_mode)
+        if transition_phase:
+            transition_bits.append(transition_phase)
+        if semantic_reasons:
+            transition_bits.append("+".join(semantic_reasons))
+        if update_source:
+            transition_bits.append(update_source)
+        slot.last_transition = lifecycle_state
+        slot.last_transition_reason = "|".join(transition_bits)
+        if lifecycle_state == "newly_revealed":
+            target_state = "known_hidden" if slot.candidate_patch_ids else "unknown_hidden"
+            self.transition_hidden_slot(slot, target_state, reason=f"graph_lifecycle:{slot.last_transition_reason}")
+        elif lifecycle_state == "newly_occluded":
+            self.transition_hidden_slot(slot, "known_hidden", reason=f"graph_lifecycle:{slot.last_transition_reason}")
+        self._promote_or_decay_hidden_slot(slot)
 
     def _upsert_canonical_memory(self, memory: VideoMemory, candidate: CanonicalRegionMemoryEntry) -> None:
         current = memory.canonical_region_memory.get(candidate.record_id)
