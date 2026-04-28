@@ -160,6 +160,106 @@ def test_update_from_graph_does_not_mark_newly_revealed_as_reliable_without_evid
     assert entry.reliable_for_reuse is False
 
 
+def test_update_from_graph_preserves_lifecycle_last_transition_on_upsert() -> None:
+    manager = MemoryManager()
+    initial_graph = SceneGraph(
+        frame_index=0,
+        persons=[
+            _person(
+                "p1",
+                canonical_overrides={
+                    "inner_garment": _canonical_payload(
+                        "inner_garment",
+                        visibility_state="visible",
+                        confidence=0.52,
+                        lifecycle_state="stable",
+                        last_transition_mode="stable",
+                        last_transition_phase="stable",
+                    )
+                },
+            )
+        ],
+        objects=[],
+    )
+    memory = manager.initialize(initial_graph)
+
+    update_graph = SceneGraph(
+        frame_index=1,
+        persons=[
+            _person(
+                "p1",
+                canonical_overrides={
+                    "inner_garment": _canonical_payload(
+                        "inner_garment",
+                        visibility_state="visible",
+                        confidence=0.78,
+                        lifecycle_state="newly_revealed",
+                        last_transition_mode="garment_open",
+                        last_transition_phase="contact_or_reveal",
+                        last_semantic_reasons=["zip_opened"],
+                    )
+                },
+            )
+        ],
+        objects=[],
+    )
+    memory = manager.update_from_graph(memory, update_graph)
+    entry = manager.get_best_region_memory(memory, "p1", "inner_garment")
+    assert entry is not None
+    assert entry.reveal_lifecycle == "newly_revealed"
+    assert "newly_revealed" in entry.last_transition
+    assert "garment_open" in entry.last_transition
+    assert entry.last_transition != "refresh"
+
+
+def test_update_from_graph_newly_revealed_hidden_slot_is_not_active_hidden() -> None:
+    manager = MemoryManager()
+    initial_graph = SceneGraph(
+        frame_index=0,
+        persons=[
+            _person(
+                "p1",
+                canonical_overrides={
+                    "outer_garment": _canonical_payload(
+                        "outer_garment",
+                        visibility_state="hidden_by_garment",
+                        confidence=0.65,
+                        lifecycle_state="newly_occluded",
+                        last_transition_mode="visibility_occlusion",
+                    )
+                },
+            )
+        ],
+        objects=[],
+    )
+    memory = manager.update_from_graph(manager.initialize(SceneGraph(frame_index=0, persons=[], objects=[])), initial_graph)
+    update_graph = SceneGraph(
+        frame_index=1,
+        persons=[
+            _person(
+                "p1",
+                canonical_overrides={
+                    "outer_garment": _canonical_payload(
+                        "outer_garment",
+                        visibility_state="visible",
+                        confidence=0.74,
+                        lifecycle_state="newly_revealed",
+                        last_transition_mode="garment_open",
+                    )
+                },
+            )
+        ],
+        objects=[],
+    )
+    memory = manager.update_from_graph(memory, update_graph)
+    slot = memory.hidden_region_slots.get(make_region_id("p1", "outer_garment"))
+    assert slot is not None
+    assert slot.last_transition == "newly_revealed"
+    assert "revealed" in slot.last_transition_reason
+    if not slot.candidate_patch_ids:
+        assert slot.hidden_type != "known_hidden"
+
+
 def test_update_from_graph_preserves_existing_reliable_visible_region() -> None:
     manager = MemoryManager()
     initial_graph = SceneGraph(

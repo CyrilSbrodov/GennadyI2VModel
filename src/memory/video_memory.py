@@ -857,6 +857,12 @@ class MemoryManager:
         return prev
 
     def _refresh_reuse_policy(self, entry: CanonicalRegionMemoryEntry) -> None:
+        # Lifecycle semantics guard:
+        # - newly_revealed/newly_occluded are special states that can directly
+        #   impact reuse/reveal safety.
+        # - visibility_changed is intentionally treated as neutral bookkeeping
+        #   (captured via last_transition / last_transition_context), not a
+        #   positive reveal suitability signal by itself.
         visibility_ok = str(entry.visibility_state) in {"visible", "partially_visible"}
         fresh_bonus = 1.0 if entry.freshness_frames <= 2 else (0.75 if entry.freshness_frames <= 6 else 0.45)
         stale_penalty = 0.22 if entry.freshness_frames > 8 else 0.0
@@ -1061,8 +1067,13 @@ class MemoryManager:
         slot.last_transition = lifecycle_state
         slot.last_transition_reason = "|".join(transition_bits)
         if lifecycle_state == "newly_revealed":
-            target_state = "known_hidden" if slot.candidate_patch_ids else "unknown_hidden"
-            self.transition_hidden_slot(slot, target_state, reason=f"graph_lifecycle:{slot.last_transition_reason}")
+            # Keep historical hidden slot trace, but do not leave it looking like
+            # an active hidden candidate after explicit reveal.
+            slot.hidden_type = "revealed_history" if slot.candidate_patch_ids else "revealed"
+            reveal_reason = slot.last_transition_reason
+            if "revealed" not in reveal_reason.lower():
+                reveal_reason = f"{reveal_reason}|revealed"
+            slot.last_transition_reason = reveal_reason
         elif lifecycle_state == "newly_occluded":
             self.transition_hidden_slot(slot, "known_hidden", reason=f"graph_lifecycle:{slot.last_transition_reason}")
         self._promote_or_decay_hidden_slot(slot)
@@ -1083,7 +1094,9 @@ class MemoryManager:
             and candidate.observed_directly
             and candidate.evidence_score >= 0.45
         ):
-            candidate.last_transition = "refresh"
+            transition = str(getattr(candidate, "last_transition", "") or "").strip().lower()
+            if transition in {"", "stable"}:
+                candidate.last_transition = "refresh"
             memory.canonical_region_memory[candidate.record_id] = candidate
         else:
             current.freshness_frames = max(0, candidate.source_frame - current.source_frame)
