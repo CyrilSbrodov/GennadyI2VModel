@@ -894,6 +894,38 @@ class MemoryManager:
             and not entry.inferred
             and reuse_score >= 0.66
             and (entry.reveal_lifecycle != "newly_revealed" or entry.evidence_score >= 0.62)
+            and entry.reveal_lifecycle not in {"newly_occluded", "currently_hidden"}
+        )
+        reference_kind = "none"
+        if entry.canonical_region in self.IDENTITY_SENSITIVE_REGIONS:
+            reference_kind = "identity_reference"
+        elif entry.canonical_region in self.GARMENT_SENSITIVE_REGIONS:
+            reference_kind = "garment_reference"
+        elif entry.canonical_region in self.APPEARANCE_SENSITIVE_REGIONS:
+            reference_kind = "appearance_reference"
+        entry.reference_kind = reference_kind
+        hidden_or_occluded = str(entry.visibility_state) in {
+            "hidden",
+            "hidden_by_self",
+            "hidden_by_garment",
+            "hidden_by_object",
+            "out_of_frame",
+        } or entry.reveal_lifecycle in {"newly_occluded", "currently_hidden", "expected_unknown"}
+        strong_direct_reference = bool(
+            entry.observed_directly
+            and not entry.generated
+            and not entry.inferred
+            and entry.evidence_quality in {"strong", "medium"}
+            and entry.evidence_score >= 0.56
+            and entry.confidence >= 0.62
+        )
+        if entry.reveal_lifecycle == "newly_revealed" and entry.evidence_score < 0.62:
+            strong_direct_reference = False
+        entry.reliable_as_reference = bool(
+            reference_kind != "none"
+            and strong_direct_reference
+            and entry.evidence_score >= 0.45
+            and (not hidden_or_occluded or reference_kind == "identity_reference")
         )
         entry.suitable_for_reveal = bool(
             entry.reliable_for_reuse
@@ -968,8 +1000,7 @@ class MemoryManager:
     def _is_protected_identity_memory(self, entry: CanonicalRegionMemoryEntry) -> bool:
         return bool(
             entry.canonical_region in self.IDENTITY_SENSITIVE_REGIONS
-            and str(entry.visibility_state) in {"visible", "partially_visible"}
-            and entry.reliable_for_reuse
+            and entry.reliable_as_reference
             and entry.observed_directly
             and not entry.generated
             and not entry.inferred
@@ -1024,6 +1055,8 @@ class MemoryManager:
                 inferred=inferred,
                 generated=False,
                 reliable_for_reuse=False,
+                reliable_as_reference=False,
+                reference_kind="none",
                 suitable_for_reveal=False,
                 freshness_frames=0,
                 last_observed_frame=(frame_index if observed_directly else None),
@@ -1136,6 +1169,8 @@ class MemoryManager:
         ):
             current.freshness_frames = max(0, candidate.source_frame - current.source_frame)
             if str(current.visibility_state) in {"visible", "partially_visible"} and str(candidate.visibility_state) in {"hidden", "hidden_by_garment", "hidden_by_object", "hidden_by_self"}:
+                current.visibility_state = str(candidate.visibility_state)
+            if candidate.reveal_lifecycle == "newly_occluded":
                 current.reveal_lifecycle = "newly_occluded"
                 current.last_transition = "preserve_identity_on_occlusion"
             self._refresh_reuse_policy(current)
@@ -1202,6 +1237,8 @@ class MemoryManager:
             inferred=not observed_directly,
             generated=generated,
             reliable_for_reuse=False,
+            reliable_as_reference=False,
+            reference_kind="none",
             suitable_for_reveal=False,
             freshness_frames=0,
             last_observed_frame=(source_frame if observed_directly else (existing.last_observed_frame if existing else None)),
