@@ -23,7 +23,7 @@ RelationType = Literal[
 ]
 
 
-class CanonicalRegionPayload(TypedDict):
+class CanonicalRegionPayloadBase(TypedDict):
     canonical_name: str
     raw_sources: list[str]
     source_regions: list[str]
@@ -34,6 +34,18 @@ class CanonicalRegionPayload(TypedDict):
     attachment_hints: list[str]
     ownership_hints: list[str]
     coverage_hints: list[str]
+
+
+class CanonicalRegionLifecyclePayload(TypedDict, total=False):
+    lifecycle_state: str
+    last_transition_mode: str
+    last_transition_phase: str
+    last_semantic_reasons: list[str]
+    last_update_source: str
+
+
+class CanonicalRegionPayload(CanonicalRegionPayloadBase, CanonicalRegionLifecyclePayload):
+    pass
 
 
 class CanonicalRelationPayload(TypedDict):
