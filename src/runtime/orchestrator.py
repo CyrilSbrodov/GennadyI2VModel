@@ -27,8 +27,10 @@ from rendering.roi_renderer import ROISelector, RenderedPatch
 from representation.graph_builder import SceneGraphBuilder
 from representation.learned_bridge import summarize_memory
 from runtime.profiles import PROFILES, RuntimeProfile
+from runtime.region_routing import CanonicalRegionRouter
 from text.intent_parser import IntentParser
 from utils_tensor import shape, zeros
+from core.region_ids import make_region_id
 
 
 @dataclass(slots=True)
@@ -48,6 +50,7 @@ class GennadyEngine:
         self.intent_parser = IntentParser()
         self.planner = TransitionPlanner()
         self.roi_selector = ROISelector()
+        self.region_router = CanonicalRegionRouter(self.memory_manager, self.roi_selector)
         self.compositor = Compositor()
         self.memory_summarizer = AppearanceMemorySummarizer()
         self.backend_config = backend_config or BackendConfig()
@@ -224,13 +227,37 @@ class GennadyEngine:
                     fallback_log.append(f"step={planned_state.step_index}:dynamics_semantic_{severity}={issue}")
 
             delta = transition_output.delta
-            changed_regions = self.roi_selector.select(scene_graph, delta)
+            region_plan = self.region_router.build_plan(
+                scene_graph=scene_graph,
+                delta=delta,
+                memory=memory,
+                semantic_transition=planned_state.semantic_transition,
+            )
+            transition_diag = delta.transition_diagnostics if isinstance(delta.transition_diagnostics, dict) else {}
+            transition_diag["region_routing_plan"] = {
+                make_region_id(region_plan.entity_id, d.canonical_region): {
+                    "decision": d.decision,
+                    "priority": d.priority,
+                    "reveal_mode": d.reveal_mode,
+                    "synthesis_required": d.synthesis_required,
+                    "renderer_mode_hint": d.renderer_mode_hint,
+                    "confidence": d.confidence,
+                    "reasons": d.reasons,
+                    "memory_source_available": d.memory_source_available,
+                    "memory_support_level": d.memory_support_level,
+                }
+                for d in region_plan.decisions
+            }
+            transition_diag["region_transition_semantics"] = region_plan.as_debug_dict()["transition_semantics"]
+            delta.transition_diagnostics = transition_diag
+            changed_regions = region_plan.render_regions or self.roi_selector.select(scene_graph, delta)
             patches: list[RenderedPatch] = []
             patch_step_debug: list[dict[str, object]] = []
             step_hidden_reconstruction = False
             step_hidden_cases = 0
             for region in changed_regions[: profile.max_roi_count]:
                 patch_channels = self.build_patch_memory_channels(memory_channels)
+                region_route = region_plan.decision_for_region_id(region.region_id)
                 transition_metadata = transition_output.metadata if isinstance(transition_output.metadata, dict) else {}
                 learned_temporal_contract = transition_metadata.get("temporal_transition_contract", {})
                 learned_human_state_contract = transition_metadata.get("human_state_contract", {})
@@ -253,6 +280,12 @@ class GennadyEngine:
                         "learned_human_state_contract": learned_human_state_contract,
                         "region_selection_rationale": transition_metadata.get("region_selection_rationale", {}),
                         "semantic_families": transition_metadata.get("semantic_families", []),
+                        "region_route_decision": {
+                            "decision": region_route.decision if region_route else "unknown",
+                            "reveal_mode": region_route.reveal_mode if region_route else "none",
+                            "renderer_mode_hint": region_route.renderer_mode_hint if region_route else "keep",
+                            "synthesis_required": region_route.synthesis_required if region_route else False,
+                        },
                     },
                     retrieval_summary={
                         "backend": "learned_primary",
@@ -316,7 +349,10 @@ class GennadyEngine:
                 patch_step_debug.append(
                     {
                         "region_id": region.region_id,
-                        "selected_strategy": patch_contract.get("selected_strategy", "unknown"),
+                        "selected_strategy": patch_out.execution_trace.get("selected_render_strategy", patch_contract.get("selected_render_strategy", patch_contract.get("selected_strategy", "unknown"))),
+                        "execution_policy": patch_out.execution_trace.get("selection", {}).get("execution_policy", {}),
+                        "mode_source": (patch_out.execution_trace.get("memory_dependency_summary", {}) or {}).get("mode_source", "unknown"),
+                        "runtime_plan_authoritative": (patch_out.execution_trace.get("memory_dependency_summary", {}) or {}).get("runtime_plan_authoritative", False),
                         "confidence": patch_out.confidence,
                         "synthesis_mode": synth_mode,
                         "retrieval_summary": str(patch_request.retrieval_summary)[:120],
@@ -435,6 +471,8 @@ class GennadyEngine:
             step_debug.append(
                 {
                     "step_index": planned_state.step_index,
+                    "region_routing": region_plan.as_debug_dict(),
+                    "region_render_order": [r.region_id for r in changed_regions[: profile.max_roi_count]],
                     "dynamics": {
                         "backend": self.backends.backend_names.get("dynamics_backend", "unknown"),
                         "confidence": transition_output.confidence,

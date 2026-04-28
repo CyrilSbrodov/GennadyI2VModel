@@ -32,6 +32,7 @@ class PatchSynthesisContract(TypedDict):
     roi_after: object
     region_metadata: dict[str, object]
     retrieval_explanation_summary: str
+    selected_render_strategy: str
     selected_strategy: str
     hidden_lifecycle_state: dict[str, object]
     synthesis_mode: str
@@ -88,6 +89,8 @@ def build_patch_synthesis_contract(roi_before: object, roi_after: object, region
         "roi_after": roi_after,
         "region_metadata": {"region_id": region.region_id, "reason": region.reason},
         "retrieval_explanation_summary": retrieval_summary,
+        "selected_render_strategy": selected_strategy,
+        # backward-compatible alias for older contract consumers
         "selected_strategy": selected_strategy,
         "hidden_lifecycle_state": hidden_state,
         "synthesis_mode": synthesis_mode,
