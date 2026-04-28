@@ -52,7 +52,11 @@ def build_graph_eval_payload(contract: dict[str, object]) -> dict[str, object]:
 
 
 def build_patch_eval_payload(contract: dict[str, object]) -> dict[str, object]:
-    strategy = str(contract.get("selected_strategy", "unknown")) if isinstance(contract, dict) else "unknown"
+    strategy = (
+        str(contract.get("selected_render_strategy", contract.get("selected_strategy", "unknown")))
+        if isinstance(contract, dict)
+        else "unknown"
+    )
     quality = 0.7 if strategy and strategy != "unknown" else 0.4
     return {
         "patch_quality": quality,

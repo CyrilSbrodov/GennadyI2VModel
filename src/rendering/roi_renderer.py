@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Literal
 
 from core.region_ids import make_region_id, parse_region_id
+from core.routing_contracts import DecisionKind, ExecutionStrategy, RoutingInputStatus, RUNTIME_ROUTING_DECISION_KINDS
 from core.schema import BBox, GarmentSemanticProfile, GraphDelta, RegionDescriptor, RegionRef, SceneGraph, VideoMemory
 from core.semantic_roi import SemanticROIHelper
 from memory.video_memory import MemoryManager
@@ -35,11 +36,47 @@ EntityLifecycle = Literal["already_existing", "newly_inserted", "previously_hidd
 
 
 @dataclass(slots=True)
+class RenderExecutionPolicy:
+    decision_kind: DecisionKind
+    execution_policy_kind: str
+    render_mode: RenderMode
+    execution_strategy: ExecutionStrategy
+    render_mode_hint: str
+    runtime_authoritative: bool
+    routing_input_status: RoutingInputStatus
+    reveal_mode: str
+    synthesis_required: bool
+    memory_support_level: str
+    reuse_oriented: bool
+    stabilize_oriented: bool
+    synthesis_oriented: bool
+    assist_oriented: bool = False
+
+
+@dataclass(slots=True)
 class RenderRouteDecision:
     mode: RenderMode
     lifecycle: EntityLifecycle
     reason_trace: list[str] = field(default_factory=list)
     memory_dependency: dict[str, object] = field(default_factory=dict)
+    execution_policy: RenderExecutionPolicy = field(
+        default_factory=lambda: RenderExecutionPolicy(
+            decision_kind="fallback_unknown",
+            execution_policy_kind="fallback_heuristic",
+            render_mode="refine",
+            execution_strategy="EXISTING_REGION_UPDATE",
+            render_mode_hint="none",
+            runtime_authoritative=False,
+            routing_input_status="no_runtime_plan",
+            reveal_mode="none",
+            synthesis_required=False,
+            memory_support_level="unknown",
+            reuse_oriented=False,
+            stabilize_oriented=False,
+            synthesis_oriented=False,
+            assist_oriented=False,
+        )
+    )
     plan: PatchSynthesisPlan | None = None
     insertion_context: dict[str, object] = field(default_factory=dict)
 
@@ -126,41 +163,168 @@ def _is_empty_roi(value) -> bool:
 class RegionModeRouter:
     """Structured роутер режимов рендера."""
 
+    def _policy_from_runtime_route(self, route_info: dict[str, object]) -> tuple[RenderExecutionPolicy | None, RoutingInputStatus]:
+        if not route_info:
+            return None, "no_runtime_plan"
+        decision = str(route_info.get("decision", "")).strip()
+        if not decision:
+            return None, "partial_runtime_plan"
+        if decision not in RUNTIME_ROUTING_DECISION_KINDS:
+            return None, "partial_runtime_plan"
+        renderer_hint = str(route_info.get("renderer_mode_hint", "keep") or "keep")
+        decision_to_mode: dict[str, RenderMode] = {
+            "direct_reuse": "keep",
+            "temporal_stabilize": "keep",
+            "local_deform_or_update": "refine",
+            "reveal_from_memory": "reveal",
+            "reveal_partial_memory_assist": "reveal",
+            "reveal_requires_synthesis": "reveal",
+            "garment_transition_update": "warp",
+            "expression_refine": "refine",
+            "pose_exposure_update": "deform",
+        }
+        policy_by_decision = {
+            "direct_reuse": "reuse_oriented",
+            "temporal_stabilize": "stabilize_oriented",
+            "local_deform_or_update": "local_update_oriented",
+            "reveal_from_memory": "reveal_memory_oriented",
+            "reveal_partial_memory_assist": "reveal_assist_oriented",
+            "reveal_requires_synthesis": "reveal_synthesis_oriented",
+            "garment_transition_update": "garment_update_oriented",
+            "expression_refine": "identity_refine_oriented",
+            "pose_exposure_update": "pose_update_oriented",
+        }
+        strategy_by_decision: dict[str, ExecutionStrategy] = {
+            "direct_reuse": "EXISTING_REGION_UPDATE",
+            "temporal_stabilize": "EXISTING_REGION_UPDATE",
+            "local_deform_or_update": "EXISTING_REGION_UPDATE",
+            "reveal_from_memory": "KNOWN_HIDDEN_REVEAL",
+            "reveal_partial_memory_assist": "PARTIAL_MEMORY_ASSIST_REVEAL",
+            "reveal_requires_synthesis": "UNKNOWN_HIDDEN_SYNTHESIS",
+            "garment_transition_update": "EXISTING_REGION_UPDATE",
+            "expression_refine": "EXISTING_REGION_UPDATE",
+            "pose_exposure_update": "EXISTING_REGION_UPDATE",
+        }
+        mode = decision_to_mode.get(decision)
+        if mode is None:
+            return None, "partial_runtime_plan"
+        reveal_mode = str(route_info.get("reveal_mode", "none"))
+        synthesis_required = bool(route_info.get("synthesis_required", False))
+        memory_support_level = str(route_info.get("memory_support_level", "unknown"))
+        runtime_complete = all(k in route_info for k in ("decision", "renderer_mode_hint", "reveal_mode", "synthesis_required"))
+        status: RoutingInputStatus = "authoritative_runtime_plan" if runtime_complete else "partial_runtime_plan"
+        return (
+            RenderExecutionPolicy(
+                decision_kind=decision,
+                execution_policy_kind=policy_by_decision.get(decision, "generic_update"),
+                render_mode=mode,
+                execution_strategy=strategy_by_decision.get(decision, "EXISTING_REGION_UPDATE"),
+                render_mode_hint=renderer_hint,
+                runtime_authoritative=runtime_complete,
+                routing_input_status=status,
+                reveal_mode=reveal_mode if mode == "reveal" else "none",
+                synthesis_required=synthesis_required if mode == "reveal" else False,
+                memory_support_level=memory_support_level,
+                reuse_oriented=decision in {"direct_reuse", "temporal_stabilize", "reveal_from_memory"},
+                stabilize_oriented=decision == "temporal_stabilize",
+                synthesis_oriented=decision in {"reveal_partial_memory_assist", "reveal_requires_synthesis"},
+                assist_oriented=decision == "reveal_partial_memory_assist",
+            ),
+            status,
+        )
+
     def route(self, renderer: "PatchRenderer", *, scene_graph: SceneGraph, delta: GraphDelta, memory: VideoMemory, region: RegionRef, roi: list[list[list[float]]]) -> RenderRouteDecision:
         entity_id, region_type = parse_region_id(region.region_id)
         transition_mode = str(delta.region_transition_mode.get(region_type, "stable") or "stable")
-        in_reveal = any(r.region_id == region.region_id for r in delta.newly_revealed_regions)
+        transition_diag = delta.transition_diagnostics if isinstance(delta.transition_diagnostics, dict) else {}
+        routing_plan = transition_diag.get("region_routing_plan", {}) if isinstance(transition_diag.get("region_routing_plan", {}), dict) else {}
+        route_info = routing_plan.get(region.region_id, {}) if isinstance(routing_plan.get(region.region_id, {}), dict) else {}
+        runtime_policy, routing_status = self._policy_from_runtime_route(route_info)
+        route_decision = runtime_policy.decision_kind if runtime_policy else str(route_info.get("decision", ""))
+        mode_hint = runtime_policy.render_mode_hint if runtime_policy else str(route_info.get("renderer_mode_hint", ""))
+        reveal_mode = runtime_policy.reveal_mode if runtime_policy else str(route_info.get("reveal_mode", "none"))
+        memory_support_level = runtime_policy.memory_support_level if runtime_policy else str(route_info.get("memory_support_level", "unknown"))
+        routing_info_present = bool(route_info)
+        runtime_authoritative = bool(runtime_policy and runtime_policy.runtime_authoritative)
+        in_reveal = any(r.region_id == region.region_id for r in delta.newly_revealed_regions) or route_decision.startswith("reveal_")
         slot = memory.hidden_region_slots.get(region.region_id)
         slot_hidden = bool(slot and slot.hidden_type in {"known_hidden", "unknown_hidden", "decayed_unknown"})
         exists_in_graph = any(p.person_id == entity_id for p in scene_graph.persons) or any(o.object_id == entity_id for o in scene_graph.objects)
         exists_in_memory = entity_id in memory.identity_memory or entity_id in memory.garment_memory
         insertion_ctx = delta.transition_diagnostics.get("insertion_context", {}) if isinstance(delta.transition_diagnostics, dict) else {}
         explicit_insert = bool(insertion_ctx.get(region.region_id) or insertion_ctx.get(entity_id))
+        decision_source = "fallback_heuristic"
+        fallback_path = "none"
 
         if explicit_insert or (not exists_in_graph and not exists_in_memory):
             mode: RenderMode = "insert_new"
             lifecycle: EntityLifecycle = "newly_inserted"
             reasons = ["entity_absent_in_scene_and_memory"]
+            decision_source = "fallback_insertion_gate"
+        elif runtime_policy is not None and routing_status == "authoritative_runtime_plan":
+            mode = runtime_policy.render_mode
+            lifecycle = "previously_hidden_now_revealed" if mode == "reveal" else "already_existing"
+            reasons = [f"runtime_execution_policy={runtime_policy.execution_policy_kind}"]
+            decision_source = "runtime_plan_authoritative"
         elif in_reveal or (slot_hidden and transition_mode in {"garment_reveal", "visibility_reveal", "pose_exposure"}):
             mode = "reveal"
             lifecycle = "previously_hidden_now_revealed"
             reasons = ["region_marked_revealed_or_hidden_slot_exists"]
+            decision_source = "fallback_reveal_heuristic"
+            fallback_path = "hidden_slot_or_delta_reveal"
         else:
             lifecycle = "already_existing"
-            if transition_mode in {"stable", ""}:
+            if runtime_policy is not None and mode_hint in {"keep", "warp", "deform", "refine"}:
+                mode = mode_hint  # type: ignore[assignment]
+                decision_source = "runtime_plan_partial_mode_hint"
+                fallback_path = "runtime_plan_incomplete"
+            elif transition_mode in {"stable", ""}:
                 mode = "keep"
+                fallback_path = "transition_mode_stable"
             elif transition_mode in {"expression_refine"} or region_type in {"face", "head"}:
                 mode = "refine"
+                fallback_path = "expression_or_head_fallback"
             elif transition_mode in {"pose_exposure", "pose_deform", "deform_relation_aware"}:
                 mode = "deform"
+                fallback_path = "pose_fallback"
             elif transition_mode in {"garment_surface", "open_front", "remove_outer"}:
                 mode = "warp"
+                fallback_path = "garment_fallback"
             else:
                 mode = "refine"
+                fallback_path = "default_refine_fallback"
             reasons = [f"existing_region_mode={mode}"]
 
         plan = renderer._build_plan(scene_graph, delta, memory, region, roi)
         reasons.append(f"transition_mode={transition_mode}")
+        if route_decision:
+            reasons.append(f"runtime_route_decision={route_decision}")
+        if mode_hint:
+            reasons.append(f"runtime_renderer_hint={mode_hint}")
+        if runtime_policy is not None:
+            reasons.append(f"runtime_execution_policy_kind={runtime_policy.execution_policy_kind}")
+            reasons.append(f"runtime_synthesis_required={runtime_policy.synthesis_required}")
+            reasons.append(f"runtime_memory_support={runtime_policy.memory_support_level}")
+        reasons.append(f"mode_source={decision_source}")
+        reasons.append(f"routing_input_status={routing_status}")
+        if fallback_path != "none":
+            reasons.append(f"fallback_path={fallback_path}")
+        effective_policy = runtime_policy or RenderExecutionPolicy(
+            decision_kind="fallback_unknown",
+            execution_policy_kind="fallback_heuristic",
+            render_mode=mode,
+            execution_strategy="NEW_ENTITY_INSERTION" if mode == "insert_new" else ("UNKNOWN_HIDDEN_SYNTHESIS" if mode == "reveal" else "EXISTING_REGION_UPDATE"),
+            render_mode_hint=mode_hint or "none",
+            runtime_authoritative=False,
+            routing_input_status=routing_status,
+            reveal_mode="none",
+            synthesis_required=False,
+            memory_support_level=memory_support_level,
+            reuse_oriented=mode == "keep",
+            stabilize_oriented=False,
+            synthesis_oriented=mode == "reveal" and fallback_path == "hidden_slot_or_delta_reveal",
+            assist_oriented=False,
+        )
         return RenderRouteDecision(
             mode=mode,
             lifecycle=lifecycle,
@@ -171,7 +335,17 @@ class RegionModeRouter:
                 "texture_patch_count": len(memory.texture_patches),
                 "region_descriptor_exists": region.region_id in memory.region_descriptors,
                 "retrieval_top_score": float(plan.retrieval_summary.get("top_score", 0.0)),
+                "runtime_route_decision": route_decision,
+                "runtime_reveal_mode": reveal_mode,
+                "runtime_synthesis_required": bool(route_info.get("synthesis_required", False)),
+                "runtime_memory_support_level": memory_support_level,
+                "routing_info_present": routing_info_present,
+                "routing_input_status": routing_status,
+                "mode_source": decision_source,
+                "fallback_path": fallback_path,
+                "runtime_plan_authoritative": runtime_authoritative,
             },
+            execution_policy=effective_policy,
             plan=plan,
             insertion_context=insertion_ctx.get(region.region_id, insertion_ctx.get(entity_id, {})),
         )
@@ -1104,20 +1278,17 @@ class PatchRenderer:
             uncertainty = [[1.0 - confidence for _ in range(rw)] for _ in range(rh)]
             learnable_surface = {"update_path_contract": asdict(update_contract)}
 
-        selected_strategy = "EXISTING_REGION_UPDATE"
-        if decision.mode == "reveal":
-            selected_strategy = "KNOWN_HIDDEN_REVEAL" if plan.hidden_reconstruction_mode == "known_hidden" else "UNKNOWN_HIDDEN_SYNTHESIS"
-        elif decision.mode == "insert_new":
-            selected_strategy = "NEW_ENTITY_INSERTION"
+        selected_strategy = decision.execution_policy.execution_strategy
 
         h, w, ch = shape(refined)
         structured_trace = {
             "selection": {
                 "selected_family": plan.selected_family,
-                "selected_strategy": plan.selected_strategy,
+                "planner_selected_strategy": plan.selected_strategy,
                 "selected_render_mode": decision.mode,
                 "entity_lifecycle": decision.lifecycle,
                 "mode_reasons": decision.reason_trace,
+                "execution_policy": asdict(decision.execution_policy),
                 "retrieval_mode": plan.retrieval_mode,
                 "transition_mode": plan.transition_mode,
                 "proposal_mode": plan.proposal_mode,
@@ -1178,6 +1349,8 @@ class PatchRenderer:
             f"family={plan.selected_family}",
             f"strategy={selected_strategy.lower()}",
             f"render_mode={decision.mode}",
+            f"execution_policy={decision.execution_policy.execution_policy_kind}",
+            f"decision_kind={decision.execution_policy.decision_kind}",
             f"lifecycle={decision.lifecycle}",
             f"hidden_mode={plan.hidden_reconstruction_mode}",
             f"retrieval_mode={plan.retrieval_mode}",
