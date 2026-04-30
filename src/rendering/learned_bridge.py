@@ -24,7 +24,14 @@ class LegacyDeterministicPatchSynthesisModel(PatchSynthesisModel):
         memory = request.transition_context.get("video_memory")
         if not isinstance(delta, GraphDelta) or not isinstance(memory, VideoMemory):
             raise RendererInputError("transition_context must include graph_delta and video_memory")
-        rendered = self.renderer.render(request.current_frame, request.scene_state, delta, memory, request.region)
+        rendered = self.renderer.render(
+            request.current_frame,
+            request.scene_state,
+            delta,
+            memory,
+            request.region,
+            transition_context=request.transition_context,
+        )
         trace = dict(rendered.execution_trace)
         trace.update({"renderer_path": "legacy_fallback", "synthesis_mode": "legacy_fallback"})
         return PatchSynthesisOutput(

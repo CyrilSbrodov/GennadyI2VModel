@@ -30,7 +30,7 @@ from runtime.profiles import PROFILES, RuntimeProfile
 from runtime.region_routing import CanonicalRegionRouter
 from text.intent_parser import IntentParser
 from utils_tensor import shape, zeros
-from core.region_ids import make_region_id
+from core.region_ids import make_region_id, parse_region_id
 
 
 @dataclass(slots=True)
@@ -258,6 +258,12 @@ class GennadyEngine:
             for region in changed_regions[: profile.max_roi_count]:
                 patch_channels = self.build_patch_memory_channels(memory_channels)
                 region_route = region_plan.decision_for_region_id(region.region_id)
+                try:
+                    region_entity_id, canonical_region = parse_region_id(region.region_id)
+                except ValueError:
+                    region_entity_id = entity_id
+                    canonical_region = region.region_id
+                region_memory_bundle = self.memory_manager.get_region_memory_bundle(memory, region_entity_id, canonical_region)
                 transition_metadata = transition_output.metadata if isinstance(transition_output.metadata, dict) else {}
                 learned_temporal_contract = transition_metadata.get("temporal_transition_contract", {})
                 learned_human_state_contract = transition_metadata.get("human_state_contract", {})
@@ -286,6 +292,10 @@ class GennadyEngine:
                             "renderer_mode_hint": region_route.renderer_mode_hint if region_route else "keep",
                             "synthesis_required": region_route.synthesis_required if region_route else False,
                         },
+                        "region_memory_bundle": region_memory_bundle,
+                        "region_memory_bundle_serialized": asdict(region_memory_bundle),
+                        "region_memory_support_level": region_memory_bundle.memory_support_level,
+                        "region_memory_retrieval_reasons": list(region_memory_bundle.retrieval_reasons),
                     },
                     retrieval_summary={
                         "backend": "learned_primary",

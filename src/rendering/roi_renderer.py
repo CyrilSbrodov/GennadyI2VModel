@@ -5,7 +5,7 @@ from typing import Literal
 
 from core.region_ids import make_region_id, parse_region_id
 from core.routing_contracts import DecisionKind, ExecutionStrategy, RoutingInputStatus, RUNTIME_ROUTING_DECISION_KINDS
-from core.schema import BBox, GarmentSemanticProfile, GraphDelta, RegionDescriptor, RegionRef, SceneGraph, VideoMemory
+from core.schema import BBox, GarmentSemanticProfile, GraphDelta, RegionDescriptor, RegionMemoryBundle, RegionRef, SceneGraph, VideoMemory
 from core.semantic_roi import SemanticROIHelper
 from memory.video_memory import MemoryManager
 from rendering.confidence import PatchConfidenceEstimator
@@ -1238,6 +1238,7 @@ class PatchRenderer:
         region: RegionRef,
         image_tensor: str | list | None = None,
         crop_tensor: str | list | None = None,
+        transition_context: dict[str, object] | None = None,
     ) -> RenderedPatch:
         _ = (image_tensor, crop_tensor)
         x0, y0, x1, y1 = self._bbox_to_pixels(region.bbox, current_frame)
@@ -1279,6 +1280,43 @@ class PatchRenderer:
             learnable_surface = {"update_path_contract": asdict(update_contract)}
 
         selected_strategy = decision.execution_policy.execution_strategy
+        ctx = transition_context if isinstance(transition_context, dict) else {}
+        memory_bundle_raw = ctx.get("region_memory_bundle")
+        memory_bundle = memory_bundle_raw if isinstance(memory_bundle_raw, RegionMemoryBundle) else None
+        memory_bundle_present = False
+        bundle_support_level = "unknown"
+        bundle_retrieval_reasons: list[str] = []
+        bundle_has_current_reuse = False
+        bundle_has_identity_reference = False
+        bundle_has_appearance_reference = False
+        bundle_has_garment_reference = False
+        bundle_has_hidden_slot = False
+        bundle_hidden_type = "none"
+        if memory_bundle is None and isinstance(ctx.get("region_memory_bundle_serialized"), dict):
+            bundle_data = ctx.get("region_memory_bundle_serialized", {})
+            if isinstance(bundle_data, dict):
+                memory_bundle_present = True
+                bundle_support_level = str(bundle_data.get("memory_support_level", "unknown"))
+                bundle_retrieval_reasons = list(bundle_data.get("retrieval_reasons", [])) if isinstance(bundle_data.get("retrieval_reasons", []), list) else []
+                bundle_has_current_reuse = bool(bundle_data.get("has_current_reuse", False))
+                bundle_has_identity_reference = bool(bundle_data.get("has_identity_reference", False))
+                bundle_has_appearance_reference = bool(bundle_data.get("has_appearance_reference", False))
+                bundle_has_garment_reference = bool(bundle_data.get("has_garment_reference", False))
+                bundle_has_hidden_slot = bool(bundle_data.get("has_hidden_slot", False))
+                bundle_hidden_type = str((bundle_data.get("hidden_slot") or {}).get("hidden_type", "none")) if isinstance(bundle_data.get("hidden_slot"), dict) else "none"
+            else:
+                memory_bundle_present = False
+        else:
+            memory_bundle_present = memory_bundle is not None
+            bundle_support_level = memory_bundle.memory_support_level if memory_bundle else "unknown"
+            bundle_retrieval_reasons = list(memory_bundle.retrieval_reasons) if memory_bundle else []
+            bundle_has_current_reuse = bool(memory_bundle.has_current_reuse) if memory_bundle else False
+            bundle_has_identity_reference = bool(memory_bundle.has_identity_reference) if memory_bundle else False
+            bundle_has_appearance_reference = bool(memory_bundle.has_appearance_reference) if memory_bundle else False
+            bundle_has_garment_reference = bool(memory_bundle.has_garment_reference) if memory_bundle else False
+            bundle_has_hidden_slot = bool(memory_bundle.has_hidden_slot) if memory_bundle else False
+            bundle_hidden_type = memory_bundle.hidden_slot.hidden_type if memory_bundle and memory_bundle.hidden_slot else "none"
+        bundle_hidden_support_active = bool(bundle_has_hidden_slot and bundle_hidden_type not in {"revealed", "revealed_history"})
 
         h, w, ch = shape(refined)
         structured_trace = {
@@ -1342,6 +1380,16 @@ class PatchRenderer:
                 "reuse_reason": "seeded_texture_memory" if decision.mode == "insert_new" else ("hidden_reveal_candidate" if decision.mode == "reveal" else "existing_region_carry"),
             },
             "learnable_mode_surface": learnable_surface,
+            "memory_bundle_present": memory_bundle_present,
+            "memory_support_level": bundle_support_level if memory_bundle_present else str(decision.execution_policy.memory_support_level),
+            "memory_bundle_has_current_reuse": bundle_has_current_reuse,
+            "memory_bundle_has_identity_reference": bundle_has_identity_reference,
+            "memory_bundle_has_appearance_reference": bundle_has_appearance_reference,
+            "memory_bundle_has_garment_reference": bundle_has_garment_reference,
+            "memory_bundle_has_hidden_slot": bundle_has_hidden_slot,
+            "memory_bundle_hidden_type": bundle_hidden_type,
+            "memory_bundle_hidden_support_active": bundle_hidden_support_active,
+            "memory_bundle_retrieval_reasons": bundle_retrieval_reasons if memory_bundle_present else list(ctx.get("region_memory_retrieval_reasons", [])),
         }
 
         debug_trace = [
