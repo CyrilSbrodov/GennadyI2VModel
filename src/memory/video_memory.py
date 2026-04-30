@@ -16,6 +16,7 @@ from core.schema import (
     SceneGraph,
     TexturePatchMemory,
     VideoMemory,
+    RegionMemoryBundle,
 )
 from utils_tensor import crop, mean_color, shape
 
@@ -483,6 +484,116 @@ class MemoryManager:
         if for_reveal and not entry.suitable_for_reveal:
             return None
         return entry
+
+    def get_region_memory_bundle(
+        self,
+        memory: VideoMemory,
+        entity_id: str,
+        canonical_region: str,
+    ) -> RegionMemoryBundle:
+        region_id = make_region_id(entity_id, canonical_region)
+        entry = memory.canonical_region_memory.get(region_id)
+        hidden_slot = memory.hidden_region_slots.get(region_id)
+
+        current_reuse = entry if entry and entry.reliable_for_reuse else None
+        identity_reference = (
+            entry
+            if entry and entry.reliable_as_reference and entry.reference_kind == "identity_reference"
+            else None
+        )
+        appearance_reference = (
+            entry
+            if entry and entry.reliable_as_reference and entry.reference_kind == "appearance_reference"
+            else None
+        )
+        garment_reference = (
+            entry
+            if entry and entry.reliable_as_reference and entry.reference_kind == "garment_reference"
+            else None
+        )
+        reasons: list[str] = []
+        if current_reuse is not None:
+            reasons.append("current_reuse_reliable")
+        if identity_reference is not None:
+            reasons.append("identity_reference_available")
+        if appearance_reference is not None:
+            reasons.append("appearance_reference_available")
+        if garment_reference is not None:
+            reasons.append("garment_reference_available")
+
+        hidden_slot_is_trace_history = bool(hidden_slot and hidden_slot.hidden_type in {"revealed", "revealed_history"})
+        active_hidden_support = bool(
+            hidden_slot
+            and hidden_slot.hidden_type not in {"revealed", "revealed_history"}
+            and bool(hidden_slot.candidate_patch_ids)
+        )
+        if hidden_slot is not None:
+            reasons.append(f"hidden_slot:{hidden_slot.hidden_type}")
+            if hidden_slot_is_trace_history:
+                reasons.append("revealed_history_trace")
+            elif active_hidden_support:
+                reasons.append("active_hidden_slot_candidates")
+        if entry is not None:
+            reasons.append(f"lifecycle:{entry.reveal_lifecycle}")
+            if entry.reveal_lifecycle == "newly_occluded":
+                reasons.append("occluded_state")
+            if entry.reliable_as_reference:
+                reasons.append("reference_reliable")
+            elif entry.reference_kind != "none":
+                reasons.append("reference_unreliable")
+            if not entry.reliable_for_reuse:
+                reasons.append("reuse_unreliable")
+
+        strong_reference = next(
+            (
+                ref
+                for ref in (identity_reference, appearance_reference, garment_reference)
+                if ref is not None
+                and ref.evidence_score >= 0.7
+                and not ref.generated
+                and not ref.inferred
+            ),
+            None,
+        )
+        strong_current_reuse = current_reuse is not None and current_reuse.evidence_score >= 0.7
+        low_evidence_newly_revealed = bool(
+            entry and entry.reveal_lifecycle == "newly_revealed" and entry.evidence_score < 0.7
+        )
+        strong = bool((strong_current_reuse or strong_reference is not None) and not low_evidence_newly_revealed)
+
+        any_reliable_reference = any(ref is not None for ref in (identity_reference, appearance_reference, garment_reference))
+        medium = bool(any_reliable_reference or current_reuse is not None or active_hidden_support)
+        weak = bool(
+            (entry is not None and not entry.reliable_for_reuse and not any_reliable_reference)
+            or hidden_slot_is_trace_history
+        )
+
+        support_level = "none"
+        if strong:
+            support_level = "strong"
+        elif medium:
+            support_level = "medium"
+        elif weak:
+            support_level = "weak"
+
+        return RegionMemoryBundle(
+            entity_id=entity_id,
+            canonical_region=canonical_region,
+            region_id=region_id,
+            current_reuse=current_reuse,
+            identity_reference=identity_reference,
+            appearance_reference=appearance_reference,
+            garment_reference=garment_reference,
+            hidden_slot=hidden_slot,
+            reveal_lifecycle=entry.reveal_lifecycle if entry else "unknown",
+            memory_support_level=support_level,
+            retrieval_reasons=reasons,
+            has_current_reuse=current_reuse is not None,
+            has_identity_reference=identity_reference is not None,
+            has_appearance_reference=appearance_reference is not None,
+            has_garment_reference=garment_reference is not None,
+            has_hidden_slot=hidden_slot is not None,
+        )
 
     def debug_canonical_memory(self, memory: VideoMemory, entity_id: str | None = None) -> dict[str, object]:
         entries = self.get_region_memory_entries(memory, entity_id=entity_id)

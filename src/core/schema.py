@@ -5,6 +5,7 @@ from typing import Any, Literal, TypedDict
 
 
 VisibilityState = Literal["visible", "partially_visible", "hidden", "hidden_by_self", "hidden_by_garment", "hidden_by_object", "out_of_frame", "unknown", "unknown_expected_region"]
+MemorySupportLevel = Literal["none", "weak", "medium", "strong"]
 RelationType = Literal[
     "part_of",
     "attached_to",
@@ -378,6 +379,26 @@ class CanonicalRegionMemoryEntry:
     last_observed_frame: int | None = None
     reveal_lifecycle: str = "unknown"
     last_transition: str = "stable"
+
+
+@dataclass(slots=True)
+class RegionMemoryBundle:
+    entity_id: str
+    canonical_region: str
+    region_id: str
+    current_reuse: CanonicalRegionMemoryEntry | None = None
+    identity_reference: CanonicalRegionMemoryEntry | None = None
+    appearance_reference: CanonicalRegionMemoryEntry | None = None
+    garment_reference: CanonicalRegionMemoryEntry | None = None
+    hidden_slot: HiddenRegionSlot | None = None
+    reveal_lifecycle: str = "unknown"
+    memory_support_level: MemorySupportLevel = "none"
+    retrieval_reasons: list[str] = field(default_factory=list)
+    has_current_reuse: bool = False
+    has_identity_reference: bool = False
+    has_appearance_reference: bool = False
+    has_garment_reference: bool = False
+    has_hidden_slot: bool = False
 
 @dataclass(slots=True)
 class PlannerDiagnostics:
