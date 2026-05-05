@@ -784,6 +784,7 @@ def summarize_memory_bundle_trace(transition_context: dict[str, object] | None) 
     bundle_has_garment_reference = False
     bundle_has_hidden_slot = False
     bundle_hidden_type = "none"
+    bundle_reveal_lifecycle = "unknown"
     if memory_bundle is None and isinstance(ctx.get("region_memory_bundle_serialized"), dict):
         bundle_data = ctx.get("region_memory_bundle_serialized", {})
         if isinstance(bundle_data, dict):
@@ -798,6 +799,7 @@ def summarize_memory_bundle_trace(transition_context: dict[str, object] | None) 
             bundle_has_hidden_slot = bool(bundle_data.get("has_hidden_slot", False))
             hidden_slot = bundle_data.get("hidden_slot")
             bundle_hidden_type = str((hidden_slot or {}).get("hidden_type", "none")) if isinstance(hidden_slot, dict) else "none"
+            bundle_reveal_lifecycle = str(bundle_data.get("reveal_lifecycle", "unknown"))
     else:
         memory_bundle_present = memory_bundle is not None
         bundle_support_level = memory_bundle.memory_support_level if memory_bundle else "unknown"
@@ -808,6 +810,7 @@ def summarize_memory_bundle_trace(transition_context: dict[str, object] | None) 
         bundle_has_garment_reference = bool(memory_bundle.has_garment_reference) if memory_bundle else False
         bundle_has_hidden_slot = bool(memory_bundle.has_hidden_slot) if memory_bundle else False
         bundle_hidden_type = memory_bundle.hidden_slot.hidden_type if memory_bundle and memory_bundle.hidden_slot else "none"
+        bundle_reveal_lifecycle = str(memory_bundle.reveal_lifecycle) if memory_bundle else "unknown"
     bundle_hidden_support_active = bool(bundle_has_hidden_slot and bundle_hidden_type not in {"revealed", "revealed_history"})
     return {
         "memory_bundle_present": memory_bundle_present,
@@ -818,8 +821,42 @@ def summarize_memory_bundle_trace(transition_context: dict[str, object] | None) 
         "memory_bundle_has_garment_reference": bundle_has_garment_reference,
         "memory_bundle_has_hidden_slot": bundle_has_hidden_slot,
         "memory_bundle_hidden_type": bundle_hidden_type,
+        "memory_bundle_reveal_lifecycle": bundle_reveal_lifecycle,
         "memory_bundle_hidden_support_active": bundle_hidden_support_active,
         "memory_bundle_retrieval_reasons": bundle_retrieval_reasons if memory_bundle_present else list(ctx.get("region_memory_retrieval_reasons", [])),
+    }
+
+
+def extract_memory_bundle_conditioning(request: PatchSynthesisRequest) -> dict[str, object]:
+    trace = summarize_memory_bundle_trace(request.transition_context if isinstance(request.transition_context, dict) else {})
+    support_map = {"none": 0.0, "weak": 0.33, "medium": 0.66, "strong": 1.0}
+    support_level = str(trace.get("memory_support_level", "none")).strip().lower()
+    retrieval_reasons = [str(x).lower() for x in trace.get("memory_bundle_retrieval_reasons", []) if isinstance(x, str)]
+    hidden_type = str(trace.get("memory_bundle_hidden_type", "none")).strip().lower()
+    reveal_lifecycle = str(trace.get("memory_bundle_reveal_lifecycle", "unknown")).strip().lower()
+    reveal_like_hidden = hidden_type in {"revealed", "revealed_history", "newly_revealed"}
+    is_revealed_history = hidden_type == "revealed_history"
+    reason_has_newly_revealed = any("newly_revealed" in reason for reason in retrieval_reasons)
+    reason_has_low_evidence = any("low_evidence" in reason for reason in retrieval_reasons)
+    newly_revealed_signal = reveal_lifecycle == "newly_revealed" or reason_has_newly_revealed
+    low_evidence_newly_revealed = (
+        newly_revealed_signal and (support_level in {"none", "weak"} or reason_has_low_evidence)
+    )
+    if not low_evidence_newly_revealed and hidden_type == "newly_revealed":
+        low_evidence_newly_revealed = support_level in {"none", "weak"} or reason_has_low_evidence
+    active_hidden_support = bool(trace.get("memory_bundle_hidden_support_active", False) and not reveal_like_hidden)
+    return {
+        "memory_bundle_present": bool(trace.get("memory_bundle_present", False)),
+        "memory_support_level": support_level,
+        "memory_bundle_support_value": float(support_map.get(support_level, 0.0)),
+        "memory_bundle_has_current_reuse": bool(trace.get("memory_bundle_has_current_reuse", False)),
+        "memory_bundle_has_identity_reference": bool(trace.get("memory_bundle_has_identity_reference", False)),
+        "memory_bundle_has_appearance_reference": bool(trace.get("memory_bundle_has_appearance_reference", False)),
+        "memory_bundle_has_garment_reference": bool(trace.get("memory_bundle_has_garment_reference", False)),
+        "memory_bundle_has_active_hidden_support": active_hidden_support,
+        "memory_bundle_is_revealed_history": is_revealed_history,
+        "memory_bundle_reveal_lifecycle": reveal_lifecycle,
+        "memory_bundle_low_evidence_newly_revealed": low_evidence_newly_revealed,
     }
 
 
@@ -959,6 +996,20 @@ def _memory_and_appearance_features(request: PatchSynthesisRequest, roi_before: 
         ],
         dtype=np.float32,
     )
+    bundle_cond = extract_memory_bundle_conditioning(request)
+    support_value = float(bundle_cond["memory_bundle_support_value"])
+    has_current_reuse = bool(bundle_cond["memory_bundle_has_current_reuse"])
+    has_identity_reference = bool(bundle_cond["memory_bundle_has_identity_reference"])
+    has_appearance_reference = bool(bundle_cond["memory_bundle_has_appearance_reference"])
+    has_garment_reference = bool(bundle_cond["memory_bundle_has_garment_reference"])
+    has_active_hidden = bool(bundle_cond["memory_bundle_has_active_hidden_support"])
+    is_revealed_history = bool(bundle_cond["memory_bundle_is_revealed_history"])
+    low_evidence_newly_revealed = bool(bundle_cond["memory_bundle_low_evidence_newly_revealed"])
+    mem_vec[6] = float(np.clip(max(mem_vec[6], support_value), 0.0, 1.0))
+    mem_vec[7] = float(np.clip(max(mem_vec[7], 1.0 if has_current_reuse else 0.0), 0.0, 1.0))
+    mem_vec[8] = float(np.clip(max(mem_vec[8], 1.0 if (has_identity_reference or has_appearance_reference or has_garment_reference) else 0.0), 0.0, 1.0))
+    mem_vec[9] = float(np.clip(max(mem_vec[9], 1.0 if has_active_hidden else 0.0) - (0.35 if is_revealed_history else 0.0), 0.0, 1.0))
+
     mean = np.mean(roi_before, axis=(0, 1))
     std = np.std(roi_before, axis=(0, 1))
     luminance = float(np.mean(mean))
@@ -967,6 +1018,17 @@ def _memory_and_appearance_features(request: PatchSynthesisRequest, roi_before: 
         [float(mean[0]), float(mean[1]), float(mean[2]), float(std[0]), float(std[1]), float(std[2]), luminance, chroma],
         dtype=np.float32,
     )
+    region_type = parse_region_id(request.region.region_id)[1]
+    if has_current_reuse:
+        appearance[3:6] = appearance[3:6] * np.float32(0.94)
+    if has_identity_reference and region_type in {"face", "head", "mouth", "eyes", "cheek", "neck", "hair"}:
+        appearance[6] = float(np.clip(appearance[6] + 0.06 * support_value, 0.0, 1.0))
+        appearance[7] = float(np.clip(max(0.0, appearance[7] - 0.03 * support_value), 0.0, 1.0))
+    if has_garment_reference and region_type in {"torso", "inner_garment", "outer_garment", "garments", "sleeves"}:
+        appearance[6] = float(np.clip(appearance[6] + 0.05 * support_value, 0.0, 1.0))
+        appearance[7] = float(np.clip(max(0.0, appearance[7] - 0.02 * support_value), 0.0, 1.0))
+    if low_evidence_newly_revealed:
+        appearance[7] = float(np.clip(appearance[7] + 0.08, 0.0, 1.0))
     return mem_vec, appearance
 
 
@@ -1197,6 +1259,7 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
     semantic = _semantic_embed(request.region.region_id, profile)
     delta_cond, planner_cond = _delta_features(request, profile)
     graph_cond = _graph_features(request)
+    bundle_cond = extract_memory_bundle_conditioning(request)
     memory_cond, appearance_cond = _memory_and_appearance_features(request, roi_before, profile)
     bbox_cond = np.array(
         [
@@ -1218,6 +1281,8 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
         appearance_cond,
         region_type,
     )
+    if bundle_cond["memory_bundle_low_evidence_newly_revealed"]:
+        uncertainty_target = np.clip(uncertainty_target + 0.08 * changed_mask, 0.0, 1.0).astype(np.float32)
 
     conditioning_summary = {
         "transition_mode": profile.transition_mode,
@@ -1230,6 +1295,16 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
         "memory_dependency": profile.memory_dependency,
         "alpha_floor": profile.alpha_floor,
         "alpha_peak": profile.alpha_peak,
+        "memory_bundle_present": bundle_cond["memory_bundle_present"],
+        "memory_support_level": bundle_cond["memory_support_level"],
+        "memory_bundle_support_value": bundle_cond["memory_bundle_support_value"],
+        "memory_bundle_has_current_reuse": bundle_cond["memory_bundle_has_current_reuse"],
+        "memory_bundle_has_identity_reference": bundle_cond["memory_bundle_has_identity_reference"],
+        "memory_bundle_has_garment_reference": bundle_cond["memory_bundle_has_garment_reference"],
+        "memory_bundle_has_active_hidden_support": bundle_cond["memory_bundle_has_active_hidden_support"],
+        "memory_bundle_is_revealed_history": bundle_cond["memory_bundle_is_revealed_history"],
+        "memory_bundle_reveal_lifecycle": bundle_cond["memory_bundle_reveal_lifecycle"],
+        "memory_bundle_low_evidence_newly_revealed": bundle_cond["memory_bundle_low_evidence_newly_revealed"],
     }
     return PatchBatch(
         roi_before=roi_before,
