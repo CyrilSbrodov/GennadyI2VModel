@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from core.region_ids import parse_region_id
-from core.schema import RegionRef
+from core.schema import RegionMemoryBundle, RegionRef
 from dynamics.transition_contracts import LearnedHumanStateContract, LearnedTemporalTransitionContract
 from learned.interfaces import PatchSynthesisOutput, PatchSynthesisRequest
 from utils_tensor import shape
@@ -771,6 +771,58 @@ def _extract_roi(frame: list, region: RegionRef) -> np.ndarray:
     return _to_np_patch([row[x0:x1] for row in frame[y0:y1]])
 
 
+def summarize_memory_bundle_trace(transition_context: dict[str, object] | None) -> dict[str, object]:
+    ctx = transition_context if isinstance(transition_context, dict) else {}
+    memory_bundle_raw = ctx.get("region_memory_bundle")
+    memory_bundle = memory_bundle_raw if isinstance(memory_bundle_raw, RegionMemoryBundle) else None
+    memory_bundle_present = False
+    bundle_support_level = "unknown"
+    bundle_retrieval_reasons: list[str] = []
+    bundle_has_current_reuse = False
+    bundle_has_identity_reference = False
+    bundle_has_appearance_reference = False
+    bundle_has_garment_reference = False
+    bundle_has_hidden_slot = False
+    bundle_hidden_type = "none"
+    if memory_bundle is None and isinstance(ctx.get("region_memory_bundle_serialized"), dict):
+        bundle_data = ctx.get("region_memory_bundle_serialized", {})
+        if isinstance(bundle_data, dict):
+            memory_bundle_present = True
+            bundle_support_level = str(bundle_data.get("memory_support_level", "unknown"))
+            reasons = bundle_data.get("retrieval_reasons", [])
+            bundle_retrieval_reasons = list(reasons) if isinstance(reasons, list) else []
+            bundle_has_current_reuse = bool(bundle_data.get("has_current_reuse", False))
+            bundle_has_identity_reference = bool(bundle_data.get("has_identity_reference", False))
+            bundle_has_appearance_reference = bool(bundle_data.get("has_appearance_reference", False))
+            bundle_has_garment_reference = bool(bundle_data.get("has_garment_reference", False))
+            bundle_has_hidden_slot = bool(bundle_data.get("has_hidden_slot", False))
+            hidden_slot = bundle_data.get("hidden_slot")
+            bundle_hidden_type = str((hidden_slot or {}).get("hidden_type", "none")) if isinstance(hidden_slot, dict) else "none"
+    else:
+        memory_bundle_present = memory_bundle is not None
+        bundle_support_level = memory_bundle.memory_support_level if memory_bundle else "unknown"
+        bundle_retrieval_reasons = list(memory_bundle.retrieval_reasons) if memory_bundle else []
+        bundle_has_current_reuse = bool(memory_bundle.has_current_reuse) if memory_bundle else False
+        bundle_has_identity_reference = bool(memory_bundle.has_identity_reference) if memory_bundle else False
+        bundle_has_appearance_reference = bool(memory_bundle.has_appearance_reference) if memory_bundle else False
+        bundle_has_garment_reference = bool(memory_bundle.has_garment_reference) if memory_bundle else False
+        bundle_has_hidden_slot = bool(memory_bundle.has_hidden_slot) if memory_bundle else False
+        bundle_hidden_type = memory_bundle.hidden_slot.hidden_type if memory_bundle and memory_bundle.hidden_slot else "none"
+    bundle_hidden_support_active = bool(bundle_has_hidden_slot and bundle_hidden_type not in {"revealed", "revealed_history"})
+    return {
+        "memory_bundle_present": memory_bundle_present,
+        "memory_support_level": bundle_support_level,
+        "memory_bundle_has_current_reuse": bundle_has_current_reuse,
+        "memory_bundle_has_identity_reference": bundle_has_identity_reference,
+        "memory_bundle_has_appearance_reference": bundle_has_appearance_reference,
+        "memory_bundle_has_garment_reference": bundle_has_garment_reference,
+        "memory_bundle_has_hidden_slot": bundle_has_hidden_slot,
+        "memory_bundle_hidden_type": bundle_hidden_type,
+        "memory_bundle_hidden_support_active": bundle_hidden_support_active,
+        "memory_bundle_retrieval_reasons": bundle_retrieval_reasons if memory_bundle_present else list(ctx.get("region_memory_retrieval_reasons", [])),
+    }
+
+
 def _semantic_embed(region_id: str, profile: RenderConditioningProfile) -> np.ndarray:
     _, region_type = parse_region_id(region_id)
     if region_type in ROI_FAMILIES["face_expression"]:
@@ -1249,6 +1301,7 @@ def output_from_prediction(
         preserved_drift = float(np.mean(np.abs(rgb - batch.roi_before) * _map_to_shape(batch.preservation_mask, (h, w), fill=0.0)))
         conf = float(np.clip(conf * (1.0 - preserved_drift * 1.35) * (1.0 - 0.18 * float(np.mean(uncertainty))), 0.0, 1.0))
 
+    memory_bundle_trace = summarize_memory_bundle_trace(request.transition_context)
     exec_trace = {
         "renderer_path": renderer_path,
         "selected_render_strategy": _strategy_name(batch, renderer_path),
@@ -1262,6 +1315,7 @@ def output_from_prediction(
         "uncertainty_semantics": "local_synthesis_ambiguity_map_for_compositor_and_confidence",
         "confidence_semantics": "patch_reliability_summary_after_preservation_and_ambiguity_checks",
         "output_provenance": "trainable_local_patch_model",
+        **memory_bundle_trace,
     }
     return PatchSynthesisOutput(
         region=request.region,
