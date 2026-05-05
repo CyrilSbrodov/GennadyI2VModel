@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from core.schema import BBox, GlobalSceneContext, GraphDelta, HiddenRegionSlot, PersonNode, RegionRef, SceneGraph
+from core.schema import BBox, GlobalSceneContext, GraphDelta, HiddenRegionSlot, PersonNode, RegionMemoryBundle, RegionRef, SceneGraph
 from learned.factory import BackendConfig, LearnedBackendFactory
 from learned.interfaces import PatchSynthesisRequest
 from memory.video_memory import MemoryManager
@@ -232,6 +232,81 @@ def test_trainable_patch_output_trace_marks_bundle_absent() -> None:
     req = _request("p1:face")
     out = backend.synthesize_patch(req)
     assert out.execution_trace["memory_bundle_present"] is False
+
+
+def test_build_patch_batch_memory_cond_uses_strong_identity_reference() -> None:
+    req = _request("p1:face", mode="expression_refine")
+    roi = _roi_from_request(req)
+    base = build_patch_batch(req, roi)
+    req.transition_context["region_memory_bundle_serialized"] = {
+        "memory_support_level": "strong",
+        "has_current_reuse": True,
+        "has_identity_reference": True,
+        "has_appearance_reference": True,
+        "has_garment_reference": False,
+        "has_hidden_slot": False,
+        "retrieval_reasons": ["identity_reference"],
+    }
+    with_bundle = build_patch_batch(req, roi)
+    assert not np.allclose(base.memory_cond, with_bundle.memory_cond)
+    assert not np.allclose(base.appearance_cond, with_bundle.appearance_cond)
+    assert with_bundle.conditioning_summary["memory_bundle_has_identity_reference"] is True
+
+
+def test_build_patch_batch_revealed_history_not_active_hidden() -> None:
+    req = _request("p1:face", mode="expression_refine")
+    req.transition_context["region_memory_bundle"] = RegionMemoryBundle(
+        entity_id="p1",
+        canonical_region="face",
+        region_id="p1:face",
+        memory_support_level="medium",
+        has_hidden_slot=True,
+        hidden_slot=HiddenRegionSlot(slot_id="p1:face", region_type="face", owner_entity="p1", hidden_type="revealed_history"),
+    )
+    batch = build_patch_batch(req, _roi_from_request(req))
+    assert batch.conditioning_summary["memory_bundle_is_revealed_history"] is True
+    assert batch.conditioning_summary["memory_bundle_has_active_hidden_support"] is False
+
+
+def test_build_patch_batch_low_evidence_newly_revealed_increases_uncertainty() -> None:
+    req = _request("p1:face", mode="expression_refine")
+    roi = _roi_from_request(req)
+    base = build_patch_batch(req, roi)
+    req.transition_context["region_memory_bundle_serialized"] = {
+        "memory_support_level": "weak",
+        "has_hidden_slot": True,
+        "hidden_slot": {"hidden_type": "newly_revealed"},
+        "retrieval_reasons": ["low_evidence_newly_revealed"],
+    }
+    risky = build_patch_batch(req, roi)
+    assert float(np.mean(risky.uncertainty_target)) > float(np.mean(base.uncertainty_target))
+    assert risky.conditioning_summary["memory_bundle_low_evidence_newly_revealed"] is True
+
+
+def test_build_patch_batch_low_evidence_newly_revealed_from_bundle_lifecycle_increases_uncertainty() -> None:
+    req = _request("p1:face", mode="expression_refine")
+    roi = _roi_from_request(req)
+    base = build_patch_batch(req, roi)
+    req.transition_context["region_memory_bundle"] = RegionMemoryBundle(
+        entity_id="p1",
+        canonical_region="face",
+        region_id="p1:face",
+        memory_support_level="weak",
+        reveal_lifecycle="newly_revealed",
+        retrieval_reasons=["newly_revealed"],
+    )
+    risky = build_patch_batch(req, roi)
+    assert float(np.mean(risky.uncertainty_target)) > float(np.mean(base.uncertainty_target))
+    assert risky.conditioning_summary["memory_bundle_low_evidence_newly_revealed"] is True
+    assert risky.conditioning_summary["memory_bundle_reveal_lifecycle"] == "newly_revealed"
+
+
+def test_build_patch_batch_bundle_absent_defaults_safe() -> None:
+    req = _request("p1:face", mode="expression_refine")
+    req.transition_context.pop("region_memory_bundle", None)
+    req.transition_context.pop("region_memory_bundle_serialized", None)
+    batch = build_patch_batch(req, _roi_from_request(req))
+    assert batch.conditioning_summary["memory_bundle_present"] is False
 
 
 def test_expression_refine_is_local_and_conservative() -> None:
