@@ -13,6 +13,7 @@ from rendering.trainable_patch_renderer import (
     summarize_request_contract,
     _extract_roi,
 )
+from rendering.torch_local_patch_generator import TorchBackendUnavailableError, TorchLocalPatchGenerator
 
 
 class LegacyDeterministicPatchSynthesisModel(PatchSynthesisModel):
@@ -51,10 +52,25 @@ class LegacyDeterministicPatchSynthesisModel(PatchSynthesisModel):
 
 
 class TrainablePatchSynthesisModel(PatchSynthesisModel):
-    def __init__(self, model: TrainableLocalPatchModel | None = None, fallback: LegacyDeterministicPatchSynthesisModel | None = None, strict_mode: bool = False) -> None:
-        self.model = model or TrainableLocalPatchModel()
+    def __init__(self, model: TrainableLocalPatchModel | TorchLocalPatchGenerator | None = None, fallback: LegacyDeterministicPatchSynthesisModel | None = None, strict_mode: bool = False, backend: str = "torch_local") -> None:
+        self.backend = backend
         self.fallback = fallback or LegacyDeterministicPatchSynthesisModel()
         self.strict_mode = strict_mode
+        self._torch_unavailable_reason = ""
+        if model is not None:
+            self.model = model
+        elif backend == "numpy_local":
+            self.model = TrainableLocalPatchModel()
+        elif backend == "torch_local":
+            try:
+                self.model = TorchLocalPatchGenerator()
+            except (RendererInferenceError, TorchBackendUnavailableError) as err:
+                if strict_mode:
+                    raise
+                self._torch_unavailable_reason = str(err)
+                self.model = TrainableLocalPatchModel()
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
 
     def synthesize_patch(self, request: PatchSynthesisRequest) -> PatchSynthesisOutput:
         request_contract = summarize_request_contract(request)
@@ -63,18 +79,25 @@ class TrainablePatchSynthesisModel(PatchSynthesisModel):
             batch = build_patch_batch(request, roi_before)
             pred = self.model.infer(batch)
             batch_summary = summarize_patch_batch(batch)
+            torch_used = isinstance(self.model, TorchLocalPatchGenerator)
+            fallback_used = self.backend == "torch_local" and (not torch_used) and bool(self._torch_unavailable_reason)
+            renderer_path = "torch_local_patch_generator" if torch_used else "learned_primary"
             return output_from_prediction(
                 request,
                 pred,
-                "learned_primary",
+                renderer_path,
                 {
-                    "fallback_used": False,
+                    "fallback_used": fallback_used,
+                    "fallback_reason": "torch_unavailable" if fallback_used else "",
+                    "fallback_message": self._torch_unavailable_reason if fallback_used else "",
                     "strict_mode": self.strict_mode,
                     "roi_shape": list(roi_before.shape),
                     "transition_mode": batch.transition_mode,
                     "profile_role": batch.profile_role,
                     "reveal_like": bool(batch.conditioning_summary.get("reveal_like", False)),
-                    "output_provenance": "trainable_local_patch_model",
+                    "output_provenance": "torch_local_patch_generator" if torch_used else "trainable_local_patch_model",
+                    "torch_backend_used": torch_used,
+                    "model_family": "local_conv_conditioned_patch_generator" if torch_used else "numpy_linear_patch_generator",
                     "conditioning_summary": batch_summary,
                     "conditioning": {
                         "has_graph_encoding": bool(request.graph_encoding),

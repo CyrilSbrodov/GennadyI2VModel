@@ -1,0 +1,23 @@
+from __future__ import annotations
+
+SEMANTIC_DIM = 8
+DELTA_DIM = 12
+PLANNER_DIM = 10
+GRAPH_DIM = 8
+MEMORY_DIM = 10
+APPEARANCE_DIM = 8
+BBOX_DIM = 6
+MODE_DIM = 8
+ROLE_DIM = 6
+
+GLOBAL_COND_DIM = (
+    SEMANTIC_DIM
+    + DELTA_DIM
+    + PLANNER_DIM
+    + GRAPH_DIM
+    + MEMORY_DIM
+    + APPEARANCE_DIM
+    + BBOX_DIM
+    + MODE_DIM
+    + ROLE_DIM
+)

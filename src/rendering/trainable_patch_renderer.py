@@ -7,7 +7,20 @@ from pathlib import Path
 import numpy as np
 
 from core.region_ids import parse_region_id
+from rendering.patch_conditioning_contract import (
+    APPEARANCE_DIM,
+    BBOX_DIM,
+    DELTA_DIM,
+    GLOBAL_COND_DIM,
+    GRAPH_DIM,
+    MEMORY_DIM,
+    MODE_DIM,
+    PLANNER_DIM,
+    ROLE_DIM,
+    SEMANTIC_DIM
+)
 from core.schema import RegionMemoryBundle, RegionRef
+from rendering.patch_tensor_utils import map_to_shape
 from dynamics.transition_contracts import LearnedHumanStateContract, LearnedTemporalTransitionContract
 from learned.interfaces import PatchSynthesisOutput, PatchSynthesisRequest
 from utils_tensor import shape
@@ -37,27 +50,8 @@ TRANSITION_MODE_ORDER = (
 )
 PROFILE_ROLE_ORDER = ("primary", "secondary", "context")
 
-SEMANTIC_DIM = 8
-DELTA_DIM = 12
-PLANNER_DIM = 10
-GRAPH_DIM = 8
-MEMORY_DIM = 10
-APPEARANCE_DIM = 8
-BBOX_DIM = 6
-MODE_DIM = 8
-ROLE_DIM = 6
 PIXEL_FEATURE_DIM = 15
-CONDITION_FEATURE_DIM = (
-    SEMANTIC_DIM
-    + DELTA_DIM
-    + PLANNER_DIM
-    + GRAPH_DIM
-    + MEMORY_DIM
-    + APPEARANCE_DIM
-    + BBOX_DIM
-    + MODE_DIM
-    + ROLE_DIM
-)
+CONDITION_FEATURE_DIM = GLOBAL_COND_DIM
 
 
 @dataclass(slots=True)
@@ -134,17 +128,10 @@ def _vector_to_size(value: np.ndarray | list[float] | tuple[float, ...] | None, 
 
 
 def _map_to_shape(value: np.ndarray | None, shape_hw: tuple[int, int], fill: float = 0.0) -> np.ndarray:
-    h, w = shape_hw
-    if value is None:
-        return np.full((h, w, 1), fill, dtype=np.float32)
-    arr = np.asarray(value, dtype=np.float32)
-    if arr.ndim == 2:
-        arr = arr[..., None]
-    if arr.ndim != 3 or arr.shape[:2] != (h, w):
-        raise RendererInferenceError(f"Unexpected map shape {arr.shape}, expected {(h, w)}")
-    if arr.shape[2] != 1:
-        arr = np.mean(arr, axis=2, keepdims=True)
-    return _clip01(arr).astype(np.float32)
+    try:
+        return map_to_shape(value, shape_hw, fill=fill)
+    except RuntimeError as err:
+        raise RendererInferenceError(str(err)) from err
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
@@ -1390,6 +1377,11 @@ def output_from_prediction(
         "uncertainty_semantics": "local_synthesis_ambiguity_map_for_compositor_and_confidence",
         "confidence_semantics": "patch_reliability_summary_after_preservation_and_ambiguity_checks",
         "output_provenance": "trainable_local_patch_model",
+        "torch_backend_used": bool(diagnostics.get("torch_backend_used", False)),
+        "model_family": str(diagnostics.get("model_family", "")),
+        "fallback_used": bool(diagnostics.get("fallback_used", False)),
+        "fallback_reason": str(diagnostics.get("fallback_reason", "")),
+        "fallback_message": str(diagnostics.get("fallback_message", "")),
         **memory_bundle_trace,
     }
     return PatchSynthesisOutput(
