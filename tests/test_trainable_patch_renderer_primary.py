@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from core.schema import BBox, GlobalSceneContext, GraphDelta, PersonNode, RegionRef, SceneGraph
+from core.schema import BBox, GlobalSceneContext, GraphDelta, HiddenRegionSlot, PersonNode, RegionRef, SceneGraph
 from learned.factory import BackendConfig, LearnedBackendFactory
 from learned.interfaces import PatchSynthesisRequest
 from memory.video_memory import MemoryManager
@@ -196,6 +196,42 @@ def test_renderer_output_contract_includes_alpha_uncertainty_semantics() -> None
     assert out.metadata["blend_hint_mean"] >= 0.0
     assert out.execution_trace["transition_mode"] == "expression_refine"
     assert out.execution_trace["profile_role"] == "primary"
+
+
+def test_trainable_patch_output_trace_records_memory_bundle() -> None:
+    backend = TrainablePatchSynthesisModel()
+    req = _request("p1:face")
+    memory = req.transition_context["video_memory"]
+    bundle = MemoryManager().get_region_memory_bundle(memory, "p1", "face")
+    req.transition_context["region_memory_bundle"] = bundle
+    out = backend.synthesize_patch(req)
+    assert out.execution_trace["memory_bundle_present"] is True
+    assert out.execution_trace["memory_support_level"] == bundle.memory_support_level
+
+
+def test_trainable_patch_output_trace_marks_revealed_history_not_active() -> None:
+    backend = TrainablePatchSynthesisModel()
+    req = _request("p1:face")
+    memory = req.transition_context["video_memory"]
+    memory.hidden_region_slots["p1:face"] = HiddenRegionSlot(
+        slot_id="p1:face",
+        region_type="face",
+        owner_entity="p1",
+        hidden_type="revealed_history",
+        candidate_patch_ids=["patch-1"],
+    )
+    bundle = MemoryManager().get_region_memory_bundle(memory, "p1", "face")
+    req.transition_context["region_memory_bundle"] = bundle
+    out = backend.synthesize_patch(req)
+    assert out.execution_trace["memory_bundle_hidden_type"] == "revealed_history"
+    assert out.execution_trace["memory_bundle_hidden_support_active"] is False
+
+
+def test_trainable_patch_output_trace_marks_bundle_absent() -> None:
+    backend = TrainablePatchSynthesisModel()
+    req = _request("p1:face")
+    out = backend.synthesize_patch(req)
+    assert out.execution_trace["memory_bundle_present"] is False
 
 
 def test_expression_refine_is_local_and_conservative() -> None:
