@@ -850,7 +850,7 @@ class PatchSynthesisStageRunner(_BaseStageRunner):
                 supervision_mismatches.append({"field": "retrieval_richness_target", "expected": sample.get("target_retrieval_richness"), "actual": sample.get("hidden_state", {}).get("retrieval_profile"), "sample_index": idx})
             parity = _build_parity_result(
                 contract=contract,
-                required_fields=["roi_before", "roi_after", "region_metadata", "selected_strategy", "transition_context"],
+                required_fields=["roi_before", "roi_after", "region_metadata", "selected_render_strategy", "transition_context"],
                 stage="patch",
                 request=req,
                 output=out,

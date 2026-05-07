@@ -266,10 +266,10 @@ def semantic_parity_checks(
                 if missing_modes:
                     _push(issues, "warnings", "region_transition_mode_missing_specific_regions")
     if stage == "patch":
-        selected = str(contract.get("selected_strategy", "")) if isinstance(contract, dict) else ""
+        selected_render_strategy = str(contract.get("selected_render_strategy", "")) if isinstance(contract, dict) else ""
         patch_obj = getattr(output, "rgb_patch", None)
-        if patch_obj and selected.strip() in {"", "unknown"}:
-            _push(issues, "warnings", "selected_strategy_missing_for_non_empty_patch")
+        if patch_obj and selected_render_strategy.strip() in {"", "unknown"}:
+            _push(issues, "warnings", "selected_render_strategy_missing_for_non_empty_patch")
         if isinstance(request, PatchSynthesisRequest) and request.memory_channels.get("identity") and not request.identity_embedding:
             _push(issues, "warnings", "identity_channel_requested_but_embedding_empty")
     if stage == "temporal":
