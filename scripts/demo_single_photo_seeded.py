@@ -474,23 +474,24 @@ def add_visible_debug_boost(patch) -> None:
     Для demo-режима делаем эффект заметнее, иначе визуально почти ничего не видно.
     Это НЕ production-логика, а просто визуальный буст для smoke/demo.
     """
-    strategy = (patch.execution_trace or {}).get("selection", {}).get("planner_selected_strategy", "")
+    # demo-only boost uses planner_selected_strategy intentionally; not renderer canonical strategy
+    planner_strategy = (patch.execution_trace or {}).get("selection", {}).get("planner_selected_strategy", "")
     rgb = np.array(patch.rgb_patch, dtype=np.float32)
 
-    if strategy == "face_refine":
+    if planner_strategy == "face_refine":
         rgb[..., 0] *= 1.06
         rgb[..., 1] *= 1.02
         rgb[..., 2] *= 1.02
-    elif strategy == "garment_reveal":
+    elif planner_strategy == "garment_reveal":
         rgb[..., 0] *= 1.10
         rgb[..., 1] *= 1.08
         rgb[..., 2] *= 1.02
-    elif strategy == "garment_surface_update":
+    elif planner_strategy == "garment_surface_update":
         rgb[..., 1] *= 1.10
         rgb[..., 2] *= 1.06
-    elif strategy == "pose_local_deform":
+    elif planner_strategy == "pose_local_deform":
         rgb[..., 2] *= 1.10
-    elif strategy == "fallback_repair":
+    elif planner_strategy == "fallback_repair":
         rgb[..., 1] *= 1.06
 
     rgb = np.clip(rgb, 0.0, 1.0)
