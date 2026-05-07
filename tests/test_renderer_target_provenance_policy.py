@@ -137,7 +137,7 @@ def test_self_generated_only_manifest_records_warning(tmp_path: Path) -> None:
     ds = RendererDataset.from_renderer_manifest(str(path), strict=True)
 
     assert ds.diagnostics["contains_only_self_generated_targets"] is True
-    assert ds.diagnostics["warning"] == "renderer manifest contains only self-generated runtime targets; use for bootstrapping/eval cautiously"
+    assert ds.diagnostics["warning"] == "renderer manifest contains only self-generated runtime targets; use for bootstrap/eval cautiously"
     assert any(w.get("type") == "self_generated_only_targets" for w in ds.diagnostics["warnings"])
 
 
