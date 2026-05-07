@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 from core.schema import ActionStep, GraphDelta, RegionRef, SceneGraph
 from training.datasets import _serialize_delta_contract, _serialize_graph
@@ -33,7 +33,7 @@ class PatchSynthesisContract(TypedDict):
     region_metadata: dict[str, object]
     retrieval_explanation_summary: str
     selected_render_strategy: str
-    selected_strategy: str
+    selected_strategy: NotRequired[str]
     hidden_lifecycle_state: dict[str, object]
     synthesis_mode: str
     transition_context: dict[str, object]
@@ -84,14 +84,15 @@ def build_graph_transition_contract(before: SceneGraph, after: SceneGraph, delta
 
 
 def build_patch_synthesis_contract(roi_before: object, roi_after: object, region: RegionRef, retrieval_summary: str, selected_strategy: str, hidden_state: dict[str, object], synthesis_mode: str, transition_context: dict[str, object]) -> PatchSynthesisContract:
+    selected_render_strategy = selected_strategy
     return {
         "roi_before": roi_before,
         "roi_after": roi_after,
         "region_metadata": {"region_id": region.region_id, "reason": region.reason},
         "retrieval_explanation_summary": retrieval_summary,
-        "selected_render_strategy": selected_strategy,
-        # backward-compatible alias for older contract consumers
-        "selected_strategy": selected_strategy,
+        "selected_render_strategy": selected_render_strategy,
+        # backward-compatible alias for older contract consumers; not a canonical required field.
+        "selected_strategy": selected_render_strategy,
         "hidden_lifecycle_state": hidden_state,
         "synthesis_mode": synthesis_mode,
         "transition_context": transition_context,

@@ -33,6 +33,9 @@ from utils_tensor import shape, zeros
 from core.region_ids import make_region_id, parse_region_id
 
 
+PATCH_PARITY_REQUIRED_FIELDS = ["roi_before", "roi_after", "region_metadata", "selected_render_strategy", "transition_context"]
+
+
 @dataclass(slots=True)
 class InferenceArtifacts:
     frames: list[list]
@@ -329,7 +332,7 @@ class GennadyEngine:
                 patch_contract = patch_io_to_contract(patch_request, patch_out)
                 patch_parity = build_parity_result(
                     contract=patch_contract,
-                    required_fields=["roi_before", "roi_after", "region_metadata", "selected_strategy", "transition_context"],
+                    required_fields=PATCH_PARITY_REQUIRED_FIELDS,
                     stage="patch",
                     request=patch_request,
                     output=patch_out,
