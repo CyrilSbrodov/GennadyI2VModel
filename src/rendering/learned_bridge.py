@@ -79,7 +79,7 @@ class TrainablePatchSynthesisModel(PatchSynthesisModel):
             batch = build_patch_batch(request, roi_before)
             pred = self.model.infer(batch)
             batch_summary = summarize_patch_batch(batch)
-            torch_used = isinstance(self.model, TorchLocalPatchGenerator)
+            torch_used = isinstance(self.model, TorchLocalPatchGenerator) if isinstance(TorchLocalPatchGenerator, type) else False
             fallback_used = self.backend == "torch_local" and (not torch_used) and bool(self._torch_unavailable_reason)
             renderer_path = "torch_local_patch_generator" if torch_used else "learned_primary"
             return output_from_prediction(
