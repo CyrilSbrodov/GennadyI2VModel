@@ -9,8 +9,10 @@ import numpy as np
 from dynamics.human_state_transition import HumanStateTransitionModel
 from dynamics.temporal_transition_encoder import PHASES, TemporalTransitionEncoder
 from dynamics.model import DynamicsModel
+from rendering.patch_conditioning_contract import GLOBAL_COND_DIM
 from rendering.trainable_patch_renderer import PatchBatch, TemporalLocalPatchModel, TrainableLocalPatchModel
 from training.rollout_eval import evaluate_rollout_modes_on_video_manifest
+from rendering.torch_local_patch_generator import TorchBackendUnavailableError, TorchLocalPatchGenerator
 from training.datasets import RendererDataset
 from training.types import StageResult, TrainingConfig
 
@@ -152,6 +154,14 @@ class RendererBatchAdapter:
         prev_roi = temporal_window.get("roi_t_minus_1", b)
         prev_np = self._np3(prev_roi)
         rollout_weight = float(np.clip(1.0 + selected.reveal_score * 0.4 + selected.occlusion_score * 0.3, 0.5, 2.0))
+        conditioning_summary = {
+            "contract_source": selected.source,
+            "predicted_family": selected.predicted_family,
+            "predicted_phase": selected.predicted_phase,
+            "target_profile": selected.target_profile,
+        }
+        extra_summary = contract.get("conditioning_summary", {}) if isinstance(contract.get("conditioning_summary", {}), dict) else {}
+        conditioning_summary.update(extra_summary)
         return PatchBatch(
             roi_before=b,
             roi_after=a,
@@ -165,12 +175,7 @@ class RendererBatchAdapter:
             memory_cond=memory_cond,
             appearance_cond=appearance_cond,
             bbox_cond=bbox_cond,
-            conditioning_summary={
-                "contract_source": selected.source,
-                "predicted_family": selected.predicted_family,
-                "predicted_phase": selected.predicted_phase,
-                "target_profile": selected.target_profile,
-            },
+            conditioning_summary=conditioning_summary,
             previous_roi=prev_np if temporal_mode else None,
             predicted_family=selected.predicted_family,
             predicted_phase=selected.predicted_phase,
@@ -188,7 +193,7 @@ class RendererTrainer:
     stage_name = "renderer"
 
     def __init__(self) -> None:
-        self.model: TrainableLocalPatchModel | TemporalLocalPatchModel = TrainableLocalPatchModel()
+        self.model: TrainableLocalPatchModel | TemporalLocalPatchModel | TorchLocalPatchGenerator = TrainableLocalPatchModel()
         self.dataset_source = "synthetic_bootstrap"
         self.dataset_diagnostics: dict[str, object] = {}
         self.contract_conditioning_mode = "weak_contract_only"
@@ -196,6 +201,9 @@ class RendererTrainer:
         self.human_state_encoder = HumanStateTransitionModel()
         self.adapter = RendererBatchAdapter(encoder=None, human_encoder=None)
         self.temporal_renderer_mode = "legacy_local_renderer"
+        self.renderer_backend = "numpy_local"
+        self.fallback_used = False
+        self.fallback_reason = ""
 
     @staticmethod
     def _resolve_conditioning_mode(config: TrainingConfig, has_manifest: bool) -> str:
@@ -229,6 +237,22 @@ class RendererTrainer:
             self.dataset_diagnostics = {}
         return RendererDataset.synthetic(config.train_size), RendererDataset.synthetic(config.val_size)
 
+    @staticmethod
+    def load_model_from_checkpoint(checkpoint_path: str):
+        payload = json.loads(Path(checkpoint_path).read_text(encoding="utf-8"))
+        metadata = payload.get("renderer_model_metadata", {}) if isinstance(payload.get("renderer_model_metadata", {}), dict) else {}
+        backend = str(metadata.get("renderer_backend", payload.get("renderer_backend", "numpy_local")))
+        model_path = str(payload.get("model_path", ""))
+        if backend == "torch_local":
+            if not model_path:
+                raise ValueError("Torch renderer checkpoint missing model_path")
+            return TorchLocalPatchGenerator.load(model_path), backend
+        if backend in {"numpy_local", "legacy_local_renderer", "temporal_local_renderer"} or not backend:
+            if not model_path:
+                raise ValueError("Renderer checkpoint missing model_path")
+            return TrainableLocalPatchModel.load(model_path), "numpy_local"
+        raise ValueError(f"Unsupported renderer backend in checkpoint metadata: {backend}")
+
     def _iter_batches(self, dataset: RendererDataset):
         has_temporal = bool(dataset.samples and isinstance(dataset.samples[0].get("temporal_transition_features"), list))
         has_human = bool(dataset.samples and isinstance(dataset.samples[0].get("human_state_transition_features"), list))
@@ -237,13 +261,13 @@ class RendererTrainer:
             yield self.adapter.adapt(sample, temporal_mode=self.temporal_renderer_mode == "temporal_local_renderer")
 
     @staticmethod
-    def evaluate_model(model: TrainableLocalPatchModel | TemporalLocalPatchModel, batches: list[PatchBatch], diagnostics: dict[str, object] | None = None) -> dict[str, float]:
+    def evaluate_model(model: TrainableLocalPatchModel | TemporalLocalPatchModel | TorchLocalPatchGenerator, batches: list[PatchBatch], diagnostics: dict[str, object] | None = None, *, renderer_backend: str = "numpy_local", fallback_used: bool = False) -> dict[str, float]:
         if not batches:
             return {"reconstruction_mae": 1.0, "alpha_mae": 1.0, "uncertainty_calibration_mae": 1.0, "contract_validity": 0.0, "fallback_free_happy_path_ratio": 0.0, "face_family_score": 0.0, "torso_family_score": 0.0, "sleeve_family_score": 0.0, "usable_sample_count": 0.0, "invalid_records": float((diagnostics or {}).get("invalid_records", 0)), "skipped_records": float((diagnostics or {}).get("skipped_records", 0)), "learned_contract_usage_ratio": 0.0, "weak_contract_usage_ratio": 1.0, "temporal_to_renderer_mode_consistency": 0.0, "temporal_to_renderer_target_profile_consistency": 0.0, "score": 0.0}
         eval_entries = [model.eval_step(b) for b in batches]
-        recon_mae = float(sum(e["mae"] for e in eval_entries) / len(eval_entries))
-        alpha_mae = float(sum(e["alpha_mae"] for e in eval_entries) / len(eval_entries))
-        unc_mae = float(sum(e["uncertainty_calibration_loss"] for e in eval_entries) / len(eval_entries))
+        recon_mae = float(sum(float(e.get("mae", e.get("total_loss", 0.0))) for e in eval_entries) / len(eval_entries))
+        alpha_mae = float(sum(float(e.get("alpha_mae", 0.0)) for e in eval_entries) / len(eval_entries))
+        unc_mae = float(sum(float(e.get("uncertainty_calibration_loss", e.get("uncertainty_mean", 0.0))) for e in eval_entries) / len(eval_entries))
         contract_validity = float(sum(1.0 for b in batches if b.alpha_target.shape[:2] == b.roi_before.shape[:2] and b.changed_mask.shape[:2] == b.roi_before.shape[:2]) / len(batches))
         per_family = {"face": [], "torso": [], "sleeve": []}
         learned_usage = 0.0
@@ -251,12 +275,13 @@ class RendererTrainer:
         mode_consistency = 0.0
         profile_consistency = 0.0
         for b, e in zip(batches, eval_entries):
+            sample_mae = float(e.get("mae", e.get("total_loss", 1.0)))
             if b.semantic_embed[0] > 0.5:
-                per_family["face"].append(e["mae"])
+                per_family["face"].append(sample_mae)
             elif b.semantic_embed[1] > 0.5:
-                per_family["torso"].append(e["mae"])
+                per_family["torso"].append(sample_mae)
             else:
-                per_family["sleeve"].append(e["mae"])
+                per_family["sleeve"].append(sample_mae)
             summary = b.conditioning_summary if isinstance(b.conditioning_summary, dict) else {}
             source = str(summary.get("contract_source", "weak_manifest_bootstrap"))
             learned_usage += 1.0 if source in {"learned_temporal_contract", "learned_human_state_contract"} else 0.0
@@ -267,6 +292,18 @@ class RendererTrainer:
             profile = summary.get("target_profile", {}) if isinstance(summary.get("target_profile", {}), dict) else {}
             has_profile = bool(profile.get("primary_regions") or profile.get("secondary_regions") or profile.get("context_regions"))
             profile_consistency += 1.0 if has_profile else 0.0
+        memory_bundle_present = 0.0
+        memory_support_known = 0.0
+        memory_support_strong = 0.0
+        for b in batches:
+            summary = b.conditioning_summary if isinstance(b.conditioning_summary, dict) else {}
+            if "memory_bundle_present" in summary:
+                memory_bundle_present += 1.0 if bool(summary.get("memory_bundle_present")) else 0.0
+                memory_support_known += 1.0
+            if str(summary.get("memory_support_level", "")) == "strong":
+                memory_support_strong += 1.0
+        memory_bundle_conditioning_present = memory_bundle_present / memory_support_known if memory_support_known > 0 else 0.0
+        memory_support_level_strong_ratio = memory_support_strong / memory_support_known if memory_support_known > 0 else 0.0
         temporal_eval = {
             "temporal_window_usage_ratio": float(sum(1.0 for b in batches if isinstance(b.previous_roi, np.ndarray)) / len(batches)),
             "reveal_loss": float(sum(float(e.get("reveal_region_focus_loss", 0.0)) for e in eval_entries) / len(eval_entries)),
@@ -290,10 +327,17 @@ class RendererTrainer:
             "torso_family_score": fam_score(per_family["torso"]),
             "sleeve_family_score": fam_score(per_family["sleeve"]),
             "usable_sample_count": float(len(batches)),
+            "renderer_backend": renderer_backend,
+            "model_family": "local_conv_conditioned_patch_generator" if isinstance(model, TorchLocalPatchGenerator) else "numpy_linear_patch_generator",
+            "torch_backend_used": 1.0 if isinstance(model, TorchLocalPatchGenerator) else 0.0,
+            "global_cond_dim": float(GLOBAL_COND_DIM),
+            "fallback_used": 1.0 if fallback_used else 0.0,
             "invalid_records": float((diagnostics or {}).get("invalid_records", 0)),
             "skipped_records": float((diagnostics or {}).get("skipped_records", 0)),
             "learned_contract_usage_ratio": float(learned_usage / len(batches)),
             "weak_contract_usage_ratio": float(weak_usage / len(batches)),
+            "memory_bundle_conditioning_present": float(memory_bundle_conditioning_present),
+            "memory_support_level_strong_ratio": float(memory_support_level_strong_ratio),
             "temporal_to_renderer_mode_consistency": float(mode_consistency / len(batches)),
             "temporal_to_renderer_target_profile_consistency": float(profile_consistency / len(batches)),
             "score": score,
@@ -306,14 +350,34 @@ class RendererTrainer:
 
     def train(self, config: TrainingConfig) -> StageResult:
         train_dataset, val_dataset = self.build_datasets(config)
-        self.temporal_renderer_mode = (
-            str(getattr(config, "renderer_backend", "legacy_local_renderer"))
-            if str(getattr(config, "renderer_backend", "legacy_local_renderer")) in {"legacy_local_renderer", "temporal_local_renderer"}
-            else "legacy_local_renderer"
-        )
+        requested_backend = str(getattr(config, "renderer_backend", "numpy_local") or "numpy_local")
+        if requested_backend in {"legacy_local_renderer", "temporal_local_renderer"}:
+            self.temporal_renderer_mode = requested_backend
+            self.renderer_backend = "numpy_local"
+            self.model = TemporalLocalPatchModel() if self.temporal_renderer_mode == "temporal_local_renderer" else TrainableLocalPatchModel()
+            self.fallback_used = False
+            self.fallback_reason = ""
+        elif requested_backend == "numpy_local":
+            self.temporal_renderer_mode = str(getattr(config, "renderer_temporal_mode", "legacy_local_renderer") or "legacy_local_renderer")
+            if self.temporal_renderer_mode not in {"legacy_local_renderer", "temporal_local_renderer"}:
+                self.temporal_renderer_mode = "legacy_local_renderer"
+            self.renderer_backend = "numpy_local"
+            self.model = TrainableLocalPatchModel()
+            self.fallback_used = False
+            self.fallback_reason = ""
+        elif requested_backend == "torch_local":
+            self.temporal_renderer_mode = "legacy_local_renderer"
+            self.renderer_backend = "torch_local"
+            try:
+                self.model = TorchLocalPatchGenerator()
+                self.fallback_used = False
+                self.fallback_reason = ""
+            except TorchBackendUnavailableError as err:
+                raise RuntimeError(f"renderer_backend='torch_local' requested but torch is unavailable: {err}") from err
+        else:
+            raise ValueError(f"Unsupported renderer backend: {requested_backend}")
         if self.temporal_renderer_mode == "temporal_local_renderer" and self.dataset_source.startswith("manifest_video_renderer_primary"):
             self.dataset_source = "manifest_video_temporal_renderer_primary"
-        self.model = TemporalLocalPatchModel() if self.temporal_renderer_mode == "temporal_local_renderer" else TrainableLocalPatchModel()
         self.contract_conditioning_mode = self._resolve_conditioning_mode(config, has_manifest=bool(config.learned_dataset_path and len(train_dataset) > 0 and self.dataset_source.startswith("manifest")))
         stage_dir = Path(config.checkpoint_dir) / self.stage_name
         stage_dir.mkdir(parents=True, exist_ok=True)
@@ -327,7 +391,7 @@ class RendererTrainer:
 
         for epoch in range(config.epochs):
             train_losses = [self.model.train_step(batch, lr=lr) for batch in train_batches]
-            eval_metrics = self.evaluate_model(self.model, val_batches, diagnostics=self.dataset_diagnostics)
+            eval_metrics = self.evaluate_model(self.model, val_batches, diagnostics=self.dataset_diagnostics, renderer_backend=self.renderer_backend, fallback_used=self.fallback_used)
 
             def m(items: list[dict[str, float]], key: str) -> float:
                 return float(sum(i[key] for i in items) / max(1, len(items)))
@@ -396,8 +460,19 @@ class RendererTrainer:
                         "learned_contract_usage_ratio": last_val.get("learned_contract_usage_ratio", 0.0),
                         "weak_contract_usage_ratio": last_val.get("weak_contract_usage_ratio", 0.0),
                     },
-                    "renderer_backend": self.temporal_renderer_mode,
+                    "renderer_backend": self.renderer_backend,
+                    "temporal_renderer_mode": self.temporal_renderer_mode,
                     "temporal_renderer_path_enabled": bool(self.temporal_renderer_mode == "temporal_local_renderer"),
+                    "renderer_model_metadata": {
+                        "renderer_backend": self.renderer_backend,
+                        "model_family": "local_conv_conditioned_patch_generator" if isinstance(self.model, TorchLocalPatchGenerator) else "numpy_linear_patch_generator",
+                        "global_cond_dim": GLOBAL_COND_DIM,
+                        "patch_batch_contract_version": "patch_batch_v1",
+                        "torch_backend_used": bool(isinstance(self.model, TorchLocalPatchGenerator)),
+                        "fallback_used": bool(self.fallback_used),
+                        "fallback_reason": self.fallback_reason,
+                        "training_losses_last": last_train,
+                    },
                 },
                 indent=2,
             ),
