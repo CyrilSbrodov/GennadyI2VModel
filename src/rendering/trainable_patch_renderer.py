@@ -777,21 +777,21 @@ def summarize_memory_bundle_trace(transition_context: dict[str, object] | None) 
         if isinstance(bundle_data, dict):
             memory_bundle_present = bool(bundle_data.get("memory_bundle_present", bool(bundle_data)))
             bundle_support_level = str(bundle_data.get("memory_support_level", "none" if not bundle_data else "unknown"))
-            reasons = bundle_data.get("retrieval_reasons", [])
+            reasons = bundle_data.get("retrieval_reasons", bundle_data.get("memory_bundle_retrieval_reasons", []))
             bundle_retrieval_reasons = list(reasons) if isinstance(reasons, list) else []
-            bundle_has_current_reuse = bool(bundle_data.get("has_current_reuse", False))
-            bundle_has_identity_reference = bool(bundle_data.get("has_identity_reference", False))
-            bundle_has_appearance_reference = bool(bundle_data.get("has_appearance_reference", False))
-            bundle_has_garment_reference = bool(bundle_data.get("has_garment_reference", False))
-            bundle_has_hidden_slot = bool(bundle_data.get("has_hidden_slot", False))
+            bundle_has_current_reuse = bool(bundle_data.get("has_current_reuse", bundle_data.get("memory_bundle_has_current_reuse", False)))
+            bundle_has_identity_reference = bool(bundle_data.get("has_identity_reference", bundle_data.get("memory_bundle_has_identity_reference", False)))
+            bundle_has_appearance_reference = bool(bundle_data.get("has_appearance_reference", bundle_data.get("memory_bundle_has_appearance_reference", False)))
+            bundle_has_garment_reference = bool(bundle_data.get("has_garment_reference", bundle_data.get("memory_bundle_has_garment_reference", False)))
+            bundle_has_hidden_slot = bool(bundle_data.get("has_hidden_slot", bundle_data.get("memory_bundle_has_hidden_slot", False)))
             hidden_slot = bundle_data.get("hidden_slot")
-            bundle_hidden_type = str(bundle_data.get("hidden_type", "none"))
+            bundle_hidden_type = str(bundle_data.get("hidden_type", bundle_data.get("memory_bundle_hidden_type", "none")))
             if isinstance(hidden_slot, dict):
                 bundle_hidden_type = str(hidden_slot.get("hidden_type", bundle_hidden_type))
-            bundle_reveal_lifecycle = str(bundle_data.get("reveal_lifecycle", "unknown"))
+            bundle_reveal_lifecycle = str(bundle_data.get("reveal_lifecycle", bundle_data.get("memory_bundle_reveal_lifecycle", "unknown")))
     else:
         memory_bundle_present = memory_bundle is not None
-        bundle_support_level = memory_bundle.memory_support_level if memory_bundle else "unknown"
+        bundle_support_level = memory_bundle.memory_support_level if memory_bundle else "none"
         bundle_retrieval_reasons = list(memory_bundle.retrieval_reasons) if memory_bundle else []
         bundle_has_current_reuse = bool(memory_bundle.has_current_reuse) if memory_bundle else False
         bundle_has_identity_reference = bool(memory_bundle.has_identity_reference) if memory_bundle else False
@@ -802,7 +802,7 @@ def summarize_memory_bundle_trace(transition_context: dict[str, object] | None) 
         bundle_reveal_lifecycle = str(memory_bundle.reveal_lifecycle) if memory_bundle else "unknown"
     if isinstance(ctx.get("region_memory_bundle_serialized"), dict):
         serialized = ctx.get("region_memory_bundle_serialized", {})
-        serialized_active = serialized.get("hidden_support_active") if isinstance(serialized, dict) else None
+        serialized_active = serialized.get("hidden_support_active", serialized.get("memory_bundle_hidden_support_active")) if isinstance(serialized, dict) else None
     else:
         serialized_active = None
     bundle_hidden_support_active = bool(bundle_has_hidden_slot and bundle_hidden_type not in {"revealed", "revealed_history"})

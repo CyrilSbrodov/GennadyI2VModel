@@ -154,6 +154,11 @@ class GennadyEngine:
         graph_encoding = self.backends.graph_encoder.encode(scene_graph)
         fallback_log: list[str] = []
         renderer_manifest_records: list[dict[str, object]] = []
+        renderer_manifest_exporter = None
+        if export_renderer_manifest_path:
+            from training.renderer_manifest_exporter import RendererManifestRecordExporter
+
+            renderer_manifest_exporter = RendererManifestRecordExporter()
 
         action_plan = self.intent_parser.parse(request.text, scene_graph=scene_graph)
         text_encoding = self.backends.text_encoder.encode(request.text, scene_graph=scene_graph, action_plan=action_plan)
@@ -316,12 +321,10 @@ class GennadyEngine:
                 patch_contract_validation = self._validate_patch_output_contract(patch_out, expected_region_id=region.region_id)
                 if patch_contract_validation["issues"]:
                     raise ValueError(f"Patch contract violation at step={planned_state.step_index}, region={region.region_id}: {patch_contract_validation['issues']}")
-                if export_renderer_manifest_path:
-                    from training.renderer_manifest_exporter import RendererManifestRecordExporter
-
+                if renderer_manifest_exporter is not None:
                     roi_before_export = self._extract_region_roi_for_export(current_frame, region, patch_out.height, patch_out.width)
                     renderer_manifest_records.append(
-                        RendererManifestRecordExporter().build_record(
+                        renderer_manifest_exporter.build_record(
                             request=patch_request,
                             output=patch_out,
                             roi_before=roi_before_export,
@@ -561,10 +564,14 @@ class GennadyEngine:
             if step_hidden_reconstruction:
                 hidden_recon_stats["steps_with_hidden_reconstruction"] += 1
 
-        if export_renderer_manifest_path:
-            from training.renderer_manifest_exporter import RendererManifestRecordExporter
-
-            RendererManifestRecordExporter().write_manifest(renderer_manifest_records, export_renderer_manifest_path)
+        renderer_manifest_export_debug = {"enabled": False}
+        if renderer_manifest_exporter is not None and export_renderer_manifest_path:
+            renderer_manifest_exporter.write_manifest(renderer_manifest_records, export_renderer_manifest_path)
+            renderer_manifest_export_debug = {
+                "enabled": True,
+                "path": export_renderer_manifest_path,
+                "record_count": len(renderer_manifest_records),
+            }
 
         video_uri = self._export_video(frames, fps)
         return InferenceArtifacts(
@@ -583,6 +590,7 @@ class GennadyEngine:
                     "backend": profile.backend,
                 },
                 "video_export": video_uri,
+                "renderer_manifest_export": renderer_manifest_export_debug,
                 "input_metadata": {
                     "input_type": request.input_type,
                     "orig_size": request.orig_size,

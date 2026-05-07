@@ -863,7 +863,19 @@ class RendererDataset(BaseStageDataset):
         if raw is None:
             raw = contract.get("region_memory_bundle_serialized")
         if not isinstance(raw, dict) or not raw:
-            return {"memory_bundle_present": False, "memory_support_level": "none"}
+            return {
+                "memory_bundle_present": False,
+                "memory_support_level": "none",
+                "reveal_lifecycle": "unknown",
+                "has_current_reuse": False,
+                "has_identity_reference": False,
+                "has_appearance_reference": False,
+                "has_garment_reference": False,
+                "has_hidden_slot": False,
+                "hidden_type": "none",
+                "hidden_support_active": False,
+                "retrieval_reasons": [],
+            }
 
         support = str(raw.get("memory_support_level", "none")).strip().lower()
         if support not in cls.ALLOWED_MEMORY_SUPPORT_LEVELS:
@@ -1133,19 +1145,33 @@ class RendererDataset(BaseStageDataset):
     def from_renderer_manifest(cls, manifest_path: str, strict: bool = False) -> "RendererDataset":
         payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
         records = payload.get("records", [])
+        manifest_type_raw = payload.get("manifest_type")
+        manifest_type = str(manifest_type_raw).strip() if manifest_type_raw is not None else "unknown"
+        supported_manifest_types = {"renderer_patch_manifest", "manifest_paired_roi", "paired_roi_renderer_manifest", "unknown"}
         samples: list[TrainingSample] = []
         diagnostics: dict[str, object] = {
             "source": "manifest_paired_roi",
             "manifest_path": manifest_path,
+            "manifest_type": manifest_type,
             "total_records": len(records),
             "loaded_records": 0,
             "invalid_records": 0,
             "skipped_records": 0,
             "invalid_examples": [],
+            "warnings": [],
+            "unsupported_manifest_type": 0,
+            "unknown_manifest_type": 0,
             "invalid_memory_bundle_records": 0,
             "memory_bundle_warnings": [],
             "family_counts": {"face_expression": 0, "torso_reveal": 0, "sleeve_arm_transition": 0},
         }
+        if manifest_type not in supported_manifest_types:
+            diagnostics["unsupported_manifest_type"] = 1
+            diagnostics["unknown_manifest_type"] = 1
+            diagnostics["warnings"].append({"type": "unknown_manifest_type", "manifest_type": manifest_type})
+        elif manifest_type == "unknown":
+            diagnostics["unknown_manifest_type"] = 1
+            diagnostics["warnings"].append({"type": "unknown_manifest_type", "manifest_type": manifest_type})
         for idx, rec in enumerate(records):
             try:
                 if not isinstance(rec, dict):

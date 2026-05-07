@@ -61,6 +61,14 @@ class RendererManifestRecordExporter:
             blend_hint=blend_hint,
             changed_mask=changed_mask,
         )
+        execution_trace_summary = _execution_trace_summary(
+            trace=trace,
+            ctx=ctx,
+            memory_bundle=memory_bundle,
+            selected_render_strategy=selected_render_strategy,
+            renderer_path=renderer_path,
+            synthesis_mode=synthesis_mode,
+        )
 
         patch_output_contract = {
             "region_id": request.region.region_id,
@@ -103,6 +111,7 @@ class RendererManifestRecordExporter:
             "target_source": target_source,
             "training_target_quality": training_target_quality,
             "renderer_memory_bundle": memory_bundle,
+            "execution_trace_summary": execution_trace_summary,
         }
         if step_index is not None:
             record["step_index"] = int(step_index)
@@ -120,10 +129,24 @@ class RendererManifestRecordExporter:
         *,
         manifest_type: str = "renderer_patch_manifest",
     ) -> None:
+        safe_records = [_safe_json(record) for record in records]
+        target_quality_counts = {
+            "self_generated_runtime_target": sum(
+                1 for record in safe_records if isinstance(record, dict) and record.get("training_target_quality") == "self_generated_runtime_target"
+            ),
+            "external_or_observed_target": sum(
+                1 for record in safe_records if isinstance(record, dict) and record.get("training_target_quality") == "external_or_observed_target"
+            ),
+        }
         payload = {
             "manifest_type": manifest_type,
             "source": "runtime_patch_export",
-            "records": [_safe_json(record) for record in records],
+            "contract_version": "renderer_patch_manifest.v1",
+            "record_count": len(safe_records),
+            "target_quality_counts": target_quality_counts,
+            "contains_self_generated_targets": target_quality_counts["self_generated_runtime_target"] > 0,
+            "contains_external_targets": target_quality_counts["external_or_observed_target"] > 0,
+            "records": safe_records,
         }
         Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -182,6 +205,66 @@ def _memory_bundle_serialized(ctx: dict[str, object]) -> dict[str, object]:
             data = {"memory_bundle_present": True, "memory_support_level": str(getattr(bundle, "memory_support_level", "none"))}
         return _safe_json(data)
     return {"memory_bundle_present": False, "memory_support_level": "none", "memory_support_level_reason": "no_runtime_region_memory_bundle"}
+
+
+def _execution_trace_summary(
+    *,
+    trace: dict[str, object],
+    ctx: dict[str, object],
+    memory_bundle: dict[str, object],
+    selected_render_strategy: str,
+    renderer_path: str,
+    synthesis_mode: str,
+) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "selected_render_strategy": selected_render_strategy,
+        "renderer_path": renderer_path,
+        "synthesis_mode": synthesis_mode,
+    }
+    planner_selected = trace.get("planner_selected_strategy") or ctx.get("planner_selected_strategy")
+    if planner_selected is not None:
+        summary["planner_selected_strategy"] = _safe_json(planner_selected)
+
+    memory_defaults = {
+        "memory_bundle_present": False,
+        "memory_support_level": "none",
+        "memory_bundle_has_current_reuse": False,
+        "memory_bundle_has_identity_reference": False,
+        "memory_bundle_has_appearance_reference": False,
+        "memory_bundle_has_garment_reference": False,
+        "memory_bundle_has_hidden_slot": False,
+        "memory_bundle_hidden_type": "none",
+        "memory_bundle_hidden_support_active": False,
+        "memory_bundle_reveal_lifecycle": "unknown",
+        "memory_bundle_retrieval_reasons": [],
+    }
+    summary.update(memory_defaults)
+    summary.update(
+        {
+            "memory_bundle_present": bool(memory_bundle.get("memory_bundle_present", bool(memory_bundle))),
+            "memory_support_level": str(memory_bundle.get("memory_support_level", "none")),
+            "memory_bundle_has_current_reuse": bool(memory_bundle.get("has_current_reuse", memory_bundle.get("memory_bundle_has_current_reuse", False))),
+            "memory_bundle_has_identity_reference": bool(memory_bundle.get("has_identity_reference", memory_bundle.get("memory_bundle_has_identity_reference", False))),
+            "memory_bundle_has_appearance_reference": bool(memory_bundle.get("has_appearance_reference", memory_bundle.get("memory_bundle_has_appearance_reference", False))),
+            "memory_bundle_has_garment_reference": bool(memory_bundle.get("has_garment_reference", memory_bundle.get("memory_bundle_has_garment_reference", False))),
+            "memory_bundle_has_hidden_slot": bool(memory_bundle.get("has_hidden_slot", memory_bundle.get("memory_bundle_has_hidden_slot", False))),
+            "memory_bundle_hidden_type": str(memory_bundle.get("hidden_type", memory_bundle.get("memory_bundle_hidden_type", "none"))),
+            "memory_bundle_hidden_support_active": bool(memory_bundle.get("hidden_support_active", memory_bundle.get("memory_bundle_hidden_support_active", False))),
+            "memory_bundle_reveal_lifecycle": str(memory_bundle.get("reveal_lifecycle", memory_bundle.get("memory_bundle_reveal_lifecycle", "unknown"))),
+            "memory_bundle_retrieval_reasons": _safe_json(memory_bundle.get("retrieval_reasons", memory_bundle.get("memory_bundle_retrieval_reasons", []))),
+        }
+    )
+    hidden_slot = memory_bundle.get("hidden_slot")
+    if isinstance(hidden_slot, dict):
+        summary["memory_bundle_hidden_type"] = str(hidden_slot.get("hidden_type", summary["memory_bundle_hidden_type"]))
+
+    for key in ("confidence_semantics_by_mode", "uncertainty_semantics_by_mode"):
+        if isinstance(trace.get(key), dict):
+            summary[key] = _safe_json(trace[key])
+    learnable = trace.get("learnable_mode_surface")
+    if isinstance(learnable, dict):
+        summary["learnable_mode_surface"] = {"keys": sorted(str(k) for k in learnable.keys())}
+    return _safe_json(summary)
 
 
 def _renderer_batch_contract(
