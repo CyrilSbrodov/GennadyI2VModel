@@ -34,8 +34,13 @@ class TrainingConfig:
     learned_dataset_path: str = ""
     learned_backend_config: BackendConfig | None = None
     contract_conditioning_mode: str = "auto"
-    renderer_backend: str = "legacy_local_renderer"
+    renderer_backend: str = "numpy_local"
     renderer_temporal_mode: str = "auto"
+
+    def __post_init__(self) -> None:
+        allowed_backends = {"numpy_local", "torch_local", "legacy_local_renderer", "temporal_local_renderer"}
+        if self.renderer_backend not in allowed_backends:
+            raise ValueError(f"Unsupported renderer_backend='{self.renderer_backend}'. Allowed: {sorted(allowed_backends)}")
 
 
 @dataclass(slots=True)
