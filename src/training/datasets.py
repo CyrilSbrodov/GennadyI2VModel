@@ -849,6 +849,52 @@ class HumanStateTransitionDataset(BaseStageDataset):
 class RendererDataset(BaseStageDataset):
     CANONICAL_PHASES = {"prepare", "transition", "contact_or_reveal", "stabilize"}
     CANONICAL_FAMILIES = {"pose_transition", "garment_transition", "expression_transition", "interaction_transition", "visibility_transition"}
+    ALLOWED_MEMORY_SUPPORT_LEVELS = {"none", "weak", "medium", "strong"}
+
+    @classmethod
+    def _normalize_renderer_memory_bundle(
+        cls,
+        rec: dict[str, object],
+        diagnostics: dict[str, object],
+        idx: int,
+    ) -> dict[str, object]:
+        contract = rec.get("renderer_batch_contract", {}) if isinstance(rec.get("renderer_batch_contract"), dict) else {}
+        raw = rec.get("renderer_memory_bundle")
+        if raw is None:
+            raw = contract.get("region_memory_bundle_serialized")
+        if not isinstance(raw, dict) or not raw:
+            return {"memory_bundle_present": False, "memory_support_level": "none"}
+
+        support = str(raw.get("memory_support_level", "none")).strip().lower()
+        if support not in cls.ALLOWED_MEMORY_SUPPORT_LEVELS:
+            diagnostics["invalid_memory_bundle_records"] = int(diagnostics.get("invalid_memory_bundle_records", 0)) + 1
+            warning = {"index": idx, "field": "memory_support_level", "value": support, "normalized": "none"}
+            warnings = diagnostics.get("memory_bundle_warnings")
+            if isinstance(warnings, list) and len(warnings) < 8:
+                warnings.append(warning)
+            support = "none"
+
+        reasons = raw.get("retrieval_reasons", [])
+        if not isinstance(reasons, list):
+            reasons = []
+        hidden_slot = raw.get("hidden_slot") if isinstance(raw.get("hidden_slot"), dict) else {}
+        hidden_type = str(raw.get("hidden_type", hidden_slot.get("hidden_type", "none"))).strip().lower()
+        hidden_support_active = bool(raw.get("hidden_support_active", False))
+        if hidden_type in {"revealed", "revealed_history"}:
+            hidden_support_active = False
+        return {
+            "memory_bundle_present": bool(raw.get("memory_bundle_present", True)),
+            "memory_support_level": support,
+            "reveal_lifecycle": str(raw.get("reveal_lifecycle", "unknown")).strip().lower(),
+            "has_current_reuse": bool(raw.get("has_current_reuse", False)),
+            "has_identity_reference": bool(raw.get("has_identity_reference", False)),
+            "has_appearance_reference": bool(raw.get("has_appearance_reference", False)),
+            "has_garment_reference": bool(raw.get("has_garment_reference", False)),
+            "has_hidden_slot": bool(raw.get("has_hidden_slot", False)),
+            "hidden_type": hidden_type,
+            "hidden_support_active": hidden_support_active,
+            "retrieval_reasons": [str(x) for x in reasons if isinstance(x, str)],
+        }
 
     @classmethod
     def from_video_transition_manifest(cls, manifest_path: str, strict: bool = False) -> "RendererDataset":
@@ -864,6 +910,8 @@ class RendererDataset(BaseStageDataset):
             "invalid_records": 0,
             "skipped_records": 0,
             "invalid_examples": [],
+            "invalid_memory_bundle_records": 0,
+            "memory_bundle_warnings": [],
             "family_counts": {},
             "region_coverage": {},
             "phase_coverage": {},
@@ -953,6 +1001,8 @@ class RendererDataset(BaseStageDataset):
                         "occlusion_score": temporal_target["occlusion_score"],
                         "support_contact_score": temporal_target["support_contact_score"],
                     }
+                    renderer_memory_bundle = cls._normalize_renderer_memory_bundle(rec, diagnostics, idx)
+                    renderer_contract["region_memory_bundle_serialized"] = renderer_memory_bundle
                     temporal_features = _build_temporal_transition_features(
                         graph_before=_deserialize_graph(rec.get("scene_graph_before", {})),
                         graph_after=_deserialize_graph(rec.get("scene_graph_after", {})),
@@ -1092,6 +1142,8 @@ class RendererDataset(BaseStageDataset):
             "invalid_records": 0,
             "skipped_records": 0,
             "invalid_examples": [],
+            "invalid_memory_bundle_records": 0,
+            "memory_bundle_warnings": [],
             "family_counts": {"face_expression": 0, "torso_reveal": 0, "sleeve_arm_transition": 0},
         }
         for idx, rec in enumerate(records):
@@ -1149,6 +1201,8 @@ class RendererDataset(BaseStageDataset):
                     "blend_hint": blend_hint,
                     "changed_mask": changed_mask,
                 }
+                renderer_memory_bundle = cls._normalize_renderer_memory_bundle(rec, diagnostics, idx)
+                renderer_contract["region_memory_bundle_serialized"] = renderer_memory_bundle
 
                 sample: TrainingSample = {
                         "frames": [roi_before, roi_after],

@@ -9,8 +9,23 @@ import numpy as np
 from dynamics.human_state_transition import HumanStateTransitionModel
 from dynamics.temporal_transition_encoder import PHASES, TemporalTransitionEncoder
 from dynamics.model import DynamicsModel
-from rendering.patch_conditioning_contract import GLOBAL_COND_DIM
-from rendering.trainable_patch_renderer import PatchBatch, TemporalLocalPatchModel, TrainableLocalPatchModel
+from rendering.patch_conditioning_contract import (
+    APPEARANCE_DIM,
+    BBOX_DIM,
+    DELTA_DIM,
+    GLOBAL_COND_DIM,
+    GRAPH_DIM,
+    MEMORY_DIM,
+    PLANNER_DIM,
+    SEMANTIC_DIM,
+)
+from rendering.trainable_patch_renderer import (
+    PatchBatch,
+    TemporalLocalPatchModel,
+    TrainableLocalPatchModel,
+    apply_memory_bundle_conditioning_to_vectors,
+    extract_memory_bundle_conditioning_from_context,
+)
 from training.rollout_eval import evaluate_rollout_modes_on_video_manifest
 from rendering.torch_local_patch_generator import TorchBackendUnavailableError, TorchLocalPatchGenerator
 from training.datasets import RendererDataset
@@ -77,6 +92,17 @@ class RendererBatchAdapter:
             return [0.0, 1.0, 0.0, 0.25, 0.8, 0.35]
         return [0.0, 0.0, 1.0, 0.3, 0.45, 0.8]
 
+    @staticmethod
+    def _vector_to_size(value: object, size: int) -> np.ndarray:
+        arr = np.asarray(value, dtype=np.float32).reshape(-1)
+        if arr.size == size:
+            return arr.astype(np.float32)
+        out = np.zeros((size,), dtype=np.float32)
+        copy = min(size, arr.size)
+        if copy:
+            out[:copy] = arr[:copy]
+        return out
+
     def adapt(self, sample: dict[str, object], *, temporal_mode: bool = False) -> PatchBatch:
         roi_pairs = sample.get("roi_pairs") or []
         before, after = roi_pairs[0] if roi_pairs else (sample["frames"][0], sample["frames"][1])
@@ -121,20 +147,28 @@ class RendererBatchAdapter:
         elif self.conditioning_mode == "mixed_contract_bootstrap":
             selected = human or learned or weak
 
-        semantic_embed = np.asarray(contract.get("semantic_embed", self._semantic_from_family(selected.predicted_family)), dtype=np.float32)
+        semantic_embed = self._vector_to_size(contract.get("semantic_embed", self._semantic_from_family(selected.predicted_family)), SEMANTIC_DIM)
         learned_sources = {"learned_temporal_contract", "learned_human_state_contract"}
         if selected.source in learned_sources:
-            semantic_embed = np.asarray(self._semantic_from_family(selected.predicted_family), dtype=np.float32)
-        delta_cond = np.asarray(contract.get("delta_cond", [0.0] * 9), dtype=np.float32)
-        planner_cond = np.asarray(contract.get("planner_cond", [0.0] * 8), dtype=np.float32)
+            semantic_embed = self._vector_to_size(self._semantic_from_family(selected.predicted_family), SEMANTIC_DIM)
+        delta_cond = self._vector_to_size(contract.get("delta_cond", [0.0] * DELTA_DIM), DELTA_DIM)
+        planner_cond = self._vector_to_size(contract.get("planner_cond", [0.0] * PLANNER_DIM), PLANNER_DIM)
         if selected.source in learned_sources:
-            delta_cond = np.asarray([selected.reveal_score, selected.occlusion_score, selected.support_contact_score] + delta_cond.tolist(), dtype=np.float32)[:9]
+            delta_cond = self._vector_to_size([selected.reveal_score, selected.occlusion_score, selected.support_contact_score] + delta_cond.tolist(), DELTA_DIM)
             phase_onehot = [1.0 if selected.predicted_phase == p else 0.0 for p in PHASES]
-            planner_cond = np.asarray(phase_onehot + planner_cond.tolist(), dtype=np.float32)[:8]
-        graph_cond = np.asarray(contract.get("graph_cond", [0.0] * 7), dtype=np.float32)
-        memory_cond = np.asarray(contract.get("memory_cond", [0.0] * 8), dtype=np.float32)
-        appearance_cond = np.asarray(contract.get("appearance_cond", np.concatenate([np.mean(b, axis=(0, 1)), np.std(b, axis=(0, 1))]).tolist()), dtype=np.float32)
-        bbox_cond = np.asarray(contract.get("bbox_cond", [0.2, 0.2, 0.4, 0.4]), dtype=np.float32)
+            planner_cond = self._vector_to_size(phase_onehot + planner_cond.tolist(), PLANNER_DIM)
+        graph_cond = self._vector_to_size(contract.get("graph_cond", [0.0] * GRAPH_DIM), GRAPH_DIM)
+        memory_cond = self._vector_to_size(contract.get("memory_cond", [0.0] * MEMORY_DIM), MEMORY_DIM)
+        appearance_cond = self._vector_to_size(contract.get("appearance_cond", np.concatenate([np.mean(b, axis=(0, 1)), np.std(b, axis=(0, 1))]).tolist()), APPEARANCE_DIM)
+        raw_bundle = contract.get("region_memory_bundle_serialized", {}) if isinstance(contract.get("region_memory_bundle_serialized", {}), dict) else {}
+        bundle_cond = extract_memory_bundle_conditioning_from_context({"region_memory_bundle_serialized": raw_bundle})
+        memory_cond, appearance_cond = apply_memory_bundle_conditioning_to_vectors(
+            memory_cond,
+            appearance_cond,
+            bundle_cond,
+            region_id=str(sample.get("region_id", contract.get("region_id", ""))),
+        )
+        bbox_cond = self._vector_to_size(contract.get("bbox_cond", [0.2, 0.2, 0.4, 0.4]), BBOX_DIM)
         changed_mask = np.asarray(contract.get("changed_mask", self._mask(b, a).tolist()), dtype=np.float32)
         if changed_mask.ndim == 2:
             changed_mask = changed_mask[..., None]
@@ -159,6 +193,19 @@ class RendererBatchAdapter:
             "predicted_family": selected.predicted_family,
             "predicted_phase": selected.predicted_phase,
             "target_profile": selected.target_profile,
+            "memory_bundle_present": bool(bundle_cond.get("memory_bundle_present", False)),
+            "memory_support_level": str(bundle_cond.get("memory_support_level", "none")),
+            "memory_bundle_reveal_lifecycle": str(bundle_cond.get("memory_bundle_reveal_lifecycle", "unknown")),
+            "memory_bundle_has_current_reuse": bool(bundle_cond.get("memory_bundle_has_current_reuse", False)),
+            "memory_bundle_has_identity_reference": bool(bundle_cond.get("memory_bundle_has_identity_reference", False)),
+            "memory_bundle_has_appearance_reference": bool(bundle_cond.get("memory_bundle_has_appearance_reference", False)),
+            "memory_bundle_has_garment_reference": bool(bundle_cond.get("memory_bundle_has_garment_reference", False)),
+            "memory_bundle_has_hidden_slot": bool(bundle_cond.get("memory_bundle_has_hidden_slot", False)),
+            "memory_bundle_hidden_type": str(bundle_cond.get("memory_bundle_hidden_type", "none")),
+            "memory_bundle_hidden_support_active": bool(bundle_cond.get("memory_bundle_hidden_support_active", False)),
+            "memory_bundle_retrieval_reasons": list(bundle_cond.get("memory_bundle_retrieval_reasons", [])) if isinstance(bundle_cond.get("memory_bundle_retrieval_reasons", []), list) else [],
+            "memory_bundle_is_revealed_history": bool(bundle_cond.get("memory_bundle_is_revealed_history", False)),
+            "memory_bundle_low_evidence_newly_revealed": bool(bundle_cond.get("memory_bundle_low_evidence_newly_revealed", False)),
         }
         extra_summary = contract.get("conditioning_summary", {}) if isinstance(contract.get("conditioning_summary", {}), dict) else {}
         conditioning_summary.update(extra_summary)

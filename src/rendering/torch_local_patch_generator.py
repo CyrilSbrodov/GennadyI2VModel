@@ -19,6 +19,11 @@ except Exception:  # pragma: no cover
     nn = None
 
 
+class _UnavailableTorchModule:
+    def __init__(self, *args, **kwargs) -> None:
+        raise TorchBackendUnavailableError("TorchLocalPatchGenerator requires torch, but torch is unavailable")
+
+
 @dataclass(slots=True)
 class _TorchBatch:
     roi_before: "torch.Tensor"
@@ -27,7 +32,7 @@ class _TorchBatch:
     global_cond: "torch.Tensor"
 
 
-class TorchLocalPatchGeneratorNet(nn.Module):
+class TorchLocalPatchGeneratorNet(nn.Module if nn is not None else _UnavailableTorchModule):
     def __init__(self, global_dim: int, hidden: int = 48) -> None:
         super().__init__()
         self.encoder = nn.Sequential(nn.Conv2d(9, hidden, 3, padding=1), nn.SiLU(), nn.Conv2d(hidden, hidden, 3, padding=1), nn.SiLU())
