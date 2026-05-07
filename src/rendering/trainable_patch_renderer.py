@@ -21,6 +21,7 @@ from rendering.patch_conditioning_contract import (
 )
 from core.schema import RegionMemoryBundle, RegionRef
 from rendering.patch_tensor_utils import map_to_shape
+from rendering.target_provenance_policy import target_supervision_weight
 from dynamics.transition_contracts import LearnedHumanStateContract, LearnedTemporalTransitionContract
 from learned.interfaces import PatchSynthesisOutput, PatchSynthesisRequest
 from utils_tensor import shape
@@ -70,6 +71,8 @@ class RenderConditioningProfile:
     local_radius_x: float
     local_radius_y: float
     context_support: float
+
+
 
 
 @dataclass(slots=True)
@@ -509,8 +512,15 @@ class TrainableLocalPatchModel:
             + 0.28 * alpha_blend_consistency
             + 0.22 * drift_penalty
         )
+        supervision_weight = target_supervision_weight(
+            str((batch.conditioning_summary or {}).get("training_target_quality", "unknown"))
+            if isinstance(batch.conditioning_summary, dict)
+            else "unknown"
+        )
         return {
             "total_loss": total,
+            "weighted_total_loss": float(total * supervision_weight),
+            "target_supervision_weight": float(supervision_weight),
             "reconstruction_loss": recon,
             "alpha_loss": alpha_loss,
             "seam_loss": seam_loss,

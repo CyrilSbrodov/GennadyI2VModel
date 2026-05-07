@@ -8,6 +8,8 @@ import numpy as np
 from rendering.patch_conditioning_contract import GLOBAL_COND_DIM, MODE_DIM, ROLE_DIM
 from rendering.patch_tensor_utils import map_to_shape
 
+from rendering.target_provenance_policy import target_supervision_weight
+
 if TYPE_CHECKING:
     from rendering.trainable_patch_renderer import PatchBatch
 
@@ -127,7 +129,13 @@ class TorchLocalPatchGenerator:
         drift_penalty = torch.abs(pred["rgb"] - tb.roi_before).mean()
         total = reconstruction_loss + 0.3 * alpha_loss + 0.25 * uncertainty_loss + 0.4 * preservation_loss + 0.15 * seam_loss + 0.1 * drift_penalty
         self.optim.zero_grad(); total.backward(); self.optim.step()
-        return {"total_loss": float(total.item()), "reconstruction_loss": float(reconstruction_loss.item()), "alpha_loss": float(alpha_loss.item()), "uncertainty_calibration_loss": float(uncertainty_loss.item()), "appearance_preservation_loss": float(preservation_loss.item()), "seam_loss": float(seam_loss.item()), "drift_penalty": float(drift_penalty.item())}
+        supervision_weight = target_supervision_weight(
+            str((batch.conditioning_summary or {}).get("training_target_quality", "unknown"))
+            if isinstance(batch.conditioning_summary, dict)
+            else "unknown"
+        )
+        total_value = float(total.item())
+        return {"total_loss": total_value, "weighted_total_loss": float(total_value * supervision_weight), "target_supervision_weight": float(supervision_weight), "reconstruction_loss": float(reconstruction_loss.item()), "alpha_loss": float(alpha_loss.item()), "uncertainty_calibration_loss": float(uncertainty_loss.item()), "appearance_preservation_loss": float(preservation_loss.item()), "seam_loss": float(seam_loss.item()), "drift_penalty": float(drift_penalty.item())}
 
     def eval_step(self, batch: "PatchBatch") -> dict[str, float]:
         self.net.eval()

@@ -27,6 +27,7 @@ from rendering.trainable_patch_renderer import (
     extract_memory_bundle_conditioning_from_context,
 )
 from training.rollout_eval import evaluate_rollout_modes_on_video_manifest
+from rendering.target_provenance_policy import target_supervision_summary
 from rendering.torch_local_patch_generator import TorchBackendUnavailableError, TorchLocalPatchGenerator
 from training.datasets import RendererDataset
 from training.types import StageResult, TrainingConfig
@@ -188,6 +189,10 @@ class RendererBatchAdapter:
         prev_roi = temporal_window.get("roi_t_minus_1", b)
         prev_np = self._np3(prev_roi)
         rollout_weight = float(np.clip(1.0 + selected.reveal_score * 0.4 + selected.occlusion_score * 0.3, 0.5, 2.0))
+        provenance_summary = target_supervision_summary(
+            str(sample.get("target_source", contract.get("target_source", "unknown"))),
+            str(sample.get("training_target_quality", contract.get("training_target_quality", "unknown"))),
+        )
         conditioning_summary = {
             "contract_source": selected.source,
             "predicted_family": selected.predicted_family,
@@ -209,6 +214,7 @@ class RendererBatchAdapter:
         }
         extra_summary = contract.get("conditioning_summary", {}) if isinstance(contract.get("conditioning_summary", {}), dict) else {}
         conditioning_summary.update(extra_summary)
+        conditioning_summary.update(provenance_summary)
         return PatchBatch(
             roi_before=b,
             roi_after=a,
@@ -321,6 +327,9 @@ class RendererTrainer:
         weak_usage = 0.0
         mode_consistency = 0.0
         profile_consistency = 0.0
+        target_self_generated = 0.0
+        target_external_or_observed = 0.0
+        target_weight_sum = 0.0
         for b, e in zip(batches, eval_entries):
             sample_mae = float(e.get("mae", e.get("total_loss", 1.0)))
             if b.semantic_embed[0] > 0.5:
@@ -339,6 +348,9 @@ class RendererTrainer:
             profile = summary.get("target_profile", {}) if isinstance(summary.get("target_profile", {}), dict) else {}
             has_profile = bool(profile.get("primary_regions") or profile.get("secondary_regions") or profile.get("context_regions"))
             profile_consistency += 1.0 if has_profile else 0.0
+            target_self_generated += 1.0 if bool(summary.get("target_is_self_generated", False)) else 0.0
+            target_external_or_observed += 1.0 if bool(summary.get("target_is_external_or_observed", False)) else 0.0
+            target_weight_sum += float(summary.get("target_supervision_weight", 0.6))
         memory_bundle_present = 0.0
         memory_support_known = 0.0
         memory_support_strong = 0.0
@@ -387,6 +399,9 @@ class RendererTrainer:
             "memory_support_level_strong_ratio": float(memory_support_level_strong_ratio),
             "temporal_to_renderer_mode_consistency": float(mode_consistency / len(batches)),
             "temporal_to_renderer_target_profile_consistency": float(profile_consistency / len(batches)),
+            "target_self_generated_ratio": float(target_self_generated / len(batches)),
+            "target_external_or_observed_ratio": float(target_external_or_observed / len(batches)),
+            "avg_target_supervision_weight": float(target_weight_sum / len(batches)),
             "score": score,
             **temporal_eval,
         }
@@ -445,8 +460,19 @@ class RendererTrainer:
 
             learned_ratio = float(sum(1.0 for b in train_batches if (b.conditioning_summary or {}).get("contract_source") in {"learned_temporal_contract", "learned_human_state_contract"}) / max(1, len(train_batches)))
             weak_ratio = float(sum(1.0 for b in train_batches if (b.conditioning_summary or {}).get("contract_source") == "weak_manifest_bootstrap") / max(1, len(train_batches)))
+            target_quality_counts: dict[str, int] = {}
+            for batch in train_batches:
+                quality = str((batch.conditioning_summary or {}).get("training_target_quality", "unknown"))
+                target_quality_counts[quality] = target_quality_counts.get(quality, 0) + 1
+            weighted_loss_available = bool(train_losses and all("weighted_total_loss" in item for item in train_losses))
+            supervision_weight_present = bool(train_batches and all("target_supervision_weight" in (b.conditioning_summary or {}) for b in train_batches))
             last_train = {
                 "loss": m(train_losses, "total_loss"),
+                "weighted_loss": m(train_losses, "weighted_total_loss") if weighted_loss_available else m(train_losses, "total_loss"),
+                "avg_target_supervision_weight": float(sum(float((b.conditioning_summary or {}).get("target_supervision_weight", 0.6)) for b in train_batches) / max(1, len(train_batches))),
+                "weighted_loss_available": 1.0 if weighted_loss_available else 0.0,
+                "supervision_weight_present": 1.0 if supervision_weight_present else 0.0,
+                "target_quality_counts": target_quality_counts,
                 "reconstruction_loss": m(train_losses, "reconstruction_loss"),
                 "alpha_loss": m(train_losses, "alpha_loss"),
                 "uncertainty_calibration_loss": m(train_losses, "uncertainty_calibration_loss"),

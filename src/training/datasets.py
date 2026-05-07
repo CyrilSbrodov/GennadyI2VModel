@@ -65,6 +65,8 @@ class TrainingSample(TypedDict, total=False):
     visibility_targets: list[float]
 
     region_id: str
+    target_source: str
+    training_target_quality: str
 
 
 @dataclass(slots=True)
@@ -850,6 +852,18 @@ class RendererDataset(BaseStageDataset):
     CANONICAL_PHASES = {"prepare", "transition", "contact_or_reveal", "stabilize"}
     CANONICAL_FAMILIES = {"pose_transition", "garment_transition", "expression_transition", "interaction_transition", "visibility_transition"}
     ALLOWED_MEMORY_SUPPORT_LEVELS = {"none", "weak", "medium", "strong"}
+    ALLOWED_TARGET_SOURCES = {"runtime_output_patch", "provided_ground_truth_roi", "unknown"}
+    ALLOWED_TRAINING_TARGET_QUALITIES = {"self_generated_runtime_target", "external_or_observed_target", "unknown"}
+
+    @classmethod
+    def _normalize_target_source(cls, value: object) -> str:
+        source = str(value if value is not None else "unknown").strip().lower()
+        return source if source in cls.ALLOWED_TARGET_SOURCES else "unknown"
+
+    @classmethod
+    def _normalize_training_target_quality(cls, value: object) -> str:
+        quality = str(value if value is not None else "unknown").strip().lower()
+        return quality if quality in cls.ALLOWED_TRAINING_TARGET_QUALITIES else "unknown"
 
     @classmethod
     def _normalize_renderer_memory_bundle(
@@ -1164,6 +1178,11 @@ class RendererDataset(BaseStageDataset):
             "invalid_memory_bundle_records": 0,
             "memory_bundle_warnings": [],
             "family_counts": {"face_expression": 0, "torso_reveal": 0, "sleeve_arm_transition": 0},
+            "target_quality_counts": {"self_generated_runtime_target": 0, "external_or_observed_target": 0, "unknown": 0},
+            "target_source_counts": {"runtime_output_patch": 0, "provided_ground_truth_roi": 0, "unknown": 0},
+            "contains_self_generated_targets": False,
+            "contains_external_targets": False,
+            "contains_only_self_generated_targets": False,
         }
         if manifest_type not in supported_manifest_types:
             diagnostics["unsupported_manifest_type"] = 1
@@ -1215,6 +1234,13 @@ class RendererDataset(BaseStageDataset):
                 alpha_target = cls._as_hw1_tensor(alpha_target, "alpha_target")
                 blend_hint = cls._as_hw1_tensor(blend_hint, "blend_hint")
 
+                target_source = cls._normalize_target_source(rec.get("target_source", "unknown"))
+                training_target_quality = cls._normalize_training_target_quality(rec.get("training_target_quality", "unknown"))
+                diagnostics["target_quality_counts"][training_target_quality] = int(diagnostics["target_quality_counts"].get(training_target_quality, 0)) + 1
+                diagnostics["target_source_counts"][target_source] = int(diagnostics["target_source_counts"].get(target_source, 0)) + 1
+                diagnostics["contains_self_generated_targets"] = bool(diagnostics["contains_self_generated_targets"]) or training_target_quality == "self_generated_runtime_target"
+                diagnostics["contains_external_targets"] = bool(diagnostics["contains_external_targets"]) or training_target_quality == "external_or_observed_target"
+
                 renderer_contract = {
                     "semantic_embed": rec.get("semantic_embed", cls._semantic_embed_from_family(family)),
                     "delta_cond": rec.get("delta_cond", rec.get("graph_delta_cond", [0.0] * 9)),
@@ -1226,6 +1252,8 @@ class RendererDataset(BaseStageDataset):
                     "alpha_target": alpha_target,
                     "blend_hint": blend_hint,
                     "changed_mask": changed_mask,
+                    "target_source": target_source,
+                    "training_target_quality": training_target_quality,
                 }
                 renderer_memory_bundle = cls._normalize_renderer_memory_bundle(rec, diagnostics, idx)
                 renderer_contract["region_memory_bundle_serialized"] = renderer_memory_bundle
@@ -1236,6 +1264,8 @@ class RendererDataset(BaseStageDataset):
                         "source": str(rec.get("source", "manifest_paired_roi")),
                         "region_family": family,
                         "region_id": region_id,
+                        "target_source": target_source,
+                        "training_target_quality": training_target_quality,
                         "renderer_batch_contract": renderer_contract,
                         "delta_contract": rec.get("graph_delta", rec.get("delta_contract", {})),
                         "graph_transition_contract": rec.get("graph_transition_contract", {}),
@@ -1252,6 +1282,14 @@ class RendererDataset(BaseStageDataset):
                 if strict:
                     raise ValueError(f"renderer manifest record {idx} is invalid: {exc}") from exc
 
+        loaded = int(diagnostics.get("loaded_records", 0))
+        self_generated_count = int(diagnostics["target_quality_counts"].get("self_generated_runtime_target", 0))
+        diagnostics["contains_only_self_generated_targets"] = bool(loaded > 0 and self_generated_count == loaded)
+        if diagnostics["contains_only_self_generated_targets"]:
+            diagnostics["warning"] = "renderer manifest contains only self-generated runtime targets; use for bootstrapping/eval cautiously"
+            warnings = diagnostics.get("warnings")
+            if isinstance(warnings, list):
+                warnings.append({"type": "self_generated_only_targets", "message": diagnostics["warning"]})
         ds = cls(samples=samples)
         ds.diagnostics = diagnostics
         return ds
