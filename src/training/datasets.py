@@ -28,6 +28,12 @@ from memory.video_memory import MemoryManager
 from perception.pipeline import ObjectFacts, PerceptionOutput, PerceptionPipeline, PersonFacts
 from representation.graph_builder import SceneGraphBuilder
 from rendering.roi_renderer import ROISelector
+from rendering.target_provenance_policy import (
+    ALLOWED_TARGET_SOURCES as POLICY_ALLOWED_TARGET_SOURCES,
+    ALLOWED_TRAINING_TARGET_QUALITIES as POLICY_ALLOWED_TRAINING_TARGET_QUALITIES,
+    classify_target_training_role,
+    target_quality_warning,
+)
 
 
 class TrainingSample(TypedDict, total=False):
@@ -67,6 +73,8 @@ class TrainingSample(TypedDict, total=False):
     region_id: str
     target_source: str
     training_target_quality: str
+    target_training_role: str
+    target_quality_warning: str
 
 
 @dataclass(slots=True)
@@ -852,8 +860,8 @@ class RendererDataset(BaseStageDataset):
     CANONICAL_PHASES = {"prepare", "transition", "contact_or_reveal", "stabilize"}
     CANONICAL_FAMILIES = {"pose_transition", "garment_transition", "expression_transition", "interaction_transition", "visibility_transition"}
     ALLOWED_MEMORY_SUPPORT_LEVELS = {"none", "weak", "medium", "strong"}
-    ALLOWED_TARGET_SOURCES = {"runtime_output_patch", "provided_ground_truth_roi", "unknown"}
-    ALLOWED_TRAINING_TARGET_QUALITIES = {"self_generated_runtime_target", "external_or_observed_target", "unknown"}
+    ALLOWED_TARGET_SOURCES = POLICY_ALLOWED_TARGET_SOURCES
+    ALLOWED_TRAINING_TARGET_QUALITIES = POLICY_ALLOWED_TRAINING_TARGET_QUALITIES
 
     @classmethod
     def _normalize_target_source(cls, value: object) -> str:
@@ -1180,9 +1188,19 @@ class RendererDataset(BaseStageDataset):
             "family_counts": {"face_expression": 0, "torso_reveal": 0, "sleeve_arm_transition": 0},
             "target_quality_counts": {"self_generated_runtime_target": 0, "external_or_observed_target": 0, "unknown": 0},
             "target_source_counts": {"runtime_output_patch": 0, "provided_ground_truth_roi": 0, "unknown": 0},
+            "target_training_role_counts": {"supervised_external": 0, "bootstrap_self_generated": 0, "weak_unknown": 0},
+            "supervised_external_ratio": 0.0,
+            "bootstrap_self_generated_ratio": 0.0,
+            "weak_unknown_target_ratio": 0.0,
             "contains_self_generated_targets": False,
             "contains_external_targets": False,
             "contains_only_self_generated_targets": False,
+            "contains_only_bootstrap_targets": False,
+            "contains_no_supervised_external_targets": False,
+            "trainable_record_count": 0,
+            "supervised_record_count": 0,
+            "bootstrap_record_count": 0,
+            "weak_unknown_record_count": 0,
         }
         if manifest_type not in supported_manifest_types:
             diagnostics["unsupported_manifest_type"] = 1
@@ -1240,6 +1258,9 @@ class RendererDataset(BaseStageDataset):
                 diagnostics["target_source_counts"][target_source] = int(diagnostics["target_source_counts"].get(target_source, 0)) + 1
                 diagnostics["contains_self_generated_targets"] = bool(diagnostics["contains_self_generated_targets"]) or training_target_quality == "self_generated_runtime_target"
                 diagnostics["contains_external_targets"] = bool(diagnostics["contains_external_targets"]) or training_target_quality == "external_or_observed_target"
+                target_training_role = classify_target_training_role(training_target_quality)
+                quality_warning = target_quality_warning(training_target_quality)
+                diagnostics["target_training_role_counts"][target_training_role] = int(diagnostics["target_training_role_counts"].get(target_training_role, 0)) + 1
 
                 renderer_contract = {
                     "semantic_embed": rec.get("semantic_embed", cls._semantic_embed_from_family(family)),
@@ -1254,7 +1275,10 @@ class RendererDataset(BaseStageDataset):
                     "changed_mask": changed_mask,
                     "target_source": target_source,
                     "training_target_quality": training_target_quality,
+                    "target_training_role": target_training_role,
                 }
+                if quality_warning is not None:
+                    renderer_contract["target_quality_warning"] = quality_warning
                 renderer_memory_bundle = cls._normalize_renderer_memory_bundle(rec, diagnostics, idx)
                 renderer_contract["region_memory_bundle_serialized"] = renderer_memory_bundle
 
@@ -1266,12 +1290,15 @@ class RendererDataset(BaseStageDataset):
                         "region_id": region_id,
                         "target_source": target_source,
                         "training_target_quality": training_target_quality,
+                        "target_training_role": target_training_role,
                         "renderer_batch_contract": renderer_contract,
                         "delta_contract": rec.get("graph_delta", rec.get("delta_contract", {})),
                         "graph_transition_contract": rec.get("graph_transition_contract", {}),
                         "memory_records": rec.get("memory_records", []),
                         "patch_synthesis_contract": rec.get("patch_synthesis_contract", {}),
                     }
+                if quality_warning is not None:
+                    sample["target_quality_warning"] = quality_warning
                 samples.append(sample)
                 diagnostics["loaded_records"] = int(diagnostics["loaded_records"]) + 1
             except Exception as exc:
@@ -1283,11 +1310,31 @@ class RendererDataset(BaseStageDataset):
                     raise ValueError(f"renderer manifest record {idx} is invalid: {exc}") from exc
 
         loaded = int(diagnostics.get("loaded_records", 0))
+        role_counts = diagnostics.get("target_training_role_counts", {}) if isinstance(diagnostics.get("target_training_role_counts", {}), dict) else {}
+        supervised_count = int(role_counts.get("supervised_external", 0))
+        bootstrap_count = int(role_counts.get("bootstrap_self_generated", 0))
+        weak_unknown_count = int(role_counts.get("weak_unknown", 0))
         self_generated_count = int(diagnostics["target_quality_counts"].get("self_generated_runtime_target", 0))
+        diagnostics["supervised_external_ratio"] = round(float(supervised_count) / max(1.0, float(loaded)), 6)
+        diagnostics["bootstrap_self_generated_ratio"] = round(float(bootstrap_count) / max(1.0, float(loaded)), 6)
+        diagnostics["weak_unknown_target_ratio"] = round(float(weak_unknown_count) / max(1.0, float(loaded)), 6)
+        diagnostics["trainable_record_count"] = loaded
+        diagnostics["supervised_record_count"] = supervised_count
+        diagnostics["bootstrap_record_count"] = bootstrap_count
+        diagnostics["weak_unknown_record_count"] = weak_unknown_count
         diagnostics["contains_only_self_generated_targets"] = bool(loaded > 0 and self_generated_count == loaded)
+        diagnostics["contains_only_bootstrap_targets"] = bool(loaded > 0 and bootstrap_count == loaded)
+        diagnostics["contains_no_supervised_external_targets"] = bool(loaded > 0 and supervised_count == 0)
+        warnings = diagnostics.get("warnings")
+        if diagnostics["contains_no_supervised_external_targets"] and isinstance(warnings, list):
+            warnings.append(
+                {
+                    "type": "no_supervised_external_targets",
+                    "message": "renderer manifest has no external/observed targets; use only for bootstrap/eval unless explicitly intended",
+                }
+            )
         if diagnostics["contains_only_self_generated_targets"]:
-            diagnostics["warning"] = "renderer manifest contains only self-generated runtime targets; use for bootstrapping/eval cautiously"
-            warnings = diagnostics.get("warnings")
+            diagnostics["warning"] = "renderer manifest contains only self-generated runtime targets; use for bootstrap/eval cautiously"
             if isinstance(warnings, list):
                 warnings.append({"type": "self_generated_only_targets", "message": diagnostics["warning"]})
         ds = cls(samples=samples)
