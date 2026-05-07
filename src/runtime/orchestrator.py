@@ -377,7 +377,7 @@ class GennadyEngine:
                 patch_step_debug.append(
                     {
                         "region_id": region.region_id,
-                        "selected_strategy": patch_out.execution_trace.get("selected_render_strategy", patch_contract.get("selected_render_strategy", patch_contract.get("selected_strategy", "unknown"))),
+                        "selected_render_strategy": patch_out.execution_trace.get("selected_render_strategy", patch_contract.get("selected_render_strategy", "unknown")),
                         "execution_policy": patch_out.execution_trace.get("selection", {}).get("execution_policy", {}),
                         "mode_source": (patch_out.execution_trace.get("memory_dependency_summary", {}) or {}).get("mode_source", "unknown"),
                         "runtime_plan_authoritative": (patch_out.execution_trace.get("memory_dependency_summary", {}) or {}).get("runtime_plan_authoritative", False),

@@ -120,7 +120,7 @@ def save_summary_txt(outdir: Path, rendered_patches: list) -> Path:
         lines.append(f"  reason: {patch.region.reason}")
         lines.append(f"  confidence: {patch.confidence:.4f}")
         lines.append(f"  bbox: x={patch.region.bbox.x:.4f}, y={patch.region.bbox.y:.4f}, w={patch.region.bbox.w:.4f}, h={patch.region.bbox.h:.4f}")
-        lines.append(f"  strategy: {selection.get('selected_strategy', 'unknown')}")
+        lines.append(f"  strategy: {execution.get('selected_render_strategy', 'unknown')}")
         lines.append(f"  family: {selection.get('selected_family', 'unknown')}")
         lines.append(f"  transition_mode: {selection.get('transition_mode', 'unknown')}")
         lines.append(f"  hidden_mode: {hidden_state.get('hidden_reconstruction_mode', 'unknown')}")

@@ -126,7 +126,7 @@ def save_summary_txt(outdir: Path, rendered_patches: list) -> Path:
             f"  bbox: x={patch.region.bbox.x:.4f}, y={patch.region.bbox.y:.4f}, "
             f"w={patch.region.bbox.w:.4f}, h={patch.region.bbox.h:.4f}"
         )
-        lines.append(f"  strategy: {selection.get('selected_strategy', 'unknown')}")
+        lines.append(f"  strategy: {execution.get('selected_render_strategy', 'unknown')}")
         lines.append(f"  family: {selection.get('selected_family', 'unknown')}")
         lines.append(f"  transition_mode: {selection.get('transition_mode', 'unknown')}")
         lines.append(f"  hidden_mode: {hidden_state.get('hidden_reconstruction_mode', 'unknown')}")
@@ -474,7 +474,7 @@ def add_visible_debug_boost(patch) -> None:
     Для demo-режима делаем эффект заметнее, иначе визуально почти ничего не видно.
     Это НЕ production-логика, а просто визуальный буст для smoke/demo.
     """
-    strategy = (patch.execution_trace or {}).get("selection", {}).get("selected_strategy", "")
+    strategy = (patch.execution_trace or {}).get("selection", {}).get("planner_selected_strategy", "")
     rgb = np.array(patch.rgb_patch, dtype=np.float32)
 
     if strategy == "face_refine":

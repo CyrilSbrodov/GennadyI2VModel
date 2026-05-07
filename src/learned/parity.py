@@ -161,7 +161,7 @@ def patch_io_to_contract(request: PatchSynthesisRequest, output: PatchSynthesisO
         roi_after=output.rgb_patch,
         region=request.region,
         retrieval_summary=str(request.retrieval_summary),
-        selected_strategy=str(output.execution_trace.get("selected_render_strategy", "unknown")),
+        selected_render_strategy=str(output.execution_trace.get("selected_render_strategy", "unknown")),
         hidden_state=request.memory_channels.get("hidden_regions", {}),
         synthesis_mode=str(output.execution_trace.get("synthesis_mode", "deterministic")),
         transition_context=request.transition_context,
