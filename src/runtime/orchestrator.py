@@ -126,6 +126,7 @@ class GennadyEngine:
         fps: int = 16,
         duration: float = 4.0,
         quality_profile: str = "balanced",
+        export_renderer_manifest_path: str | None = None,
     ) -> InferenceArtifacts:
         profile = self._resolve_profile(quality_profile)
         request = self.input_layer.build_request(
@@ -149,6 +150,7 @@ class GennadyEngine:
         memory = self.memory_manager.initialize_from_scene(scene_graph)
         graph_encoding = self.backends.graph_encoder.encode(scene_graph)
         fallback_log: list[str] = []
+        renderer_manifest_records: list[dict[str, object]] = []
 
         action_plan = self.intent_parser.parse(request.text, scene_graph=scene_graph)
         text_encoding = self.backends.text_encoder.encode(request.text, scene_graph=scene_graph, action_plan=action_plan)
@@ -311,6 +313,19 @@ class GennadyEngine:
                 patch_contract_validation = self._validate_patch_output_contract(patch_out, expected_region_id=region.region_id)
                 if patch_contract_validation["issues"]:
                     raise ValueError(f"Patch contract violation at step={planned_state.step_index}, region={region.region_id}: {patch_contract_validation['issues']}")
+                if export_renderer_manifest_path:
+                    from training.renderer_manifest_exporter import RendererManifestRecordExporter
+
+                    roi_before_export = self._extract_region_roi_for_export(current_frame, region, patch_out.height, patch_out.width)
+                    renderer_manifest_records.append(
+                        RendererManifestRecordExporter().build_record(
+                            request=patch_request,
+                            output=patch_out,
+                            roi_before=roi_before_export,
+                            step_index=planned_state.step_index,
+                            frame_index=len(frames),
+                        )
+                    )
                 patch_contract = patch_io_to_contract(patch_request, patch_out)
                 patch_parity = build_parity_result(
                     contract=patch_contract,
@@ -543,6 +558,11 @@ class GennadyEngine:
             if step_hidden_reconstruction:
                 hidden_recon_stats["steps_with_hidden_reconstruction"] += 1
 
+        if export_renderer_manifest_path:
+            from training.renderer_manifest_exporter import RendererManifestRecordExporter
+
+            RendererManifestRecordExporter().write_manifest(renderer_manifest_records, export_renderer_manifest_path)
+
         video_uri = self._export_video(frames, fps)
         return InferenceArtifacts(
             frames=frames,
@@ -598,6 +618,38 @@ class GennadyEngine:
                 },
             },
         )
+
+    @staticmethod
+    def _extract_region_roi_for_export(frame: list, region: object, height: int, width: int) -> list:
+        arr = np.asarray(frame, dtype=np.float32)
+        if arr.ndim != 3 or arr.shape[2] != 3:
+            raise ValueError(f"renderer export roi_before requires HxWx3 frame, got shape={list(arr.shape)}")
+        h, w = arr.shape[:2]
+        bbox = getattr(region, "bbox", None)
+        if bbox is not None:
+            x = float(getattr(bbox, "x", 0.0))
+            y = float(getattr(bbox, "y", 0.0))
+            bw = float(getattr(bbox, "w", 1.0))
+            bh = float(getattr(bbox, "h", 1.0))
+            if max(abs(x), abs(y), abs(bw), abs(bh)) <= 1.5:
+                x0, y0 = int(round(x * w)), int(round(y * h))
+                x1, y1 = int(round((x + bw) * w)), int(round((y + bh) * h))
+            else:
+                x0, y0 = int(round(x)), int(round(y))
+                x1, y1 = int(round(x + bw)), int(round(y + bh))
+            x0, y0 = max(0, min(w - 1, x0)), max(0, min(h - 1, y0))
+            x1, y1 = max(x0 + 1, min(w, x1)), max(y0 + 1, min(h, y1))
+            crop = arr[y0:y1, x0:x1]
+        else:
+            crop = arr
+        target_h = max(1, int(height))
+        target_w = max(1, int(width))
+        if crop.shape[0] == target_h and crop.shape[1] == target_w:
+            return np.clip(crop, 0.0, 1.0).tolist()
+        yy = np.linspace(0, crop.shape[0] - 1, target_h).round().astype(int)
+        xx = np.linspace(0, crop.shape[1] - 1, target_w).round().astype(int)
+        resized = crop[yy][:, xx]
+        return np.clip(resized, 0.0, 1.0).tolist()
 
     def _debug_seed_frame_tensor(self, profile: RuntimeProfile) -> list:
         h, w = profile.internal_resolution
