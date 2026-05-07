@@ -83,8 +83,16 @@ def build_graph_transition_contract(before: SceneGraph, after: SceneGraph, delta
     }
 
 
-def build_patch_synthesis_contract(roi_before: object, roi_after: object, region: RegionRef, retrieval_summary: str, selected_strategy: str, hidden_state: dict[str, object], synthesis_mode: str, transition_context: dict[str, object]) -> PatchSynthesisContract:
-    selected_render_strategy = selected_strategy
+def build_patch_synthesis_contract(
+    roi_before: object,
+    roi_after: object,
+    region: RegionRef,
+    retrieval_summary: str,
+    selected_render_strategy: str,
+    hidden_state: dict[str, object],
+    synthesis_mode: str,
+    transition_context: dict[str, object],
+) -> PatchSynthesisContract:
     return {
         "roi_before": roi_before,
         "roi_after": roi_after,

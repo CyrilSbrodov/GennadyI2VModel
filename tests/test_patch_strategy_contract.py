@@ -4,6 +4,7 @@ from core.schema import BBox, PersonNode, RegionRef, SceneGraph
 from learned.interfaces import PatchSynthesisOutput, PatchSynthesisRequest
 from learned.parity import build_parity_result, patch_io_to_contract
 from runtime.orchestrator import PATCH_PARITY_REQUIRED_FIELDS
+from training.learned_contracts import build_patch_synthesis_contract
 
 
 PATCH_REQUIRED_FIELDS = ["roi_before", "roi_after", "region_metadata", "selected_render_strategy", "transition_context"]
@@ -102,6 +103,23 @@ def test_patch_contract_legacy_selected_strategy_is_alias_only() -> None:
     assert "selected_strategy" not in PATCH_REQUIRED_FIELDS
     assert "missing_field:selected_strategy" not in parity["errors"]
     assert parity["missing_fields"] == []
+
+
+def test_build_patch_synthesis_contract_parameter_uses_selected_render_strategy_name() -> None:
+    contract = build_patch_synthesis_contract(
+        roi_before=_frame(0.2),
+        roi_after=_frame(0.8),
+        region=_region(),
+        retrieval_summary="test",
+        selected_render_strategy="LEARNED_PRIMARY",
+        hidden_state={"visible": True},
+        synthesis_mode="learned_primary",
+        transition_context={"stage": "patch"},
+    )
+
+    assert contract["selected_render_strategy"] == "LEARNED_PRIMARY"
+    assert contract.get("selected_strategy") == "LEARNED_PRIMARY"
+    assert "selected_execution_strategy" not in contract
 
 
 def test_runtime_patch_parity_required_fields_are_canonical() -> None:

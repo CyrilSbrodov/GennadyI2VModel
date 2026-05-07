@@ -832,7 +832,18 @@ class PatchSynthesisStageRunner(_BaseStageRunner):
                 identity_embedding=[0.1 + 0.01 * idx] * 8,
             )
             out = self.backends.patch_backend.synthesize_patch(req)
-            contract = build_patch_synthesis_contract(sample["frame"], out.rgb_patch, sample["region"], "baseline", str(out.execution_trace.get("selected_render_strategy", "unknown")), sample.get("hidden_state", {}), str(out.execution_trace.get("synthesis_mode", "deterministic")), req.transition_context)
+            contract = build_patch_synthesis_contract(
+                sample["frame"],
+                out.rgb_patch,
+                sample["region"],
+                "baseline",
+                selected_render_strategy=str(
+                    out.execution_trace.get("selected_render_strategy", "unknown")
+                ),
+                hidden_state=sample.get("hidden_state", {}),
+                synthesis_mode=str(out.execution_trace.get("synthesis_mode", "deterministic")),
+                transition_context=req.transition_context,
+            )
             last_contract = contract
             eval_payload = build_patch_eval_payload(contract)
             patch_eval = patch_synthesis_eval(eval_payload)
