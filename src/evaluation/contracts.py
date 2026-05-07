@@ -52,15 +52,19 @@ def build_graph_eval_payload(contract: dict[str, object]) -> dict[str, object]:
 
 
 def build_patch_eval_payload(contract: dict[str, object]) -> dict[str, object]:
-    strategy = (
-        str(contract.get("selected_render_strategy", contract.get("selected_strategy", "unknown")))
-        if isinstance(contract, dict)
-        else "unknown"
-    )
+    if not isinstance(contract, dict):
+        strategy = "unknown"
+    elif "selected_render_strategy" in contract:
+        strategy = str(contract.get("selected_render_strategy", "unknown"))
+    else:
+        # Legacy compatibility only: old payloads may only have selected_strategy.
+        # Do not use it when selected_render_strategy exists, even if canonical is unknown.
+        strategy = str(contract.get("selected_strategy", "unknown"))
     quality = 0.7 if strategy and strategy != "unknown" else 0.4
+    hidden_lifecycle_state = contract.get("hidden_lifecycle_state") if isinstance(contract, dict) else None
     return {
         "patch_quality": quality,
-        "identity_consistency": 0.75 if contract.get("hidden_lifecycle_state") else 0.55,
+        "identity_consistency": 0.75 if hidden_lifecycle_state else 0.55,
     }
 
 
