@@ -1321,7 +1321,9 @@ class RendererDataset(BaseStageDataset):
                     roi_after=frames[1],
                     region=rois[0],
                     retrieval_summary=rec.get("retrieval_summary", "manifest"),
-                    selected_strategy=rec.get("selected_strategy", "fallback"),
+                    selected_render_strategy=rec.get(
+                        "selected_render_strategy", rec.get("selected_strategy", "fallback")
+                    ),
                     hidden_state=rec.get("hidden_lifecycle_state", {}),
                     synthesis_mode=rec.get("synthesis_mode", "deterministic"),
                     transition_context=rec.get("transition_context", {}),
