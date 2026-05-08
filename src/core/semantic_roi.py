@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from core.region_ids import make_region_id
 from core.schema import BBox, RegionRef, SceneGraph
+from perception.mask_store import DEFAULT_MASK_STORE
 from representation.scene_graph_queries import SceneGraphQueries
 
 
@@ -39,10 +40,100 @@ class SemanticROIHelper:
             return BBox(person_bbox.x + person_bbox.w * 0.15, person_bbox.y + person_bbox.h * 0.55, person_bbox.w * 0.7, person_bbox.h * 0.42)
         return BBox(person_bbox.x + person_bbox.w * 0.1, person_bbox.y + person_bbox.h * 0.18, person_bbox.w * 0.8, person_bbox.h * 0.62)
 
+
+    @staticmethod
+    def _bbox_xyxy_from_payload(payload: object) -> tuple[float, float, float, float] | None:
+        if hasattr(payload, "tolist"):
+            payload = payload.tolist()
+        if not isinstance(payload, list) or not payload:
+            return None
+        ys: list[int] = []
+        xs: list[int] = []
+        for y, row in enumerate(payload):
+            if not isinstance(row, list):
+                continue
+            for x, value in enumerate(row):
+                try:
+                    active = float(value[0] if isinstance(value, list) else value) > 0
+                except Exception:
+                    active = False
+                if active:
+                    ys.append(y)
+                    xs.append(x)
+        if not xs or not ys:
+            return None
+        height = max(1, len(payload))
+        width = max(1, len(payload[0]) if isinstance(payload[0], list) else 1)
+        return (min(xs) / width, min(ys) / height, (max(xs) + 1) / width, (max(ys) + 1) / height)
+
+    def _bbox_from_mask_ref(self, mask_ref: str | None) -> BBox | None:
+        if not mask_ref:
+            return None
+        stored = DEFAULT_MASK_STORE.get(mask_ref)
+        if stored is None:
+            return None
+        bbox = stored.extra.get("bbox_xyxy") if isinstance(stored.extra, dict) else None
+        if not (isinstance(bbox, tuple) or isinstance(bbox, list)) or len(bbox) != 4:
+            bbox = self._bbox_xyxy_from_payload(stored.payload)
+        if not (isinstance(bbox, tuple) or isinstance(bbox, list)) or len(bbox) != 4:
+            roi = stored.roi_bbox
+            if roi is None:
+                return None
+            x, y, w, h = roi
+            return self.normalize_bbox(BBox(float(x), float(y), float(w), float(h)))
+        x1, y1, x2, y2 = [max(0.0, min(1.0, float(v))) for v in bbox]
+        return self.normalize_bbox(BBox(x1, y1, max(0.02, x2 - x1), max(0.02, y2 - y1)))
+
+    @staticmethod
+    def _mask_reason(prefix: str, node: object) -> str:
+        return ";".join(
+            [
+                prefix,
+                "roi_source=parser_mask_bbox",
+                f"mask_ref={getattr(node, 'mask_ref', '')}",
+                f"source={getattr(node, 'source', '')}",
+                f"confidence={getattr(node, 'confidence', 0.0)}",
+            ]
+        )
+
     def region_from_graph(self, scene_graph: SceneGraph, entity_id: str, region_type: str) -> RegionRef | None:
         person = SceneGraphQueries._person(scene_graph, entity_id)
         if person is None:
             return None
+
+        part_aliases = {
+            "face": ["face"],
+            "head": ["face", "head"],
+            "hair": ["hair"],
+            "neck": ["neck", "head"],
+            "torso": ["torso", "upper_body"],
+            "arms": ["left_arm", "right_arm", "arms", "upper_body"],
+            "left_arm": ["left_arm", "arms"],
+            "right_arm": ["right_arm", "arms"],
+            "hands": ["left_hand", "right_hand", "hands"],
+            "left_hand": ["left_hand", "hands"],
+            "right_hand": ["right_hand", "hands"],
+            "legs": ["left_leg", "right_leg", "legs"],
+        }
+        for alias in part_aliases.get(region_type, [region_type]):
+            part_node = SceneGraphQueries.get_body_part(scene_graph, entity_id, alias)
+            bbox = self._bbox_from_mask_ref(part_node.mask_ref if part_node else None)
+            if bbox is not None and part_node is not None:
+                return RegionRef(make_region_id(entity_id, region_type), self.expand_with_context(bbox, 0.015), self._mask_reason("graph_semantic:body_part_mask", part_node))
+
+        garment_aliases = {
+            "garments": ["dress", "outer_garment", "upper_garment", "lower_garment", "inner_garment"],
+            "dress": ["dress", "upper_garment", "outer_garment"],
+            "outer_garment": ["outer_garment", "upper_garment", "dress"],
+            "upper_garment": ["upper_garment", "dress"],
+            "lower_garment": ["lower_garment"],
+            "inner_garment": ["inner_garment", "upper_garment"],
+        }
+        for wanted in garment_aliases.get(region_type, []):
+            garment = next((g for g in person.garments if g.garment_type == wanted and g.mask_ref), None)
+            bbox = self._bbox_from_mask_ref(garment.mask_ref if garment else None)
+            if bbox is not None and garment is not None:
+                return RegionRef(make_region_id(entity_id, region_type), self.expand_with_context(bbox, 0.02), self._mask_reason("graph_semantic:garment_mask", garment))
 
         if region_type in {"face", "head"}:
             part = SceneGraphQueries.get_body_part(scene_graph, entity_id, "head")
@@ -51,7 +142,7 @@ class SemanticROIHelper:
                 if bbox:
                     return RegionRef(make_region_id(entity_id, region_type), self.expand_with_context(bbox, 0.015), "graph_semantic:body_part_keypoints")
 
-        if region_type in {"left_arm", "right_arm", "left_upper_arm", "right_upper_arm", "sleeves"}:
+        if region_type in {"arms", "left_arm", "right_arm", "left_upper_arm", "right_upper_arm", "sleeves", "hands"}:
             arm_keys = {"left_arm": {"left_upper_arm", "left_lower_arm", "left_hand"}, "right_arm": {"right_upper_arm", "right_lower_arm", "right_hand"}}
             wanted = arm_keys.get(region_type, {region_type})
             kp = [k for bp in person.body_parts if bp.part_type in wanted for k in bp.keypoints]
@@ -84,4 +175,4 @@ class SemanticROIHelper:
         if person is None:
             return None
         fallback = self.normalize_bbox(self.fallback_person_bbox(person.bbox, region_type))
-        return RegionRef(make_region_id(entity_id, region_type), fallback, "fallback:person_bbox_template")
+        return RegionRef(make_region_id(entity_id, region_type), fallback, "roi_source=person_bbox_fallback;fallback:person_bbox_template")

@@ -10,6 +10,7 @@ from core.input_layer import AssetFrame
 from perception.backend import frame_to_features
 from perception.detector import BackendConfig, PersonDetection
 from perception.frame_context import FrameLike, PerceptionFrameContext
+from perception.human_parser_mapping import map_human_parser_class
 from perception.image_ops import crop_rgb, frame_to_numpy_rgb
 from perception.mask_store import DEFAULT_MASK_STORE
 
@@ -42,20 +43,21 @@ class ParserStackConfig:
         )
 
     @classmethod
-    def from_backend_config(cls, config: BackendConfig) -> "ParserStackConfig":
-        # Legacy-режим: один backend размножаем по всем parser-компонентам.
-        mapped = ParserBackendConfig(
+    def from_legacy_backend_config(cls, config: BackendConfig) -> "ParserStackConfig":
+        # Legacy mode: one BackendConfig selects the primary HF/FASHN parser while
+        # optional refiners stay disabled unless explicitly configured. This avoids
+        # silently invoking unsupported parser runtimes for a real-human-parsing config.
+        primary = ParserBackendConfig(
             backend=("fashn" if config.backend == "hf" else config.backend),
             variant=config.checkpoint,
             device=config.device,
             confidence_threshold=config.confidence_threshold,
         )
-        return cls(
-            primary_human_parser=mapped,
-            structural_body_parser=mapped,
-            garment_refinement_parser=mapped,
-            face_parser=mapped,
-        )
+        return cls(primary_human_parser=primary)
+
+    @classmethod
+    def from_backend_config(cls, config: BackendConfig) -> "ParserStackConfig":
+        return cls.from_legacy_backend_config(config)
 
 
 @dataclass(slots=True)
@@ -68,6 +70,10 @@ class GarmentPrediction:
     coverage_targets: list[str] = field(default_factory=list)
     attachment_targets: list[str] = field(default_factory=list)
     layer_hint: str = "unknown"
+    bbox_xyxy: tuple[float, float, float, float] | None = None
+    pixel_count: int = 0
+    parser_class_name: str = ""
+    class_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -77,6 +83,10 @@ class BodyPartMaskPrediction:
     confidence: float
     visibility: str
     source: str
+    bbox_xyxy: tuple[float, float, float, float] | None = None
+    pixel_count: int = 0
+    parser_class_name: str = ""
+    class_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -85,6 +95,10 @@ class FaceRegionPrediction:
     mask_ref: str | None
     confidence: float
     source: str
+    bbox_xyxy: tuple[float, float, float, float] | None = None
+    pixel_count: int = 0
+    parser_class_name: str = ""
+    class_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -94,9 +108,12 @@ class EnrichedParsingPayload:
     garment_masks: dict[str, str] = field(default_factory=dict)
     face_region_masks: dict[str, str] = field(default_factory=dict)
     accessory_masks: dict[str, str] = field(default_factory=dict)
+    background_masks: dict[str, str] = field(default_factory=dict)
     coverage_hints: dict[str, list[str]] = field(default_factory=dict)
     visibility_hints: dict[str, str] = field(default_factory=dict)
     provenance_by_region: dict[str, str] = field(default_factory=dict)
+    parser_class_names: dict[str, str] = field(default_factory=dict)
+    region_mask_refs: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -120,6 +137,7 @@ class HumanParser(Protocol):
 class AdapterSegmentationOutput:
     masks: dict[str, "object"] = field(default_factory=dict)
     confidences: dict[str, float] = field(default_factory=dict)
+    class_ids: dict[str, int | None] = field(default_factory=dict)
     runtime_format: str = "unknown"
 
 
@@ -148,11 +166,30 @@ def _label_map_to_masks(label_map: "object", class_map: dict[int, str]) -> dict[
         return {}
     out: dict[str, object] = {}
     for lid, name in class_map.items():
-        if lid == 0:
-            continue
         out[name] = [[1 if int(px) == lid else 0 for px in row] for row in arr]
     return out
 
+
+
+def _mask_stats(mask: "object", roi_bbox: tuple[float, float, float, float] | None = None) -> tuple[int, tuple[float, float, float, float] | None]:
+    arr = _safe_array(mask)
+    ys: list[int] = []
+    xs: list[int] = []
+    for y, row in enumerate(arr):
+        for x, v in enumerate(row):
+            if int(v) > 0:
+                ys.append(y)
+                xs.append(x)
+    if not xs or not ys:
+        return 0, None
+    h = max(1, len(arr))
+    w = max(1, len(arr[0]) if arr else 1)
+    x1, x2 = min(xs) / w, (max(xs) + 1) / w
+    y1, y2 = min(ys) / h, (max(ys) + 1) / h
+    if roi_bbox is not None:
+        rx, ry, rw, rh = roi_bbox
+        return len(xs), (rx + x1 * rw, ry + y1 * rh, rx + x2 * rw, ry + y2 * rh)
+    return len(xs), (x1, y1, x2, y2)
 
 def _mask_conf(mask: "object") -> float:
     arr = _safe_array(mask)
@@ -161,6 +198,11 @@ def _mask_conf(mask: "object") -> float:
         return 0.0
     ones = sum(sum(int(v > 0) for v in row) for row in arr)
     return float(max(0.0, min(1.0, ones / total)))
+
+
+def _remember_region_ref(enriched: EnrichedParsingPayload, key: str, ref: str | None) -> None:
+    if ref:
+        enriched.region_mask_refs.setdefault(key, []).append(ref)
 
 
 def _store_mask(
@@ -179,6 +221,7 @@ def _store_mask(
         arr = _safe_array(mask)
         if not arr or max((max(row) if row else 0 for row in arr), default=0) <= 0:
             return None
+        pixel_count, bbox_xyxy = _mask_stats(arr, roi_bbox=roi_bbox)
         return DEFAULT_MASK_STORE.put(
             arr,
             confidence=confidence,
@@ -189,6 +232,7 @@ def _store_mask(
             roi_bbox=roi_bbox,
             frame_size=frame_size,
             tags=[f"person:{person_id}"] if person_id else [],
+            extra={"pixel_count": pixel_count, "bbox_xyxy": bbox_xyxy},
         )
     except Exception:
         return None
@@ -305,22 +349,30 @@ class FashnHumanParserAdapter:
             return AdapterSegmentationOutput(
                 masks=masks,
                 confidences={k: _mask_conf(v) for k, v in masks.items()},
+                class_ids={name: lid for lid, name in class_map.items()},
                 runtime_format=runtime_format + ":label_map",
             )
 
         masks: dict[str, object] = {}
+        class_ids: dict[str, int | None] = {}
         if isinstance(raw, list):
             for seg in raw:
                 if not isinstance(seg, dict):
                     continue
                 label = str(seg.get("label", "")).lower().strip()
                 mask = seg.get("mask")
-                if mask is not None and label and label != "background":
+                if mask is not None and label:
                     masks[label] = _safe_array(mask)
+                    raw_id = seg.get("class_id", seg.get("id", seg.get("label_id")))
+                    try:
+                        class_ids[label] = int(raw_id) if raw_id is not None else None
+                    except Exception:
+                        class_ids[label] = None
 
         return AdapterSegmentationOutput(
             masks=masks,
             confidences={k: _mask_conf(v) for k, v in masks.items()},
+            class_ids=class_ids,
             runtime_format=runtime_format + ":segments_list",
         )
 
@@ -566,8 +618,10 @@ class ParserFusionEngine:
 
         topology = dict(fashn.masks)
         topology.update(pascal.masks)
+        parser_roi = (person.bbox.x, person.bbox.y, person.bbox.w, person.bbox.h)
         for part, mask in topology.items():
-            if part in {"top", "dress", "skirt", "pants", "belt", "bag", "hat", "scarf", "glasses", "jewelry"}:
+            mapping = map_human_parser_class(part)
+            if mapping.category in {"garment", "accessory", "background"}:
                 continue
             conf = pascal.confidences.get(part, fashn.confidences.get(part, 0.0))
             source = "parser:schp_pascal" if part in pascal.masks else "parser:fashn"
@@ -575,67 +629,89 @@ class ParserFusionEngine:
                 mask,
                 conf,
                 source,
-                "body",
+                f"parser_{person.detection_id}_{mapping.canonical_region_type}",
                 "body_part_mask",
                 source.split(":")[-1],
-                roi_bbox=(person.bbox.x, person.bbox.y, person.bbox.w, person.bbox.h),
+                roi_bbox=parser_roi,
                 frame_size=frame_size,
                 person_id=person.detection_id,
             )
             if ref is None:
                 continue
-            body_parts.append(BodyPartMaskPrediction(part, ref, conf, "visible" if conf >= 0.5 else "partially_visible", source))
-            enriched.body_part_masks[part] = ref
-            enriched.visibility_hints[f"body:{part}"] = "visible" if conf >= 0.5 else "partially_visible"
-            enriched.provenance_by_region[f"body:{part}"] = source
+            pixel_count, bbox_xyxy = _mask_stats(mask, roi_bbox=parser_roi)
+            body_parts.append(
+                BodyPartMaskPrediction(
+                    mapping.canonical_region_type,
+                    ref,
+                    conf,
+                    "visible" if conf >= 0.5 else "partially_visible",
+                    source,
+                    bbox_xyxy=bbox_xyxy,
+                    pixel_count=pixel_count,
+                    parser_class_name=part,
+                    class_id=pascal.class_ids.get(part, fashn.class_ids.get(part)),
+                )
+            )
+            enriched.body_part_masks[mapping.canonical_region_type] = ref
+            _remember_region_ref(enriched, f"body:{mapping.canonical_region_type}", ref)
+            enriched.visibility_hints[f"body:{mapping.canonical_region_type}"] = "visible" if conf >= 0.5 else "partially_visible"
+            enriched.provenance_by_region[f"body:{mapping.canonical_region_type}"] = source
+            enriched.parser_class_names[f"body:{mapping.canonical_region_type}"] = part
 
-        garment_candidates = {
-            "top": "upper_torso",
-            "upper_clothes": "upper_torso",
+        garment_targets = {
             "dress": "torso_pelvis_upper_legs",
-            "skirt": "pelvis_upper_legs",
-            "pants": "pelvis_legs",
-            "belt": "pelvis_waist",
-            "bag": "torso_side",
-            "scarf": "neck_upper_torso",
-            "hat": "head",
+            "upper_garment": "upper_torso",
+            "outer_garment": "upper_torso",
+            "lower_garment": "pelvis_legs",
+            "accessory": "person_accessory",
         }
         seen: set[str] = set()
         for source_name, out in (("fashn", fashn), ("schp_atr", atr)):
-            for g, target in garment_candidates.items():
-                if g not in out.masks or g in seen:
+            for g, mask in out.masks.items():
+                mapping = map_human_parser_class(g)
+                if mapping.category not in {"garment", "accessory"} or g in seen:
                     continue
                 seen.add(g)
                 conf = out.confidences.get(g, 0.0)
                 src = f"parser:{source_name}"
                 ref = _store_mask(
-                    out.masks[g],
+                    mask,
                     conf,
                     src,
-                    "garment",
-                    "garment_mask",
+                    f"parser_{person.detection_id}_{mapping.garment_type or mapping.canonical_region_type}",
+                    "garment_mask" if mapping.category == "garment" else "accessory_mask",
                     source_name,
-                    roi_bbox=(person.bbox.x, person.bbox.y, person.bbox.w, person.bbox.h),
+                    roi_bbox=parser_roi,
                     frame_size=frame_size,
                     person_id=person.detection_id,
                 )
+                pixel_count, bbox_xyxy = _mask_stats(mask, roi_bbox=parser_roi)
+                target = garment_targets.get(mapping.canonical_region_type, "upper_torso")
                 garments.append(
                     GarmentPrediction(
-                        garment_type=("top" if g == "upper_clothes" else g),
+                        garment_type=mapping.garment_type or g,
                         state="visible",
                         confidence=conf,
                         source=src,
                         mask_ref=ref,
                         coverage_targets=[target],
-                        attachment_targets=["torso" if g != "hat" else "head"],
-                        layer_hint=("outerwear" if g in {"coat", "jacket", "scarf"} else "innerwear"),
+                        attachment_targets=["torso" if mapping.garment_type != "hat" else "head"],
+                        layer_hint=("outerwear" if mapping.canonical_region_type == "outer_garment" else "innerwear"),
+                        bbox_xyxy=bbox_xyxy,
+                        pixel_count=pixel_count,
+                        parser_class_name=g,
+                        class_id=out.class_ids.get(g),
                     )
                 )
                 if ref:
-                    enriched.garment_masks[g] = ref
-                    enriched.coverage_hints[g] = [target]
-                    enriched.visibility_hints[f"garment:{g}"] = "visible" if conf >= 0.5 else "partially_visible"
-                    enriched.provenance_by_region[f"garment:{g}"] = src
+                    bucket = enriched.accessory_masks if mapping.category == "accessory" else enriched.garment_masks
+                    bucket[mapping.garment_type or g] = ref
+                    _remember_region_ref(enriched, f"{mapping.category}:{mapping.garment_type or g}", ref)
+                    _remember_region_ref(enriched, f"canonical:{mapping.canonical_region_type}", ref)
+                    enriched.coverage_hints[mapping.garment_type or g] = [target]
+                    enriched.visibility_hints[f"garment:{mapping.garment_type or g}"] = "visible" if conf >= 0.5 else "partially_visible"
+                    enriched.provenance_by_region[f"garment:{mapping.garment_type or g}"] = src
+                    enriched.parser_class_names[f"garment:{mapping.garment_type or g}"] = g
 
         for acc in ("bag", "hat", "glasses", "jewelry", "scarf", "belt"):
             if acc in fashn.masks:
@@ -656,12 +732,31 @@ class ParserFusionEngine:
                     enriched.visibility_hints[f"accessory:{acc}"] = "visible" if conf >= 0.5 else "partially_visible"
                     enriched.provenance_by_region[f"accessory:{acc}"] = "parser:fashn"
 
+        if "background" in fashn.masks:
+            bg_ref = _store_mask(
+                fashn.masks["background"],
+                fashn.confidences.get("background", 0.0),
+                "parser:fashn",
+                "parser_background",
+                "background_mask",
+                "fashn",
+                roi_bbox=parser_roi,
+                frame_size=frame_size,
+                person_id=person.detection_id,
+            )
+            if bg_ref:
+                enriched.background_masks["background"] = bg_ref
+                _remember_region_ref(enriched, "background:background", bg_ref)
+                enriched.provenance_by_region["background:background"] = "parser:fashn"
+                enriched.parser_class_names["background:background"] = "background"
+
         face_source = facer if facer.masks else AdapterSegmentationOutput(
             masks={k: v for k, v in fashn.masks.items() if k in {"face", "hair"}},
             confidences={k: fashn.confidences.get(k, 0.0) for k in ("face", "hair")},
         )
         for region, mask in face_source.masks.items():
-            canonical = "face_skin" if region == "face" else ("hairline_or_hair_face_boundary" if region == "hair" else region)
+            mapped_region = map_human_parser_class(region)
+            canonical = mapped_region.canonical_region_type
             conf = face_source.confidences.get(region, 0.0)
             src = "parser:facer" if facer.masks else "parser:fashn"
             ref = _store_mask(
@@ -677,10 +772,13 @@ class ParserFusionEngine:
             )
             if ref is None:
                 continue
-            face_regions.append(FaceRegionPrediction(canonical, ref, conf, src))
+            pixel_count, bbox_xyxy = _mask_stats(mask, roi_bbox=parser_roi)
+            face_regions.append(FaceRegionPrediction(canonical, ref, conf, src, bbox_xyxy=bbox_xyxy, pixel_count=pixel_count, parser_class_name=region, class_id=face_source.class_ids.get(region)))
             enriched.face_region_masks[canonical] = ref
+            _remember_region_ref(enriched, f"face:{canonical}", ref)
             enriched.visibility_hints[f"face:{canonical}"] = "visible" if conf >= 0.5 else "partially_visible"
             enriched.provenance_by_region[f"face:{canonical}"] = src
+            enriched.parser_class_names[f"face:{canonical}"] = region
 
         occlusion_hints = ["torso_visible" if "torso" in topology else "torso_hidden"]
         for part in ("upper_arm", "arms"):
@@ -803,3 +901,19 @@ class SegFormerHumanParserAdapter:
 
             result[person.detection_id] = fused
         return result
+
+
+class HFHumanParserBackend(FashnHumanParserAdapter):
+    """HF SegFormer human/clothes parser backend using the FASHN parser by default.
+
+    Imports transformers lazily through the underlying runtime so repository imports do
+    not require torch/transformers unless this backend is executed.
+    """
+
+    source_name = "hf_human_parser"
+
+    def __init__(self, config: ParserBackendConfig | None = None, infer_fn: Callable[["object"], "object"] | None = None) -> None:
+        cfg = config or ParserBackendConfig(backend="fashn", variant="fashn-ai/fashn-human-parser", device="auto")
+        if not cfg.variant:
+            cfg.variant = "fashn-ai/fashn-human-parser"
+        super().__init__(cfg, infer_fn=infer_fn)

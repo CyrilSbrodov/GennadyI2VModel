@@ -38,9 +38,10 @@ class InMemoryMaskStore:
         frame_size: tuple[int, int] | None = None,
         tags: list[str] | None = None,
         extra: dict[str, "object"] | None = None,
+        ref: str | None = None,
     ) -> str:
         mid = next(self._counter)
-        ref = f"mask://{prefix}/{mid}"
+        ref = ref or f"mask://{prefix}/{mid}"
         self._items[ref] = StoredMask(
             ref=ref,
             payload=payload,
@@ -57,6 +58,26 @@ class InMemoryMaskStore:
 
     def get(self, ref: str) -> StoredMask | None:
         return self._items.get(ref)
+
+    def clear(self) -> None:
+        """Remove all runtime masks and reset deterministic per-run numbering."""
+        self._counter = itertools.count(1)
+        self._items.clear()
+
+    def snapshot_metadata(self) -> dict[str, dict[str, object]]:
+        return {
+            ref: {
+                "confidence": item.confidence,
+                "source": item.source,
+                "mask_kind": item.mask_kind,
+                "backend": item.backend,
+                "roi_bbox": item.roi_bbox,
+                "frame_size": item.frame_size,
+                "tags": list(item.tags),
+                "extra": dict(item.extra),
+            }
+            for ref, item in self._items.items()
+        }
 
 
 DEFAULT_MASK_STORE = InMemoryMaskStore()
