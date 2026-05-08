@@ -53,8 +53,8 @@ class TrainingConfig:
 @dataclass(slots=True)
 class StageResult:
     stage_name: str
-    train_metrics: dict[str, float]
-    val_metrics: dict[str, float]
+    train_metrics: dict[str, object]
+    val_metrics: dict[str, object]
     checkpoint_path: str
 
 
