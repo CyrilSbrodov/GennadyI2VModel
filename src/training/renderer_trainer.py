@@ -28,6 +28,7 @@ from rendering.trainable_patch_renderer import (
 )
 from training.rollout_eval import evaluate_rollout_modes_on_video_manifest
 from rendering.target_provenance_policy import classify_target_training_role, target_quality_warning, target_supervision_summary
+from rendering.renderer_checkpoint_loader import load_renderer_model_from_checkpoint
 from rendering.torch_local_patch_generator import TorchBackendUnavailableError, TorchLocalPatchGenerator
 from training.datasets import RendererDataset
 from training.types import StageResult, TrainingConfig
@@ -367,19 +368,8 @@ class RendererTrainer:
 
     @staticmethod
     def load_model_from_checkpoint(checkpoint_path: str):
-        payload = json.loads(Path(checkpoint_path).read_text(encoding="utf-8"))
-        metadata = payload.get("renderer_model_metadata", {}) if isinstance(payload.get("renderer_model_metadata", {}), dict) else {}
-        backend = str(metadata.get("renderer_backend", payload.get("renderer_backend", "numpy_local")))
-        model_path = str(payload.get("model_path", ""))
-        if backend == "torch_local":
-            if not model_path:
-                raise ValueError("Torch renderer checkpoint missing model_path")
-            return TorchLocalPatchGenerator.load(model_path), backend
-        if backend in {"numpy_local", "legacy_local_renderer", "temporal_local_renderer"} or not backend:
-            if not model_path:
-                raise ValueError("Renderer checkpoint missing model_path")
-            return TrainableLocalPatchModel.load(model_path), "numpy_local"
-        raise ValueError(f"Unsupported renderer backend in checkpoint metadata: {backend}")
+        model, backend, _metadata = load_renderer_model_from_checkpoint(checkpoint_path)
+        return model, backend
 
     def _iter_batches(self, dataset: RendererDataset):
         has_temporal = bool(dataset.samples and isinstance(dataset.samples[0].get("temporal_transition_features"), list))

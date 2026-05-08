@@ -25,6 +25,9 @@ class BackendConfig:
     dynamics_backend: str = "learned_graph_delta"
     patch_backend: str = "trainable_local"
     temporal_backend: str = "trainable_temporal"
+    patch_checkpoint_path: str = ""
+    patch_strict_mode: bool = False
+    patch_strict_checkpoint: bool = True
 
 
 @dataclass(slots=True)
@@ -35,7 +38,7 @@ class BackendBundle:
     dynamics_backend: DynamicsTransitionModel
     patch_backend: PatchSynthesisModel
     temporal_backend: TemporalConsistencyModel
-    backend_names: dict[str, str]
+    backend_names: dict[str, object]
 
 
 class LearnedBackendFactory:
@@ -63,6 +66,10 @@ class LearnedBackendFactory:
                 "requested_dynamics_backend": self.config.dynamics_backend,
                 "requested_patch_backend": self.config.patch_backend,
                 "requested_temporal_backend": self.config.temporal_backend,
+                "patch_checkpoint_requested": bool(self.config.patch_checkpoint_path),
+                "patch_checkpoint_path": self.config.patch_checkpoint_path,
+                "patch_strict_checkpoint": self.config.patch_strict_checkpoint,
+                "patch_strict_mode": self.config.patch_strict_mode,
             },
         )
 
@@ -100,7 +107,13 @@ class LearnedBackendFactory:
 
     def _build_patch(self, name: str) -> PatchSynthesisModel:
         if name in {"trainable_local", "learned_primary"}:
-            return TrainablePatchSynthesisModel()
+            if self.config.patch_checkpoint_path:
+                return TrainablePatchSynthesisModel.from_checkpoint(
+                    self.config.patch_checkpoint_path,
+                    strict_mode=self.config.patch_strict_mode,
+                    strict_checkpoint=self.config.patch_strict_checkpoint,
+                )
+            return TrainablePatchSynthesisModel(strict_mode=self.config.patch_strict_mode)
         if name in {"legacy", "legacy_deterministic"}:
             return LegacyDeterministicPatchSynthesisModel()
         raise ValueError(f"Unknown patch backend: {name}")
