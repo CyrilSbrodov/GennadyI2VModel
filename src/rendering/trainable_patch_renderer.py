@@ -1430,6 +1430,13 @@ def output_from_prediction(
         "fallback_used": bool(diagnostics.get("fallback_used", False)),
         "fallback_reason": str(diagnostics.get("fallback_reason", "")),
         "fallback_message": str(diagnostics.get("fallback_message", "")),
+        "checkpoint_requested": bool(diagnostics.get("checkpoint_requested", False)),
+        "checkpoint_loaded": bool(diagnostics.get("checkpoint_loaded", False)),
+        "checkpoint_path": str(diagnostics.get("checkpoint_path", "")),
+        "checkpoint_backend": str(diagnostics.get("checkpoint_backend", "")),
+        "checkpoint_fallback_used": bool(diagnostics.get("checkpoint_fallback_used", False)),
+        "checkpoint_fallback_backend": str(diagnostics.get("checkpoint_fallback_backend", "")),
+        "checkpoint_load_error": str(diagnostics.get("checkpoint_load_error", "")),
         **memory_bundle_trace,
     }
     return PatchSynthesisOutput(

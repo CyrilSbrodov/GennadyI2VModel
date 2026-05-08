@@ -13,6 +13,7 @@ from rendering.trainable_patch_renderer import (
     summarize_request_contract,
     _extract_roi,
 )
+from rendering.renderer_checkpoint_loader import load_renderer_model_from_checkpoint
 from rendering.torch_local_patch_generator import TorchBackendUnavailableError, TorchLocalPatchGenerator
 
 
@@ -57,6 +58,13 @@ class TrainablePatchSynthesisModel(PatchSynthesisModel):
         self.fallback = fallback or LegacyDeterministicPatchSynthesisModel()
         self.strict_mode = strict_mode
         self._torch_unavailable_reason = ""
+        self._checkpoint_requested = False
+        self._checkpoint_loaded = False
+        self._checkpoint_path = ""
+        self._checkpoint_backend = ""
+        self._checkpoint_fallback_used = False
+        self._checkpoint_fallback_backend = ""
+        self._checkpoint_load_error = ""
         if model is not None:
             self.model = model
         elif backend == "numpy_local":
@@ -71,6 +79,53 @@ class TrainablePatchSynthesisModel(PatchSynthesisModel):
                 self.model = TrainableLocalPatchModel()
         else:
             raise ValueError(f"Unsupported backend: {backend}")
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint_path: str,
+        *,
+        fallback: LegacyDeterministicPatchSynthesisModel | None = None,
+        strict_mode: bool = False,
+        strict_checkpoint: bool = True,
+    ) -> "TrainablePatchSynthesisModel":
+        try:
+            loaded_model, backend, metadata = load_renderer_model_from_checkpoint(checkpoint_path)
+        except Exception as err:
+            message = f"Failed to load renderer patch checkpoint '{checkpoint_path}': {err}"
+            if strict_checkpoint:
+                raise RuntimeError(message) from err
+            inst = cls(fallback=fallback, strict_mode=strict_mode, backend="numpy_local")
+            inst._checkpoint_requested = True
+            inst._checkpoint_loaded = False
+            inst._checkpoint_path = checkpoint_path
+            inst._checkpoint_backend = ""
+            inst._checkpoint_fallback_used = True
+            inst._checkpoint_fallback_backend = "numpy_local"
+            inst._checkpoint_load_error = message
+            return inst
+
+        inst = cls(model=loaded_model, fallback=fallback, strict_mode=strict_mode, backend=backend)
+        inst._checkpoint_requested = True
+        inst._checkpoint_loaded = True
+        inst._checkpoint_path = checkpoint_path
+        inst._checkpoint_backend = backend
+        inst._checkpoint_fallback_used = False
+        inst._checkpoint_fallback_backend = ""
+        inst._checkpoint_load_error = ""
+        inst._checkpoint_metadata = dict(metadata)
+        return inst
+
+    def checkpoint_status(self) -> dict[str, object]:
+        return {
+            "checkpoint_requested": self._checkpoint_requested,
+            "checkpoint_loaded": self._checkpoint_loaded,
+            "checkpoint_path": self._checkpoint_path,
+            "checkpoint_backend": self._checkpoint_backend,
+            "checkpoint_fallback_used": self._checkpoint_fallback_used,
+            "checkpoint_fallback_backend": self._checkpoint_fallback_backend,
+            "checkpoint_load_error": self._checkpoint_load_error,
+        }
 
     def synthesize_patch(self, request: PatchSynthesisRequest) -> PatchSynthesisOutput:
         request_contract = summarize_request_contract(request)
@@ -90,6 +145,7 @@ class TrainablePatchSynthesisModel(PatchSynthesisModel):
                     "fallback_used": fallback_used,
                     "fallback_reason": "torch_unavailable" if fallback_used else "",
                     "fallback_message": self._torch_unavailable_reason if fallback_used else "",
+                    **self.checkpoint_status(),
                     "strict_mode": self.strict_mode,
                     "roi_shape": list(roi_before.shape),
                     "transition_mode": batch.transition_mode,
@@ -125,9 +181,13 @@ class TrainablePatchSynthesisModel(PatchSynthesisModel):
             fb.execution_trace.update(
                 {
                     "renderer_path": "legacy_fallback",
+                    "fallback_used": True,
                     "fallback_reason": type(err).__name__,
                     "fallback_message": str(err),
+                    **self.checkpoint_status(),
                     "strict_mode": self.strict_mode,
+                    "torch_backend_used": False,
+                    "model_family": "legacy_deterministic_patch_renderer",
                     "requested_transition_mode": request_contract["requested_transition_mode"],
                     "requested_profile_role": request_contract["requested_profile_role"],
                     "fallback_provenance": "legacy_deterministic_patch_renderer",
