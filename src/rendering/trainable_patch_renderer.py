@@ -1437,6 +1437,10 @@ def output_from_prediction(
         "checkpoint_fallback_used": bool(diagnostics.get("checkpoint_fallback_used", False)),
         "checkpoint_fallback_backend": str(diagnostics.get("checkpoint_fallback_backend", "")),
         "checkpoint_load_error": str(diagnostics.get("checkpoint_load_error", "")),
+        "checkpoint_contract_version": str(diagnostics.get("checkpoint_contract_version", "")),
+        "checkpoint_model_family": str(diagnostics.get("checkpoint_model_family", "")),
+        "checkpoint_runtime_loadable": bool(diagnostics.get("checkpoint_runtime_loadable", False)),
+        "checkpoint_global_cond_dim": int(diagnostics.get("checkpoint_global_cond_dim", 0) or 0),
         **memory_bundle_trace,
     }
     return PatchSynthesisOutput(

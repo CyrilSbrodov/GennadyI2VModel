@@ -28,7 +28,7 @@ from rendering.trainable_patch_renderer import (
 )
 from training.rollout_eval import evaluate_rollout_modes_on_video_manifest
 from rendering.target_provenance_policy import classify_target_training_role, target_quality_warning, target_supervision_summary
-from rendering.renderer_checkpoint_loader import load_renderer_model_from_checkpoint
+from rendering.renderer_checkpoint_loader import RENDERER_CHECKPOINT_CONTRACT_VERSION, load_renderer_model_from_checkpoint
 from rendering.torch_local_patch_generator import TorchBackendUnavailableError, TorchLocalPatchGenerator
 from training.datasets import RendererDataset
 from training.types import StageResult, TrainingConfig
@@ -379,7 +379,7 @@ class RendererTrainer:
             yield self.adapter.adapt(sample, temporal_mode=self.temporal_renderer_mode == "temporal_local_renderer")
 
     @staticmethod
-    def evaluate_model(model: TrainableLocalPatchModel | TemporalLocalPatchModel | TorchLocalPatchGenerator, batches: list[PatchBatch], diagnostics: dict[str, object] | None = None, *, renderer_backend: str = "numpy_local", fallback_used: bool = False) -> dict[str, float]:
+    def evaluate_model(model: TrainableLocalPatchModel | TemporalLocalPatchModel | TorchLocalPatchGenerator, batches: list[PatchBatch], diagnostics: dict[str, object] | None = None, *, renderer_backend: str = "numpy_local", fallback_used: bool = False) -> dict[str, object]:
         if not batches:
             return {"reconstruction_mae": 1.0, "alpha_mae": 1.0, "uncertainty_calibration_mae": 1.0, "contract_validity": 0.0, "fallback_free_happy_path_ratio": 0.0, "face_family_score": 0.0, "torso_family_score": 0.0, "sleeve_family_score": 0.0, "usable_sample_count": 0.0, "invalid_records": float((diagnostics or {}).get("invalid_records", 0)), "skipped_records": float((diagnostics or {}).get("skipped_records", 0)), "learned_contract_usage_ratio": 0.0, "weak_contract_usage_ratio": 1.0, "temporal_to_renderer_mode_consistency": 0.0, "temporal_to_renderer_target_profile_consistency": 0.0, "target_supervised_external_ratio": 0.0, "target_bootstrap_self_generated_ratio": 0.0, "target_weak_unknown_ratio": 0.0, "score": 0.0}
         eval_entries = [model.eval_step(b) for b in batches]
@@ -520,8 +520,8 @@ class RendererTrainer:
         stage_dir.mkdir(parents=True, exist_ok=True)
         history: list[dict[str, object]] = []
         lr = config.learning_rate
-        last_train: dict[str, float] = {}
-        last_val: dict[str, float] = {}
+        last_train: dict[str, object] = {}
+        last_val: dict[str, object] = {}
 
         train_batches = list(self._iter_batches(train_dataset))
         val_batches = list(self._iter_batches(val_dataset))
@@ -576,10 +576,21 @@ class RendererTrainer:
                 "learned_contract_usage_ratio": learned_ratio,
                 "weak_contract_usage_ratio": weak_ratio,
                 "progress": (epoch + 1) / max(1, config.epochs),
+                "checkpoint_contract_version": RENDERER_CHECKPOINT_CONTRACT_VERSION,
+                "runtime_loadable": 1.0,
+                "torch_backend_used": 1.0 if isinstance(self.model, TorchLocalPatchGenerator) else 0.0,
+                "target_role_policy_compatibility_fallback": 1.0 if bool(self.dataset_diagnostics.get("target_role_policy_compatibility_fallback", False)) else 0.0,
             }
             last_val = eval_metrics
             last_val["contract_conditioning_mode"] = self.contract_conditioning_mode
             last_val["renderer_target_role_policy"] = effective_target_role_policy
+            last_val["effective_target_role_policy"] = effective_target_role_policy
+            last_val["checkpoint_contract_version"] = RENDERER_CHECKPOINT_CONTRACT_VERSION
+            last_val["runtime_loadable"] = 1.0
+            last_val["target_role_policy_compatibility_fallback"] = 1.0 if bool(self.dataset_diagnostics.get("target_role_policy_compatibility_fallback", False)) else 0.0
+            last_val["supervised_external_ratio"] = float(supervised_external_count / train_batch_count)
+            last_val["bootstrap_self_generated_ratio"] = float(bootstrap_self_generated_count / train_batch_count)
+            last_val["weak_unknown_target_ratio"] = float(weak_unknown_target_count / train_batch_count)
             last_val["train_post_filter_sample_count"] = len(train_dataset)
             last_val["val_post_filter_sample_count"] = len(val_dataset)
             last_val["target_role_counts_after_filtering"] = self.dataset_diagnostics.get("val_target_role_counts_after_filtering", {})
@@ -609,18 +620,64 @@ class RendererTrainer:
             history.append({"epoch": epoch + 1, "train": last_train, "val": last_val})
             lr *= 0.94
 
-        model_path = stage_dir / "renderer_model.json"
+        torch_backend_used = isinstance(self.model, TorchLocalPatchGenerator)
+        model_path = stage_dir / ("renderer_model.pt" if torch_backend_used else "renderer_model.json")
         self.model.save(str(model_path))
         ckpt = stage_dir / "latest.json"
+        model_family = "local_conv_conditioned_patch_generator" if torch_backend_used else "numpy_linear_patch_generator"
+        runtime_backend = "torch_local" if torch_backend_used else "numpy_local"
+        requested_target_role_policy = str(self.dataset_diagnostics.get("requested_target_role_policy", config.renderer_target_role_policy) or "unknown")
+        effective_target_role_policy = str(self.dataset_diagnostics.get("effective_target_role_policy", requested_target_role_policy) or "unknown")
+        target_quality_counts = last_train.get("target_quality_counts", {}) if isinstance(last_train.get("target_quality_counts", {}), dict) else {}
+        target_training_role_counts = last_train.get("target_training_role_counts", {}) if isinstance(last_train.get("target_training_role_counts", {}), dict) else {}
+        metadata = {
+            "checkpoint_contract_version": RENDERER_CHECKPOINT_CONTRACT_VERSION,
+            "stage": "renderer",
+            "renderer_backend": self.renderer_backend or "unknown",
+            "model_family": model_family,
+            "torch_backend_used": bool(torch_backend_used),
+            "global_cond_dim": GLOBAL_COND_DIM,
+            "patch_batch_contract_version": "patch_batch_v1",
+            "runtime_loadable": True,
+            "runtime_backend": runtime_backend,
+            "model_path": str(model_path),
+            "created_by": "RendererTrainer",
+            "training_dataset_source": self.dataset_source or "unknown",
+            "renderer_target_role_policy": effective_target_role_policy,
+            "requested_target_role_policy": requested_target_role_policy,
+            "effective_target_role_policy": effective_target_role_policy,
+            "target_role_policy_compatibility_fallback": bool(self.dataset_diagnostics.get("target_role_policy_compatibility_fallback", False)),
+            "target_quality_counts": target_quality_counts,
+            "target_training_role_counts": target_training_role_counts,
+            "supervised_external_ratio": float(last_train.get("supervised_external_ratio", 0.0) or 0.0),
+            "bootstrap_self_generated_ratio": float(last_train.get("bootstrap_self_generated_ratio", 0.0) or 0.0),
+            "weak_unknown_target_ratio": float(last_train.get("weak_unknown_target_ratio", 0.0) or 0.0),
+            "contains_no_supervised_external_targets": bool(last_train.get("contains_no_supervised_external_targets", False)),
+            "contains_only_bootstrap_targets": bool(last_train.get("contains_only_bootstrap_targets", False)),
+            "avg_target_supervision_weight": float(last_train.get("avg_target_supervision_weight", 0.0) or 0.0),
+            "weighted_loss_available": bool(last_train.get("weighted_loss_available", 0.0)),
+            "final_train_loss": float(last_train.get("loss", 0.0) or 0.0),
+            "final_weighted_train_loss": float(last_train.get("weighted_loss", 0.0) or 0.0),
+            "final_val_score": float(last_val.get("score", 0.0) or 0.0),
+            "final_val_reconstruction_mae": float(last_val.get("reconstruction_mae", 0.0) or 0.0),
+            "memory_bundle_conditioning_present": float(last_val.get("memory_bundle_conditioning_present", 0.0) or 0.0),
+            "memory_support_level_strong_ratio": float(last_val.get("memory_support_level_strong_ratio", 0.0) or 0.0),
+            "fallback_used": bool(self.fallback_used),
+            "fallback_reason": self.fallback_reason,
+            "training_losses_last": last_train,
+        }
         ckpt.write_text(
             json.dumps(
                 {
+                    "checkpoint_contract_version": RENDERER_CHECKPOINT_CONTRACT_VERSION,
                     "stage": self.stage_name,
                     "config": asdict(config),
                     "history": history,
                     "final_train": last_train,
                     "final_val": last_val,
                     "model_path": str(model_path),
+                    "runtime_loadable": True,
+                    "model_family": model_family,
                     "eval": last_val,
                     "dataset_profile": {
                         "source": self.dataset_source,
@@ -636,16 +693,7 @@ class RendererTrainer:
                     "renderer_backend": self.renderer_backend,
                     "temporal_renderer_mode": self.temporal_renderer_mode,
                     "temporal_renderer_path_enabled": bool(self.temporal_renderer_mode == "temporal_local_renderer"),
-                    "renderer_model_metadata": {
-                        "renderer_backend": self.renderer_backend,
-                        "model_family": "local_conv_conditioned_patch_generator" if isinstance(self.model, TorchLocalPatchGenerator) else "numpy_linear_patch_generator",
-                        "global_cond_dim": GLOBAL_COND_DIM,
-                        "patch_batch_contract_version": "patch_batch_v1",
-                        "torch_backend_used": bool(isinstance(self.model, TorchLocalPatchGenerator)),
-                        "fallback_used": bool(self.fallback_used),
-                        "fallback_reason": self.fallback_reason,
-                        "training_losses_last": last_train,
-                    },
+                    "renderer_model_metadata": metadata,
                 },
                 indent=2,
             ),

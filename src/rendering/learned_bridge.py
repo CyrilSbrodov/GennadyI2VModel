@@ -65,6 +65,7 @@ class TrainablePatchSynthesisModel(PatchSynthesisModel):
         self._checkpoint_fallback_used = False
         self._checkpoint_fallback_backend = ""
         self._checkpoint_load_error = ""
+        self._checkpoint_metadata: dict[str, object] = {}
         if model is not None:
             self.model = model
         elif backend == "numpy_local":
@@ -117,6 +118,7 @@ class TrainablePatchSynthesisModel(PatchSynthesisModel):
         return inst
 
     def checkpoint_status(self) -> dict[str, object]:
+        metadata = self._checkpoint_metadata if isinstance(self._checkpoint_metadata, dict) else {}
         return {
             "checkpoint_requested": self._checkpoint_requested,
             "checkpoint_loaded": self._checkpoint_loaded,
@@ -125,6 +127,10 @@ class TrainablePatchSynthesisModel(PatchSynthesisModel):
             "checkpoint_fallback_used": self._checkpoint_fallback_used,
             "checkpoint_fallback_backend": self._checkpoint_fallback_backend,
             "checkpoint_load_error": self._checkpoint_load_error,
+            "checkpoint_contract_version": str(metadata.get("checkpoint_contract_version", "")) if self._checkpoint_loaded else "",
+            "checkpoint_model_family": str(metadata.get("model_family", "")) if self._checkpoint_loaded else "",
+            "checkpoint_runtime_loadable": bool(metadata.get("runtime_loadable", False)) if self._checkpoint_loaded else False,
+            "checkpoint_global_cond_dim": int(metadata.get("global_cond_dim", 0) or 0) if self._checkpoint_loaded else 0,
         }
 
     def synthesize_patch(self, request: PatchSynthesisRequest) -> PatchSynthesisOutput:
