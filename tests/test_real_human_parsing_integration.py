@@ -194,6 +194,8 @@ def test_real_human_parsing_config_auto_device_and_legacy_parser_config_do_not_i
     assert adapter.config.primary_human_parser.backend == "fashn"
     assert adapter.config.primary_human_parser.variant == "fashn-ai/fashn-human-parser"
     assert adapter.config.structural_body_parser.backend == "builtin"
+    assert adapter.config.garment_refinement_parser.backend == "builtin"
+    assert adapter.config.face_parser.backend == "builtin"
     assert "ultralytics" not in sys.modules
     assert "transformers" not in sys.modules
     assert "mediapipe" not in sys.modules
@@ -265,3 +267,118 @@ def test_fake_parser_duplicate_regions_preserved_in_parser_summary() -> None:
     assert fused.enriched.region_mask_refs["body:right_arm"]
     assert fused.body_parts[0].class_id in {12, 13}
     assert fused.garments[0].class_id == 4
+
+
+def test_reset_mask_store_per_analyze_drops_stale_refs_between_single_image_requests() -> None:
+    from perception.pipeline import PerceptionBackendsConfig
+
+    DEFAULT_MASK_STORE.clear()
+    stale = DEFAULT_MASK_STORE.put([[1]], 0.1, "test", "stale", mask_kind="body_part_mask")
+    pipe = PerceptionPipeline(
+        detector=_FakeDetector(),
+        pose=_FakePose(),
+        parser=_FakeParser(),
+        face=_NoneModule(),
+        objects=_NoneModule(),
+        tracker=_NoneModule(),
+        depth=_NoneModule(),
+        backends=PerceptionBackendsConfig(reset_mask_store_per_analyze=True),
+    )
+    first = pipe.analyze(_solid())
+    assert stale not in first.mask_store
+    stale2 = DEFAULT_MASK_STORE.put([[1]], 0.1, "test", "stale2", mask_kind="body_part_mask")
+    second = pipe.analyze(_solid())
+    assert stale2 not in second.mask_store
+    assert second.mask_store
+
+
+def test_analyze_video_resets_mask_store_once_for_video_not_per_frame() -> None:
+    from perception.pipeline import PerceptionBackendsConfig
+
+    DEFAULT_MASK_STORE.clear()
+    stale = DEFAULT_MASK_STORE.put([[1]], 0.1, "test", "stale_video", mask_kind="body_part_mask")
+    pipe = PerceptionPipeline(
+        detector=_FakeDetector(),
+        pose=_FakePose(),
+        parser=_FakeParser(),
+        face=_NoneModule(),
+        objects=_NoneModule(),
+        tracker=_NoneModule(),
+        depth=_NoneModule(),
+        backends=PerceptionBackendsConfig(reset_mask_store_per_analyze=True),
+    )
+    outputs = pipe.analyze_video([_solid(), _solid()], batch_size=1)
+    assert stale not in outputs[0].mask_store
+    assert len(outputs[1].mask_store) > len(outputs[0].mask_store)
+
+
+def test_debug_face_hair_refs_use_parser_summary_not_ref_name_and_background_exclusion() -> None:
+    import importlib.util
+    from pathlib import Path
+    from types import SimpleNamespace
+    from PIL import Image, ImageChops
+
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "debug_real_perception_layers.py"
+    spec = importlib.util.spec_from_file_location("debug_real_perception_layers", script_path)
+    assert spec and spec.loader
+    debug_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(debug_mod)
+
+    DEFAULT_MASK_STORE.clear()
+    semantic_ref = DEFAULT_MASK_STORE.put([[1, 0], [0, 0]], 0.9, "parser:fashn", "opaque_semantic_ref", mask_kind="face_region_mask")
+    bg_ref = DEFAULT_MASK_STORE.put([[1, 1], [1, 1]], 0.5, "parser:fashn", "opaque_background_ref", mask_kind="background_mask")
+    output = SimpleNamespace(
+        parser_summary={"region_mask_refs": {"face:face": [semantic_ref], "background:background": [bg_ref]}},
+        mask_store=DEFAULT_MASK_STORE.snapshot_metadata(),
+    )
+    refs = debug_mod._refs_from_parser_summary(output, {"face:face"}, fallback_kinds={"face_region_mask"})
+    assert refs == [semantic_ref]
+
+    img = Image.new("RGB", (8, 8), (10, 10, 10))
+    excluded = debug_mod._overlay(img, [bg_ref], exclude_kinds={"background_mask"})
+    background = debug_mod._overlay(img, [bg_ref], kinds={"background_mask"})
+    assert ImageChops.difference(img, excluded).getbbox() is None
+    assert ImageChops.difference(img, background).getbbox() is not None
+
+
+def test_mask_stats_projects_crop_local_bbox_to_frame_normalized_xyxy() -> None:
+    from perception.parser import _mask_stats
+
+    pixel_count, bbox = _mask_stats([[0, 1], [0, 1]], roi_bbox=(0.25, 0.25, 0.5, 0.5))
+    assert pixel_count == 2
+    assert bbox is not None
+    x1, y1, x2, y2 = bbox
+    assert abs(x1 - 0.5) < 1e-6
+    assert abs(x2 - 0.75) < 1e-6
+    assert abs(y1 - 0.25) < 1e-6
+    assert abs(y2 - 0.75) < 1e-6
+
+
+def test_common_arms_mask_reaches_left_and_right_arm_roi_from_parser_bbox() -> None:
+    DEFAULT_MASK_STORE.clear()
+    pipe = PerceptionPipeline(detector=_FakeDetector(), pose=_FakePose(), parser=_FakeParser(), face=_NoneModule(), objects=_NoneModule(), tracker=_NoneModule(), depth=_NoneModule())
+    output = pipe.analyze(_solid())
+    assert "arms" in output.persons[0].body_part_masks
+    graph = SceneGraphBuilder().build(output)
+    person = graph.persons[0]
+    left_arm = next(part for part in person.body_parts if part.part_type == "left_arm")
+    right_arm = next(part for part in person.body_parts if part.part_type == "right_arm")
+    assert left_arm.mask_ref == output.persons[0].body_part_masks["arms"]
+    assert right_arm.mask_ref == output.persons[0].body_part_masks["arms"]
+    rois = ROISelector().select(graph, GraphDelta(affected_entities=[person.person_id], affected_regions=["left_arm", "right_arm"]))
+    assert rois
+    assert all("roi_source=parser_mask_bbox" in roi.reason for roi in rois)
+
+
+def test_gennady_engine_accepts_real_perception_config_without_eager_real_backend_imports() -> None:
+    for name in ("ultralytics", "transformers", "mediapipe"):
+        sys.modules.pop(name, None)
+    from perception.pipeline import real_human_parsing_config
+    from runtime.orchestrator import GennadyEngine
+
+    cfg = real_human_parsing_config(device="cpu", strict_perception=False)
+    engine = GennadyEngine(perception_config=cfg, backend_bundle=types.SimpleNamespace())
+    assert engine.perception.strict_perception is False
+    assert "ultralytics" not in sys.modules
+    assert "transformers" not in sys.modules
+    assert "mediapipe" not in sys.modules

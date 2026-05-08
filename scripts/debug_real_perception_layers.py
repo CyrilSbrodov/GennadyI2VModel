@@ -141,6 +141,38 @@ def _draw_pose_predictions(base: Image.Image, predictions: dict[str, Any]) -> Im
     return out
 
 
+
+
+def _refs_from_parser_summary(output: Any, region_keys: set[str], *, fallback_kinds: set[str] | None = None) -> list[str]:
+    """Resolve semantic overlay refs from parser_summary, not fragile ref names."""
+    refs: list[str] = []
+    summary = getattr(output, "parser_summary", {})
+    refs_by_region = summary.get("region_mask_refs", {}) if isinstance(summary, dict) else {}
+    if isinstance(refs_by_region, dict):
+        for key in region_keys:
+            values = refs_by_region.get(key, [])
+            if isinstance(values, str):
+                values = [values]
+            if isinstance(values, list):
+                refs.extend(str(v) for v in values)
+    if not refs and fallback_kinds:
+        store = getattr(output, "mask_store", {})
+        if isinstance(store, dict):
+            for ref, meta in store.items():
+                if isinstance(meta, dict) and meta.get("mask_kind") in fallback_kinds:
+                    refs.append(str(ref))
+    return sorted(dict.fromkeys(refs))
+
+
+def _mask_counts_by_kind(refs: list[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for ref in refs:
+        item = DEFAULT_MASK_STORE.get(ref)
+        if item is None:
+            continue
+        counts[item.mask_kind] = counts.get(item.mask_kind, 0) + 1
+    return counts
+
 def _grid(base: Image.Image, mask_refs: list[str]) -> Image.Image:
     cells = []
     for ref in mask_refs:
@@ -163,12 +195,20 @@ def _grid(base: Image.Image, mask_refs: list[str]) -> Image.Image:
 
 
 def _summary_text(output, refs: list[str]) -> str:
+    module_fallbacks = getattr(output, "module_fallbacks", {})
+    parser_summary = getattr(output, "parser_summary", {})
     lines = [
         f"persons count: {len(output.persons)}",
         f"mask refs count: {len(refs)}",
-        f"module_fallbacks: {json.dumps(output.module_fallbacks, ensure_ascii=False)}",
+        f"detector mode/fallback: {module_fallbacks.get('detector', 'unknown')}",
+        f"pose mode/fallback: {module_fallbacks.get('pose', 'unknown')}",
+        f"parser mode/fallback: {module_fallbacks.get('parser', 'unknown')}",
+        f"parser canonical regions: {json.dumps(parser_summary.get('canonical_regions', []), ensure_ascii=False) if isinstance(parser_summary, dict) else '[]'}",
+        f"mask counts by kind: {json.dumps(_mask_counts_by_kind(refs), ensure_ascii=False)}",
         f"warnings: {json.dumps(output.warnings, ensure_ascii=False)}",
-        f"parser_summary: {json.dumps(output.parser_summary, ensure_ascii=False)}",
+        f"diagnostics: {json.dumps(output.diagnostics, ensure_ascii=False)}",
+        f"module_fallbacks: {json.dumps(module_fallbacks, ensure_ascii=False)}",
+        f"parser_summary: {json.dumps(parser_summary, ensure_ascii=False)}",
         "masks:",
     ]
     for ref in refs:
@@ -238,13 +278,18 @@ def main() -> None:
     refs = sorted(output.mask_store.keys())
     _overlay(img, refs, kinds={"person_mask"}).save(out_dir / "10_yolo_person_seg_overlay.jpg")
     _draw_pose(img, output.persons).save(out_dir / "20_yolo_pose_overlay.jpg")
-    _overlay(img, refs, exclude_kinds={"person_mask"}, background_alpha=24).save(out_dir / "30_parser_all_masks_overlay.jpg")
+    _overlay(img, refs, exclude_kinds={"person_mask", "background_mask"}).save(out_dir / "30_parser_all_masks_overlay.jpg")
     _grid(img, refs).save(out_dir / "31_parser_masks_grid.jpg")
     _overlay(img, refs, kinds={"body_part_mask"}).save(out_dir / "32_parser_body_parts_overlay.jpg")
     _overlay(img, refs, kinds={"garment_mask", "accessory_mask"}).save(out_dir / "33_parser_garments_overlay.jpg")
-    _overlay(img, [r for r in refs if any(tag in r.lower() for tag in ("face", "hair"))], kinds={"body_part_mask", "face_region_mask"}).save(out_dir / "34_parser_face_hair_overlay.jpg")
+    face_hair_refs = _refs_from_parser_summary(
+        output,
+        {"face:face", "face:hair", "body:face", "body:hair", "canonical:face", "canonical:hair"},
+        fallback_kinds={"face_region_mask"},
+    )
+    _overlay(img, face_hair_refs, kinds={"body_part_mask", "face_region_mask"}).save(out_dir / "34_parser_face_hair_overlay.jpg")
     _overlay(img, refs, kinds={"background_mask"}, background_alpha=90).save(out_dir / "35_parser_background_overlay.jpg")
-    _overlay(_draw_pose(img, output.persons), refs, background_alpha=18).save(out_dir / "40_fusion_preview.jpg")
+    _overlay(_draw_pose(img, output.persons), refs, exclude_kinds={"background_mask"}).save(out_dir / "40_fusion_preview.jpg")
     _overlay(img, refs, exclude_kinds={"background_mask"}).save(out_dir / "50_scene_graph_overlay.jpg")
 
     summary = {"perception": _jsonify(output), "mask_store": output.mask_store, "parser_summary": output.parser_summary, "diagnostics": output.diagnostics, "mediapipe": mediapipe_summary, "scene_graph": _jsonify(graph)}

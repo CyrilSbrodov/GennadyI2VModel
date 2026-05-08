@@ -34,6 +34,7 @@ class PerceptionBackendsConfig:
     yolo_pose_model: str = "yolo11n-pose.pt"
     perception_device: str = "auto"
     strict_perception: bool = False
+    reset_mask_store_per_analyze: bool = False
 
 
 @dataclass(slots=True)
@@ -136,6 +137,7 @@ class PerceptionPipeline:
         self._builtin_objects_fallback: ObjectDetector | None = None
         self._builtin_depth_fallback: MonoDepthEstimator | None = None
         self.strict_perception = cfg.strict_perception
+        self.reset_mask_store_per_analyze = cfg.reset_mask_store_per_analyze
 
     @staticmethod
     def _parser_stack_config(config: ParserStackConfig | BackendConfig) -> ParserStackConfig:
@@ -232,7 +234,10 @@ class PerceptionPipeline:
         backend = getattr(config, "backend", None)
         return "builtin" if backend in {"", "builtin"} else "native"
 
-    def analyze(self, frame: FrameLike) -> PerceptionOutput:
+    def analyze(self, frame: FrameLike, *, reset_mask_store: bool | None = None) -> PerceptionOutput:
+        should_reset = self.reset_mask_store_per_analyze if reset_mask_store is None else reset_mask_store
+        if should_reset:
+            DEFAULT_MASK_STORE.clear()
         frame_ctx = ensure_frame_context(frame)
         out = PerceptionOutput()
         warnings = out.warnings
@@ -418,10 +423,12 @@ class PerceptionPipeline:
         return out
 
     def analyze_video(self, frames: list[FrameLike], batch_size: int = 4) -> list[PerceptionOutput]:
+        if self.reset_mask_store_per_analyze:
+            DEFAULT_MASK_STORE.clear()
         outputs: list[PerceptionOutput] = []
         for start in range(0, len(frames), max(1, batch_size)):
             for frame in frames[start : start + max(1, batch_size)]:
-                outputs.append(self.analyze(frame))
+                outputs.append(self.analyze(frame, reset_mask_store=False))
         return outputs
 
 
@@ -435,6 +442,7 @@ class ParserOnlyPipeline:
         self._builtin_detector_fallback: Detector | None = None
         self._builtin_parser_fallback: HumanParser | None = None
         self.strict_perception = cfg.strict_perception
+        self.reset_mask_store_per_analyze = cfg.reset_mask_store_per_analyze
 
     @staticmethod
     def _parser_stack_config(config: ParserStackConfig | BackendConfig) -> ParserStackConfig:
@@ -490,7 +498,10 @@ class ParserOnlyPipeline:
             self._builtin_parser_fallback = SegFormerHumanParserAdapter(BackendConfig(backend="builtin"))
         return self._builtin_parser_fallback
 
-    def analyze(self, frame: FrameLike, profiler: StageTimer | None = None) -> PerceptionOutput:
+    def analyze(self, frame: FrameLike, profiler: StageTimer | None = None, *, reset_mask_store: bool | None = None) -> PerceptionOutput:
+        should_reset = self.reset_mask_store_per_analyze if reset_mask_store is None else reset_mask_store
+        if should_reset:
+            DEFAULT_MASK_STORE.clear()
         out = PerceptionOutput()
         timer = profiler or StageTimer(enabled=False)
         frame_ctx = ensure_frame_context(frame)
@@ -636,6 +647,7 @@ def real_human_parsing_config(
     yolo_seg_model: str = "yolo11n-seg.pt",
     yolo_pose_model: str = "yolo11n-pose.pt",
     strict_perception: bool = False,
+    reset_mask_store_per_analyze: bool = False,
 ) -> PerceptionBackendsConfig:
     runtime_device = _resolve_perception_device(device)
     return PerceptionBackendsConfig(
@@ -650,4 +662,5 @@ def real_human_parsing_config(
         yolo_pose_model=yolo_pose_model,
         perception_device=runtime_device,
         strict_perception=strict_perception,
+        reset_mask_store_per_analyze=reset_mask_store_per_analyze,
     )

@@ -15,6 +15,8 @@ class StoredMask:
     roi_bbox: tuple[float, float, float, float] | None = None
     frame_size: tuple[int, int] | None = None
     tags: list[str] = field(default_factory=list)
+    # For perception masks, extra["bbox_xyxy"] is normalized frame-space xyxy
+    # (x1, y1, x2, y2 in [0, 1]) and extra["pixel_count"] is payload-local.
     extra: dict[str, "object"] = field(default_factory=dict)
 
 

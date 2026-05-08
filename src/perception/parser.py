@@ -172,6 +172,12 @@ def _label_map_to_masks(label_map: "object", class_map: dict[int, str]) -> dict[
 
 
 def _mask_stats(mask: "object", roi_bbox: tuple[float, float, float, float] | None = None) -> tuple[int, tuple[float, float, float, float] | None]:
+    """Return pixel count and normalized frame-space xyxy bbox.
+
+    When ``roi_bbox`` is provided it is a normalized frame-space xywh crop.
+    The mask bbox is first computed in crop-local normalized xyxy and then
+    projected back into the original frame coordinate system.
+    """
     arr = _safe_array(mask)
     ys: list[int] = []
     xs: list[int] = []
@@ -822,7 +828,7 @@ class SegFormerHumanParserAdapter:
         facer_adapter: FacerFaceParserAdapter | None = None,
     ) -> None:
         if isinstance(config, BackendConfig):
-            self.config = ParserStackConfig.from_backend_config(config)
+            self.config = ParserStackConfig.from_legacy_backend_config(config)
         else:
             self.config = config or ParserStackConfig()
         self.fashn = fashn_adapter or FashnHumanParserAdapter(self.config.primary_human_parser)
