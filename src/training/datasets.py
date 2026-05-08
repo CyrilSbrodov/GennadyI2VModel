@@ -957,6 +957,31 @@ class RendererDataset(BaseStageDataset):
         diagnostics = copy.deepcopy(getattr(self, "diagnostics", {}))
         pre_count = len(self.samples)
         post_count = len(filtered_samples)
+        sq_present = 0
+        sq_warning_records = 0
+        sq_changed_sum = 0.0
+        sq_delta_sum = 0.0
+        sq_family_counts: dict[str, int] = {}
+        sq_warning_counts: dict[str, int] = {}
+        for sample in filtered_samples:
+            quality = sample.get("supervised_quality") if isinstance(sample.get("supervised_quality"), dict) else None
+            if quality is None:
+                contract = sample.get("renderer_batch_contract", {}) if isinstance(sample.get("renderer_batch_contract", {}), dict) else {}
+                quality = contract.get("supervised_quality") if isinstance(contract.get("supervised_quality"), dict) else None
+            if quality is None:
+                continue
+            sq_present += 1
+            sq_changed_sum += float(quality.get("changed_ratio", 0.0) or 0.0)
+            sq_delta_sum += float(quality.get("mean_abs_delta", 0.0) or 0.0)
+            family = str(quality.get("semantic_family", ""))
+            if family:
+                sq_family_counts[family] = sq_family_counts.get(family, 0) + 1
+            q_warnings = quality.get("warnings", []) if isinstance(quality.get("warnings", []), list) else []
+            if q_warnings:
+                sq_warning_records += 1
+            for warning in q_warnings:
+                warning_text = str(warning)
+                sq_warning_counts[warning_text] = sq_warning_counts.get(warning_text, 0) + 1
         diagnostics.update(
             {
                 "target_role_policy": policy,
@@ -965,6 +990,12 @@ class RendererDataset(BaseStageDataset):
                 "filtered_out_sample_count": pre_count - post_count,
                 "filtered_out_by_role": filtered_out_by_role,
                 "retained_by_role": retained_by_role,
+                "supervised_quality_present_count": sq_present,
+                "supervised_quality_warning_record_count": sq_warning_records,
+                "supervised_quality_avg_changed_ratio": round(sq_changed_sum / max(1, sq_present), 6),
+                "supervised_quality_avg_mean_abs_delta": round(sq_delta_sum / max(1, sq_present), 6),
+                "supervised_quality_semantic_family_counts": sq_family_counts,
+                "supervised_quality_warnings_count_by_type": sq_warning_counts,
             }
         )
         warnings = diagnostics.get("warnings")
@@ -1276,6 +1307,12 @@ class RendererDataset(BaseStageDataset):
             "supervised_record_count": 0,
             "bootstrap_record_count": 0,
             "weak_unknown_record_count": 0,
+            "supervised_quality_present_count": 0,
+            "supervised_quality_warning_record_count": 0,
+            "supervised_quality_avg_changed_ratio": 0.0,
+            "supervised_quality_avg_mean_abs_delta": 0.0,
+            "supervised_quality_semantic_family_counts": {},
+            "supervised_quality_warnings_count_by_type": {},
         }
         if manifest_type not in supported_manifest_types:
             diagnostics["unsupported_manifest_type"] = 1
@@ -1341,6 +1378,25 @@ class RendererDataset(BaseStageDataset):
                 quality_warning = target_quality_warning(training_target_quality)
                 diagnostics["target_training_role_counts"][target_training_role] = int(diagnostics["target_training_role_counts"].get(target_training_role, 0)) + 1
 
+                supervised_quality = rec.get("supervised_quality") if isinstance(rec.get("supervised_quality"), dict) else None
+                if supervised_quality is not None:
+                    sq_copy = copy.deepcopy(supervised_quality)
+                    diagnostics["supervised_quality_present_count"] = int(diagnostics.get("supervised_quality_present_count", 0)) + 1
+                    sq_warnings = sq_copy.get("warnings", []) if isinstance(sq_copy.get("warnings", []), list) else []
+                    if sq_warnings:
+                        diagnostics["supervised_quality_warning_record_count"] = int(diagnostics.get("supervised_quality_warning_record_count", 0)) + 1
+                    family_key = str(sq_copy.get("semantic_family", family))
+                    sq_family_counts = diagnostics.get("supervised_quality_semantic_family_counts", {})
+                    if isinstance(sq_family_counts, dict) and family_key:
+                        sq_family_counts[family_key] = int(sq_family_counts.get(family_key, 0)) + 1
+                    sq_warning_counts = diagnostics.get("supervised_quality_warnings_count_by_type", {})
+                    if isinstance(sq_warning_counts, dict):
+                        for warning in sq_warnings:
+                            warning_text = str(warning)
+                            sq_warning_counts[warning_text] = int(sq_warning_counts.get(warning_text, 0)) + 1
+                    diagnostics["_supervised_quality_changed_ratio_sum"] = float(diagnostics.get("_supervised_quality_changed_ratio_sum", 0.0)) + float(sq_copy.get("changed_ratio", 0.0) or 0.0)
+                    diagnostics["_supervised_quality_mean_abs_delta_sum"] = float(diagnostics.get("_supervised_quality_mean_abs_delta_sum", 0.0)) + float(sq_copy.get("mean_abs_delta", 0.0) or 0.0)
+
                 renderer_contract = {
                     "semantic_embed": rec.get("semantic_embed", cls._semantic_embed_from_family(family)),
                     "delta_cond": rec.get("delta_cond", rec.get("graph_delta_cond", [0.0] * 9)),
@@ -1356,6 +1412,8 @@ class RendererDataset(BaseStageDataset):
                     "training_target_quality": training_target_quality,
                     "target_training_role": target_training_role,
                 }
+                if supervised_quality is not None:
+                    renderer_contract["supervised_quality"] = sq_copy
                 if quality_warning is not None:
                     renderer_contract["target_quality_warning"] = quality_warning
                 renderer_memory_bundle = cls._normalize_renderer_memory_bundle(rec, diagnostics, idx)
@@ -1376,6 +1434,8 @@ class RendererDataset(BaseStageDataset):
                         "memory_records": rec.get("memory_records", []),
                         "patch_synthesis_contract": rec.get("patch_synthesis_contract", {}),
                     }
+                if supervised_quality is not None:
+                    sample["supervised_quality"] = sq_copy
                 if quality_warning is not None:
                     sample["target_quality_warning"] = quality_warning
                 samples.append(sample)
@@ -1404,6 +1464,11 @@ class RendererDataset(BaseStageDataset):
         diagnostics["contains_only_self_generated_targets"] = bool(loaded > 0 and self_generated_count == loaded)
         diagnostics["contains_only_bootstrap_targets"] = bool(loaded > 0 and bootstrap_count == loaded)
         diagnostics["contains_no_supervised_external_targets"] = bool(loaded > 0 and supervised_count == 0)
+        sq_present = int(diagnostics.get("supervised_quality_present_count", 0) or 0)
+        diagnostics["supervised_quality_avg_changed_ratio"] = round(float(diagnostics.get("_supervised_quality_changed_ratio_sum", 0.0) or 0.0) / max(1.0, float(sq_present)), 6)
+        diagnostics["supervised_quality_avg_mean_abs_delta"] = round(float(diagnostics.get("_supervised_quality_mean_abs_delta_sum", 0.0) or 0.0) / max(1.0, float(sq_present)), 6)
+        diagnostics.pop("_supervised_quality_changed_ratio_sum", None)
+        diagnostics.pop("_supervised_quality_mean_abs_delta_sum", None)
         warnings = diagnostics.get("warnings")
         if diagnostics["contains_no_supervised_external_targets"] and isinstance(warnings, list):
             warnings.append(

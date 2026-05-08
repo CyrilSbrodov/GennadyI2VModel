@@ -330,6 +330,16 @@ class RendererTrainer:
                 "validation_filtered": True,
             }
         )
+        for key in (
+            "supervised_quality_present_count",
+            "supervised_quality_warning_record_count",
+            "supervised_quality_avg_changed_ratio",
+            "supervised_quality_avg_mean_abs_delta",
+            "supervised_quality_semantic_family_counts",
+            "supervised_quality_warnings_count_by_type",
+        ):
+            if key in train_diag:
+                diagnostics[key] = train_diag.get(key)
         warnings = diagnostics.get("warnings")
         if not isinstance(warnings, list):
             warnings = []
@@ -337,6 +347,22 @@ class RendererTrainer:
             source_warnings = source.get("warnings", []) if isinstance(source, dict) else []
             if isinstance(source_warnings, list):
                 warnings.extend(source_warnings)
+        if requested_policy == "supervised_only" and int(diagnostics.get("supervised_quality_present_count", 0) or 0) > 0:
+            if float(diagnostics.get("supervised_quality_avg_changed_ratio", 0.0) or 0.0) < 0.005:
+                warnings.append(
+                    {
+                        "type": "low_motion_supervised_dataset",
+                        "message": "supervised renderer dataset has very low changed_ratio; training signal may be weak",
+                    }
+                )
+            family_counts = diagnostics.get("supervised_quality_semantic_family_counts", {})
+            if isinstance(family_counts, dict) and len([family for family, count in family_counts.items() if int(count or 0) > 0]) == 1:
+                warnings.append(
+                    {
+                        "type": "single_family_supervised_dataset",
+                        "message": "supervised renderer dataset covers only one semantic family",
+                    }
+                )
         diagnostics["warnings"] = warnings
         self.dataset_diagnostics = diagnostics
         return filtered_train, filtered_val
@@ -647,6 +673,12 @@ class RendererTrainer:
             "requested_target_role_policy": requested_target_role_policy,
             "effective_target_role_policy": effective_target_role_policy,
             "target_role_policy_compatibility_fallback": bool(self.dataset_diagnostics.get("target_role_policy_compatibility_fallback", False)),
+            "supervised_quality_present_count": int(self.dataset_diagnostics.get("supervised_quality_present_count", 0) or 0),
+            "supervised_quality_warning_record_count": int(self.dataset_diagnostics.get("supervised_quality_warning_record_count", 0) or 0),
+            "supervised_quality_avg_changed_ratio": float(self.dataset_diagnostics.get("supervised_quality_avg_changed_ratio", 0.0) or 0.0),
+            "supervised_quality_avg_mean_abs_delta": float(self.dataset_diagnostics.get("supervised_quality_avg_mean_abs_delta", 0.0) or 0.0),
+            "supervised_quality_semantic_family_counts": self.dataset_diagnostics.get("supervised_quality_semantic_family_counts", {}) if isinstance(self.dataset_diagnostics.get("supervised_quality_semantic_family_counts", {}), dict) else {},
+            "supervised_quality_warnings_count_by_type": self.dataset_diagnostics.get("supervised_quality_warnings_count_by_type", {}) if isinstance(self.dataset_diagnostics.get("supervised_quality_warnings_count_by_type", {}), dict) else {},
             "target_quality_counts": target_quality_counts,
             "target_training_role_counts": target_training_role_counts,
             "supervised_external_ratio": float(last_train.get("supervised_external_ratio", 0.0) or 0.0),
