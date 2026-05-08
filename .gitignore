@@ -4,3 +4,6 @@ out/
 validation/
 input/
 output/
+note.txt
+yolo11n-pose.pt
+yolo11n-seg.pt
