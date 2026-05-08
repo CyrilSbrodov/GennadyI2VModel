@@ -271,6 +271,75 @@ class RendererTrainer:
             return raw
         return "mixed_contract_bootstrap" if has_manifest else "weak_contract_only"
 
+
+    def _apply_target_role_policy(
+        self,
+        train_ds: RendererDataset,
+        val_ds: RendererDataset,
+        policy: str,
+    ) -> tuple[RendererDataset, RendererDataset]:
+        train_pre = len(train_ds)
+        val_pre = len(val_ds)
+        requested_policy = policy
+        effective_policy = policy
+        compatibility_fallback = False
+        compatibility_fallback_reason = ""
+        filtered_train = train_ds.filtered_by_target_role_policy(effective_policy)
+        filtered_val = val_ds.filtered_by_target_role_policy(effective_policy)
+        original_train_diag = getattr(train_ds, "diagnostics", {})
+        legacy_missing_provenance = bool(
+            isinstance(original_train_diag, dict)
+            and (
+                original_train_diag.get("contains_legacy_unknown_target_provenance") is True
+                or int(original_train_diag.get("missing_target_provenance_count", 0) or 0) > 0
+            )
+        )
+        if len(filtered_train) == 0 and requested_policy == "supervised_plus_bootstrap" and legacy_missing_provenance:
+            effective_policy = "all"
+            compatibility_fallback = True
+            compatibility_fallback_reason = "legacy_missing_target_provenance"
+            filtered_train = train_ds.filtered_by_target_role_policy(effective_policy)
+            filtered_val = val_ds.filtered_by_target_role_policy(effective_policy)
+        filtered_val.diagnostics = dict(getattr(filtered_val, "diagnostics", {}), validation_filtered=True)
+        if len(filtered_train) == 0:
+            raise ValueError(
+                f"renderer_target_role_policy={requested_policy!r} produced empty training dataset; "
+                "manifest may contain only bootstrap/unknown targets"
+            )
+        train_diag = getattr(filtered_train, "diagnostics", {})
+        val_diag = getattr(filtered_val, "diagnostics", {})
+        diagnostics = dict(getattr(self, "dataset_diagnostics", {}) or {})
+        diagnostics.update(
+            {
+                "renderer_target_role_policy": effective_policy,
+                "requested_target_role_policy": requested_policy,
+                "effective_target_role_policy": effective_policy,
+                "target_role_policy_compatibility_fallback": compatibility_fallback,
+                "compatibility_fallback_reason": compatibility_fallback_reason,
+                "train_pre_filter_count": train_pre,
+                "train_post_filter_count": len(filtered_train),
+                "val_pre_filter_count": val_pre,
+                "val_post_filter_count": len(filtered_val),
+                "train_filtered_out_by_role": train_diag.get("filtered_out_by_role", {}),
+                "val_filtered_out_by_role": val_diag.get("filtered_out_by_role", {}),
+                "train_retained_by_role": train_diag.get("retained_by_role", {}),
+                "val_retained_by_role": val_diag.get("retained_by_role", {}),
+                "train_target_role_counts_after_filtering": train_diag.get("retained_by_role", {}),
+                "val_target_role_counts_after_filtering": val_diag.get("retained_by_role", {}),
+                "validation_filtered": True,
+            }
+        )
+        warnings = diagnostics.get("warnings")
+        if not isinstance(warnings, list):
+            warnings = []
+        for source in (train_diag, val_diag):
+            source_warnings = source.get("warnings", []) if isinstance(source, dict) else []
+            if isinstance(source_warnings, list):
+                warnings.extend(source_warnings)
+        diagnostics["warnings"] = warnings
+        self.dataset_diagnostics = diagnostics
+        return filtered_train, filtered_val
+
     def build_datasets(self, config: TrainingConfig) -> tuple[RendererDataset, RendererDataset]:
         if config.learned_dataset_path:
             payload = json.loads(Path(config.learned_dataset_path).read_text(encoding="utf-8"))
@@ -284,17 +353,17 @@ class RendererTrainer:
                 val_ds.diagnostics = dict(getattr(manifest_ds, "diagnostics", {}), split="val")
                 self.dataset_source = "manifest_video_renderer_primary" if is_video_manifest else "manifest_paired_roi_primary"
                 self.dataset_diagnostics = getattr(manifest_ds, "diagnostics", {})
-                return train_ds, val_ds
+                return self._apply_target_role_policy(train_ds, val_ds, config.renderer_target_role_policy)
             if len(manifest_ds) == 1:
                 self.dataset_source = "manifest_video_renderer_primary_with_synthetic_val_fallback" if is_video_manifest else "manifest_paired_roi_primary_with_synthetic_val_fallback"
                 self.dataset_diagnostics = getattr(manifest_ds, "diagnostics", {})
-                return manifest_ds, RendererDataset.synthetic(max(1, config.val_size))
+                return self._apply_target_role_policy(manifest_ds, RendererDataset.synthetic(max(1, config.val_size)), config.renderer_target_role_policy)
             self.dataset_source = "synthetic_bootstrap_fallback_manifest_empty"
             self.dataset_diagnostics = getattr(manifest_ds, "diagnostics", {})
         else:
             self.dataset_source = "synthetic_bootstrap"
             self.dataset_diagnostics = {}
-        return RendererDataset.synthetic(config.train_size), RendererDataset.synthetic(config.val_size)
+        return self._apply_target_role_policy(RendererDataset.synthetic(config.train_size), RendererDataset.synthetic(config.val_size), config.renderer_target_role_policy)
 
     @staticmethod
     def load_model_from_checkpoint(checkpoint_path: str):
@@ -492,6 +561,7 @@ class RendererTrainer:
             train_batch_count = max(1, len(train_batches))
             weighted_loss_available = bool(train_losses and all("weighted_total_loss" in item for item in train_losses))
             supervision_weight_present = bool(train_batches and all("target_supervision_weight" in (b.conditioning_summary or {}) for b in train_batches))
+            effective_target_role_policy = str(self.dataset_diagnostics.get("effective_target_role_policy", config.renderer_target_role_policy))
             last_train = {
                 "loss": m(train_losses, "total_loss"),
                 "weighted_loss": m(train_losses, "weighted_total_loss") if weighted_loss_available else m(train_losses, "total_loss"),
@@ -500,6 +570,10 @@ class RendererTrainer:
                 "supervision_weight_present": 1.0 if supervision_weight_present else 0.0,
                 "target_quality_counts": target_quality_counts,
                 "target_training_role_counts": target_training_role_counts,
+                "renderer_target_role_policy": effective_target_role_policy,
+                "train_post_filter_sample_count": len(train_dataset),
+                "val_post_filter_sample_count": len(val_dataset),
+                "target_role_counts_after_filtering": target_training_role_counts,
                 "supervised_external_ratio": float(supervised_external_count / train_batch_count),
                 "bootstrap_self_generated_ratio": float(bootstrap_self_generated_count / train_batch_count),
                 "weak_unknown_target_ratio": float(weak_unknown_target_count / train_batch_count),
@@ -515,6 +589,10 @@ class RendererTrainer:
             }
             last_val = eval_metrics
             last_val["contract_conditioning_mode"] = self.contract_conditioning_mode
+            last_val["renderer_target_role_policy"] = effective_target_role_policy
+            last_val["train_post_filter_sample_count"] = len(train_dataset)
+            last_val["val_post_filter_sample_count"] = len(val_dataset)
+            last_val["target_role_counts_after_filtering"] = self.dataset_diagnostics.get("val_target_role_counts_after_filtering", {})
             if config.learned_dataset_path and self.dataset_source.startswith("manifest_video_renderer_primary"):
                 rollout = evaluate_rollout_modes_on_video_manifest(
                     dataset_manifest=config.learned_dataset_path,
