@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from learned.factory import BackendConfig
+from rendering.target_provenance_policy import ALLOWED_RENDERER_TARGET_ROLE_POLICIES
 
 
 @dataclass(slots=True)
@@ -36,9 +37,15 @@ class TrainingConfig:
     contract_conditioning_mode: str = "auto"
     renderer_backend: str = "numpy_local"
     renderer_temporal_mode: str = "auto"
+    renderer_target_role_policy: str = "supervised_plus_bootstrap"
 
     def __post_init__(self) -> None:
         allowed_backends = {"numpy_local", "torch_local", "legacy_local_renderer", "temporal_local_renderer"}
+        if self.renderer_target_role_policy not in ALLOWED_RENDERER_TARGET_ROLE_POLICIES:
+            raise ValueError(
+                f"Unsupported renderer_target_role_policy={self.renderer_target_role_policy!r}. "
+                f"Allowed: {sorted(ALLOWED_RENDERER_TARGET_ROLE_POLICIES)}"
+            )
         if self.renderer_backend not in allowed_backends:
             raise ValueError(f"Unsupported renderer_backend='{self.renderer_backend}'. Allowed: {sorted(allowed_backends)}")
 

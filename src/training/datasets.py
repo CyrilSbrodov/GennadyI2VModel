@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import numpy as np
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ from rendering.target_provenance_policy import (
     ALLOWED_TRAINING_TARGET_QUALITIES as POLICY_ALLOWED_TRAINING_TARGET_QUALITIES,
     classify_target_training_role,
     target_quality_warning,
+    target_role_allowed_by_policy,
 )
 
 
@@ -930,6 +932,62 @@ class RendererDataset(BaseStageDataset):
             "retrieval_reasons": [str(x) for x in reasons if isinstance(x, str)],
         }
 
+    @staticmethod
+    def _target_role_from_sample(sample: TrainingSample) -> str:
+        role = str(sample.get("target_training_role", "") or "").strip().lower()
+        if role not in {"supervised_external", "bootstrap_self_generated", "weak_unknown"}:
+            contract = sample.get("renderer_batch_contract", {}) if isinstance(sample.get("renderer_batch_contract", {}), dict) else {}
+            role = str(contract.get("target_training_role", "") or "").strip().lower()
+        return role if role in {"supervised_external", "bootstrap_self_generated", "weak_unknown"} else "weak_unknown"
+
+    def filtered_by_target_role_policy(self, policy: str) -> "RendererDataset":
+        """Return a non-mutating renderer dataset view filtered by explicit target-role policy."""
+        role_keys = ("supervised_external", "bootstrap_self_generated", "weak_unknown")
+        retained_by_role = {key: 0 for key in role_keys}
+        filtered_out_by_role = {key: 0 for key in role_keys}
+        filtered_samples: list[TrainingSample] = []
+        for sample in self.samples:
+            role = self._target_role_from_sample(sample)
+            if target_role_allowed_by_policy(role, policy):
+                filtered_samples.append(sample)
+                retained_by_role[role] += 1
+            else:
+                filtered_out_by_role[role] += 1
+
+        diagnostics = copy.deepcopy(getattr(self, "diagnostics", {}))
+        pre_count = len(self.samples)
+        post_count = len(filtered_samples)
+        diagnostics.update(
+            {
+                "target_role_policy": policy,
+                "pre_filter_sample_count": pre_count,
+                "post_filter_sample_count": post_count,
+                "filtered_out_sample_count": pre_count - post_count,
+                "filtered_out_by_role": filtered_out_by_role,
+                "retained_by_role": retained_by_role,
+            }
+        )
+        warnings = diagnostics.get("warnings")
+        if not isinstance(warnings, list):
+            warnings = []
+            diagnostics["warnings"] = warnings
+        if post_count == 0:
+            diagnostics["filter_warning"] = f"renderer_target_role_policy={policy!r} retained zero samples"
+            warnings.append({"type": "empty_after_target_role_policy", "message": diagnostics["filter_warning"]})
+        if policy in {"supervised_plus_bootstrap", "bootstrap_only", "all_non_unknown", "all"}:
+            warnings.append(
+                {
+                    "type": "bootstrap_self_generated_not_ground_truth",
+                    "message": "bootstrap_self_generated targets are not ground truth; weighted/bootstrapped training only",
+                }
+            )
+        if policy == "all":
+            warnings.append({"type": "weak_unknown_included", "message": "weak_unknown targets included by policy='all'"})
+
+        ds = RendererDataset(samples=filtered_samples)
+        ds.diagnostics = diagnostics
+        return ds
+
     @classmethod
     def from_video_transition_manifest(cls, manifest_path: str, strict: bool = False) -> "RendererDataset":
         payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
@@ -952,6 +1010,8 @@ class RendererDataset(BaseStageDataset):
             "fallback_free_ratio": 0.0,
             "temporal_window_records": 0,
             "temporal_window_usage_ratio": 0.0,
+            "missing_target_provenance_count": 0,
+            "contains_legacy_unknown_target_provenance": True,
         }
         fallback_free = 0
         for idx, rec in enumerate(records):
@@ -1013,6 +1073,10 @@ class RendererDataset(BaseStageDataset):
                             )
                         ),
                     }
+                    target_source = "unknown"
+                    training_target_quality = "unknown"
+                    target_training_role = "weak_unknown"
+                    quality_warning = "unknown_training_target_quality"
                     renderer_contract = {
                         "semantic_embed": rec.get("semantic_embed", cls._semantic_embed_from_family(family)),
                         "delta_cond": rec.get("delta_cond", [0.0] * 9),
@@ -1034,6 +1098,10 @@ class RendererDataset(BaseStageDataset):
                         "reveal_score": temporal_target["reveal_score"],
                         "occlusion_score": temporal_target["occlusion_score"],
                         "support_contact_score": temporal_target["support_contact_score"],
+                        "target_source": target_source,
+                        "training_target_quality": training_target_quality,
+                        "target_training_role": target_training_role,
+                        "target_quality_warning": quality_warning,
                     }
                     renderer_memory_bundle = cls._normalize_renderer_memory_bundle(rec, diagnostics, idx)
                     renderer_contract["region_memory_bundle_serialized"] = renderer_memory_bundle
@@ -1085,6 +1153,10 @@ class RendererDataset(BaseStageDataset):
                             },
                             "source": "manifest_video_renderer_primary",
                             "region_family": family,
+                            "target_source": target_source,
+                            "training_target_quality": training_target_quality,
+                            "target_training_role": target_training_role,
+                            "target_quality_warning": quality_warning,
                             "renderer_batch_contract": renderer_contract,
                             "delta_contract": rec.get("graph_delta_target", {}),
                             "temporal_transition_features": temporal_features,
@@ -1108,6 +1180,7 @@ class RendererDataset(BaseStageDataset):
                         }
                     )
                     diagnostics["loaded_records"] = int(diagnostics["loaded_records"]) + 1
+                    diagnostics["missing_target_provenance_count"] = int(diagnostics.get("missing_target_provenance_count", 0)) + 1
                     diagnostics["family_counts"][family] = int(diagnostics["family_counts"].get(family, 0)) + 1
                     diagnostics["region_coverage"][region_type] = int(diagnostics["region_coverage"].get(region_type, 0)) + 1
                     diagnostics["phase_coverage"][phase] = int(diagnostics["phase_coverage"].get(phase, 0)) + 1
@@ -1189,6 +1262,8 @@ class RendererDataset(BaseStageDataset):
             "target_quality_counts": {"self_generated_runtime_target": 0, "external_or_observed_target": 0, "unknown": 0},
             "target_source_counts": {"runtime_output_patch": 0, "provided_ground_truth_roi": 0, "unknown": 0},
             "target_training_role_counts": {"supervised_external": 0, "bootstrap_self_generated": 0, "weak_unknown": 0},
+            "missing_target_provenance_count": 0,
+            "contains_legacy_unknown_target_provenance": False,
             "supervised_external_ratio": 0.0,
             "bootstrap_self_generated_ratio": 0.0,
             "weak_unknown_target_ratio": 0.0,
@@ -1252,6 +1327,10 @@ class RendererDataset(BaseStageDataset):
                 alpha_target = cls._as_hw1_tensor(alpha_target, "alpha_target")
                 blend_hint = cls._as_hw1_tensor(blend_hint, "blend_hint")
 
+                missing_target_provenance = "target_source" not in rec and "training_target_quality" not in rec
+                if missing_target_provenance:
+                    diagnostics["missing_target_provenance_count"] = int(diagnostics.get("missing_target_provenance_count", 0)) + 1
+                    diagnostics["contains_legacy_unknown_target_provenance"] = True
                 target_source = cls._normalize_target_source(rec.get("target_source", "unknown"))
                 training_target_quality = cls._normalize_training_target_quality(rec.get("training_target_quality", "unknown"))
                 diagnostics["target_quality_counts"][training_target_quality] = int(diagnostics["target_quality_counts"].get(training_target_quality, 0)) + 1
@@ -1369,7 +1448,13 @@ class RendererDataset(BaseStageDataset):
                     "roi_pairs": [(before, after)],
                     "source": "synthetic",
                     "region_family": family,
+                    "target_source": "runtime_output_patch",
+                    "training_target_quality": "self_generated_runtime_target",
+                    "target_training_role": "bootstrap_self_generated",
                     "renderer_batch_contract": {
+                        "target_source": "runtime_output_patch",
+                        "training_target_quality": "self_generated_runtime_target",
+                        "target_training_role": "bootstrap_self_generated",
                         "semantic_embed": semantic,
                         "delta_cond": [0.2 + 0.1 * idx, 0.1, 0.2 if family != "face_expression" else 0.05, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
                         "planner_cond": [min(1.0, idx / max(1, size)), 0.0, 1.0, 0.0, 1.0 if family == "torso_reveal" else 0.0, 1.0 if family == "sleeve_arm_transition" else 0.0, 1.0 if family == "face_expression" else 0.0, 0.0],
@@ -1395,6 +1480,14 @@ class RendererDataset(BaseStageDataset):
                 "sleeve_arm_transition": sum(1 for s in samples if s["region_family"] == "sleeve_arm_transition"),
             },
             "invalid_examples": [],
+            "target_quality_counts": {"self_generated_runtime_target": size, "external_or_observed_target": 0, "unknown": 0},
+            "target_source_counts": {"runtime_output_patch": size, "provided_ground_truth_roi": 0, "unknown": 0},
+            "target_training_role_counts": {"supervised_external": 0, "bootstrap_self_generated": size, "weak_unknown": 0},
+            "supervised_external_ratio": 0.0,
+            "bootstrap_self_generated_ratio": 1.0 if size else 0.0,
+            "weak_unknown_target_ratio": 0.0,
+            "contains_no_supervised_external_targets": bool(size > 0),
+            "contains_only_bootstrap_targets": bool(size > 0),
         }
         return ds
 
