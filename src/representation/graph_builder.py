@@ -96,9 +96,37 @@ class SceneGraphBuilder:
                         alternatives=[
                             f"source_regions:{','.join(region.source_regions) or 'none'}",
                             f"ownership:{','.join(region.ownership_hints) or 'person'}",
+                            f"layer_hint:{g_name}",
                         ],
                     )
                 )
+
+            existing_garment_types = {g.garment_type for g in garments}
+            for raw_garment in p.garments:
+                raw_type = str(raw_garment.get("type", "")).lower().strip()
+                mask_ref = raw_garment.get("mask_ref")
+                if not raw_type or not mask_ref or raw_type in existing_garment_types:
+                    continue
+                garments.append(
+                    GarmentNode(
+                        garment_id=f"{person_id}_{raw_type}",
+                        garment_type=raw_type,
+                        mask_ref=str(mask_ref),
+                        garment_state=str(raw_garment.get("state", "worn")),
+                        coverage_targets=[f"{person_id}_{x}" for x in raw_garment.get("coverage_targets", [])] or [f"{person_id}_torso"],
+                        attachment_targets=[f"{person_id}_{x}" for x in raw_garment.get("attachment_targets", [])] or [f"{person_id}_torso"],
+                        confidence=self._calibrate_confidence(float(raw_garment.get("confidence", 0.0)), str(raw_garment.get("source", "unknown"))),
+                        visibility="visible" if float(raw_garment.get("confidence", 0.0)) >= 0.5 else "partially_visible",
+                        source=str(raw_garment.get("source", "unknown")),
+                        frame_index=frame_index,
+                        alternatives=[
+                            f"parser_class:{raw_garment.get('parser_class_name', raw_type)}",
+                            f"class_id:{raw_garment.get('class_id')}",
+                            f"layer_hint:{raw_garment.get('layer_hint', 'unknown')}",
+                        ],
+                    )
+                )
+                existing_garment_types.add(raw_type)
 
             canonical_payload = canonical_state_to_dict(canonical)
             persons.append(

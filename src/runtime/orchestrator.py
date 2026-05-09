@@ -20,7 +20,7 @@ from learned.parity import (
 )
 from memory.summaries import AppearanceMemorySummarizer
 from memory.video_memory import MemoryManager
-from perception.pipeline import PerceptionPipeline
+from perception.pipeline import PerceptionBackendsConfig, PerceptionPipeline
 from planning.transition_engine import StatePlan, TransitionPlanner
 from rendering.compositor import Compositor
 from rendering.roi_renderer import ROISelector, RenderedPatch
@@ -45,9 +45,9 @@ class InferenceArtifacts:
 
 
 class GennadyEngine:
-    def __init__(self, backend_config: BackendConfig | None = None, backend_bundle: BackendBundle | None = None) -> None:
+    def __init__(self, backend_config: BackendConfig | None = None, backend_bundle: BackendBundle | None = None, perception_config: PerceptionBackendsConfig | None = None) -> None:
         self.input_layer = InputAssetLayer()
-        self.perception = PerceptionPipeline()
+        self.perception = PerceptionPipeline(backends=perception_config)
         self.graph_builder = SceneGraphBuilder()
         self.memory_manager = MemoryManager()
         self.intent_parser = IntentParser()

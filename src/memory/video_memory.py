@@ -237,7 +237,8 @@ class MemoryManager:
                 region_id = make_region_id(person.person_id, part.part_type)
                 if part.visibility in ("visible", "partially_visible"):
                     visible_regions.add(region_id)
-                    memory.region_descriptors[region_id] = RegionDescriptor(region_id=region_id, entity_id=person.person_id, region_type=part.part_type, bbox=person.bbox, visibility=part.visibility, confidence=part.confidence, last_update_frame=scene_graph.frame_index)
+                    mask_roi = self.roi.resolve_region(scene_graph, person.person_id, part.part_type)
+                    memory.region_descriptors[region_id] = RegionDescriptor(region_id=region_id, entity_id=person.person_id, region_type=part.part_type, bbox=(mask_roi.bbox if mask_roi else person.bbox), visibility=part.visibility, confidence=part.confidence, last_update_frame=scene_graph.frame_index)
                 else:
                     self.apply_visibility_event(memory, {"region_id": region_id, "entity": person.person_id}, {}, visibility="hidden", transition_reason="graph_visibility_hidden")
             for garment in person.garments:
@@ -245,6 +246,10 @@ class MemoryManager:
                 gid = make_region_id(person.person_id, "garments")
                 if garment.visibility in ("visible", "partially_visible"):
                     visible_regions.add(gid)
+                    mask_roi = self.roi.resolve_region(scene_graph, person.person_id, garment.garment_type or "garments")
+                    if mask_roi is not None:
+                        specific_gid = make_region_id(person.person_id, garment.garment_type)
+                        memory.region_descriptors[specific_gid] = RegionDescriptor(region_id=specific_gid, entity_id=person.person_id, region_type=garment.garment_type, bbox=mask_roi.bbox, visibility=garment.visibility, confidence=garment.confidence, last_update_frame=scene_graph.frame_index)
                 else:
                     self.apply_visibility_event(memory, {"region_id": gid, "entity": person.person_id}, {}, visibility="hidden", transition_reason="garment_hidden")
 
@@ -1360,13 +1365,13 @@ class MemoryManager:
         self._upsert_canonical_memory(memory, candidate)
 
     def _semantic_region_types(self, person: object) -> list[str]:
-        region_types = {"face", "torso", "garments", "sleeves", "pelvis", "legs"}
+        region_types = {"face", "hair", "torso", "garments", "sleeves", "pelvis", "legs"}
         body_parts = getattr(person, "body_parts", [])
         garments = getattr(person, "garments", [])
         for part in body_parts:
-            if part.part_type in {"left_upper_arm", "left_lower_arm", "left_hand"}:
+            if part.part_type in {"left_arm", "left_upper_arm", "left_lower_arm", "left_hand", "arms"}:
                 region_types.add("left_arm")
-            if part.part_type in {"right_upper_arm", "right_lower_arm", "right_hand"}:
+            if part.part_type in {"right_arm", "right_upper_arm", "right_lower_arm", "right_hand", "arms"}:
                 region_types.add("right_arm")
         if garments:
             region_types.add("garments")

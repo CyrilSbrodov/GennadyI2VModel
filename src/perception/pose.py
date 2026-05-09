@@ -73,7 +73,7 @@ class YoloPoseAdapter:
     source_name = "pose:yolo"
 
     def __init__(self, config: BackendConfig | None = None) -> None:
-        self.config = config or BackendConfig(backend="ultralytics", checkpoint="yolov8n-pose.pt")
+        self.config = config or BackendConfig(backend="ultralytics", checkpoint="yolo11n-pose.pt")
         self._model = None
 
     def is_builtin_backend(self) -> bool:
@@ -86,7 +86,7 @@ class YoloPoseAdapter:
             from ultralytics import YOLO  # type: ignore
         except Exception as exc:  # pragma: no cover
             raise RuntimeError("ultralytics is not installed") from exc
-        self._model = YOLO(self.config.checkpoint or "yolov8n-pose.pt")
+        self._model = YOLO(self.config.checkpoint or "yolo11n-pose.pt")
         return self._model
 
     def _to_prediction(self, person: PersonDetection, xs: list[float], ys: list[float], vs: list[float]) -> PosePrediction:
@@ -109,7 +109,7 @@ class YoloPoseAdapter:
         return PosePrediction(
             pose=PoseState(keypoints=kps, coarse_pose="unknown", angles={}),
             confidence=avg_conf,
-            source=f"{self.source_name}:ultralytics",
+            source=f"{self.source_name}:yolo_pose",
             landmarks_2d=[(k.x, k.y) for k in kps],
             hand_landmarks=hand_landmarks,
             face_landmarks=face_landmarks,
@@ -211,6 +211,10 @@ class YoloPoseAdapter:
         return predictions
 
 
+class YoloPoseBackend(YoloPoseAdapter):
+    source_name = "yolo_pose"
+
+
 class MediaPipePoseAdapter:
     source_name = "pose:mediapipe"
 
@@ -274,3 +278,7 @@ class MediaPipePoseAdapter:
                 face_landmarks=face_landmarks,
             )
         return result
+
+
+class OptionalMediaPipePoseBackend(MediaPipePoseAdapter):
+    source_name = "mediapipe_pose"

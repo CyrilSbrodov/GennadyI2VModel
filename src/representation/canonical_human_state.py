@@ -151,32 +151,28 @@ class CanonicalHumanNormalizer:
 
         for part in person.body_parts:
             raw = str(part.get("part_type", "")).lower().strip()
-            canonical = BODY_PART_MAP.get(raw, raw if raw in regions else "")
-            if not canonical:
-                continue
-            self._merge_region(
-                region=regions[canonical],
-                raw_name=raw,
-                source=str(part.get("source", "unknown")),
-                mask_ref=part.get("mask_ref"),
-                confidence=float(part.get("confidence", 0.0)),
-                visibility_hint=str(part.get("visibility", "")),
-                coverage_hints=person.coverage_hints.get(raw, []),
-            )
+            for canonical in self._canonical_targets(raw, regions):
+                self._merge_region(
+                    region=regions[canonical],
+                    raw_name=raw,
+                    source=str(part.get("source", "unknown")),
+                    mask_ref=part.get("mask_ref"),
+                    confidence=float(part.get("confidence", 0.0)),
+                    visibility_hint=str(part.get("visibility", "")),
+                    coverage_hints=person.coverage_hints.get(raw, []),
+                )
 
         for raw_name, mask_ref in person.body_part_masks.items():
-            canonical = BODY_PART_MAP.get(raw_name, raw_name if raw_name in regions else "")
-            if not canonical:
-                continue
-            self._merge_region(
-                region=regions[canonical],
-                raw_name=raw_name,
-                source=person.provenance_by_region.get(f"body:{raw_name}", person.mask_source),
-                mask_ref=mask_ref,
-                confidence=person.mask_confidence,
-                visibility_hint=person.visibility_hints.get(raw_name, ""),
-                coverage_hints=person.coverage_hints.get(raw_name, []),
-            )
+            for canonical in self._canonical_targets(raw_name, regions):
+                self._merge_region(
+                    region=regions[canonical],
+                    raw_name=raw_name,
+                    source=person.provenance_by_region.get(f"body:{raw_name}", person.mask_source),
+                    mask_ref=mask_ref,
+                    confidence=person.mask_confidence,
+                    visibility_hint=person.visibility_hints.get(raw_name, ""),
+                    coverage_hints=person.coverage_hints.get(raw_name, []),
+                )
 
         for region in person.face_regions:
             raw = str(region.get("region_type", "")).lower().strip()
@@ -256,6 +252,18 @@ class CanonicalHumanNormalizer:
 
         self._finalize_composites(regions)
         return CanonicalPersonState(person_id=person_id, regions=regions)
+
+    @staticmethod
+    def _canonical_targets(raw_name: str, regions: dict[str, CanonicalRegion]) -> list[str]:
+        raw = raw_name.lower().strip()
+        if raw == "arms":
+            return ["left_arm", "right_arm"]
+        if raw == "hands":
+            return ["left_hand", "right_hand"]
+        if raw == "legs":
+            return ["left_leg", "right_leg"]
+        canonical = BODY_PART_MAP.get(raw, raw if raw in regions else "")
+        return [canonical] if canonical else []
 
     @staticmethod
     def _seed_composites(regions: dict[str, CanonicalRegion]) -> None:

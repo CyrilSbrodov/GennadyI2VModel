@@ -79,7 +79,7 @@ class YoloPersonDetectorAdapter:
             from ultralytics import YOLO  # type: ignore
         except Exception as exc:  # pragma: no cover
             raise RuntimeError("ultralytics is not installed") from exc
-        model_name = self.config.checkpoint or "yolov8n-seg.pt"
+        model_name = self.config.checkpoint or "yolo11n-seg.pt"
         self._model = YOLO(model_name)
         return self._model
 
@@ -98,20 +98,31 @@ class YoloPersonDetectorAdapter:
             mask_np = np.squeeze(mask_np)
         if mask_np.ndim != 2:
             return None, 0.0
+        if mask_np.shape != (frame_size[1], frame_size[0]):
+            try:
+                from PIL import Image
+
+                mask_np = np.asarray(Image.fromarray(mask_np.astype(np.float32)).resize(frame_size, resample=Image.Resampling.NEAREST))
+            except Exception:
+                pass
         bin_mask = (mask_np > 0.5).astype(np.uint8, copy=False)
-        if int(bin_mask.sum()) <= 0:
+        pixel_count = int(bin_mask.sum())
+        if pixel_count <= 0:
             return None, 0.0
+        ys, xs = np.where(bin_mask > 0)
+        bbox_xyxy = (float(xs.min()) / max(1, frame_size[0]), float(ys.min()) / max(1, frame_size[1]), float(xs.max() + 1) / max(1, frame_size[0]), float(ys.max() + 1) / max(1, frame_size[1]))
         mask_conf = max(0.0, min(1.0, float(conf)))
         ref = DEFAULT_MASK_STORE.put(
             bin_mask.tolist(),
             confidence=mask_conf,
             source=source,
-            prefix="detector_person",
+            prefix=f"yolo_person_{detection_id.replace('::', '_')}",
             mask_kind="person_mask",
             backend="ultralytics",
             roi_bbox=(bbox.x, bbox.y, bbox.w, bbox.h),
             frame_size=frame_size,
             tags=[f"person:{detection_id}", "detector:instance-seg"],
+            extra={"pixel_count": pixel_count, "bbox_xyxy": bbox_xyxy, "model_name": "yolo11n-seg.pt"},
         )
         return ref, mask_conf
 
@@ -148,7 +159,7 @@ class YoloPersonDetectorAdapter:
                         masks_data[i],
                         detection_id=det_key,
                         conf=conf,
-                        source=f"{self.source_name}:ultralytics-seg",
+                        source="yolo_person_seg",
                         bbox=bbox,
                         frame_size=(image.width, image.height),
                     )
@@ -157,10 +168,10 @@ class YoloPersonDetectorAdapter:
                         detection_id=det_key,
                         bbox=bbox,
                         confidence=conf,
-                        source=f"{self.source_name}:ultralytics",
+                        source="yolo_person_seg",
                         mask_ref=mask_ref,
                         mask_confidence=mask_conf,
-                        mask_source=f"{self.source_name}:ultralytics-seg" if mask_ref else "",
+                        mask_source="yolo_person_seg" if mask_ref else "",
                     )
                 )
                 det_id += 1
@@ -190,3 +201,7 @@ class YoloPersonDetectorAdapter:
             frame_size=(1024, 1024),
             latency_ms=3.0,
         )
+
+
+class YoloPersonSegmentationBackend(YoloPersonDetectorAdapter):
+    source_name = "yolo_person_seg"

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+import importlib.util
 from typing import Any, Callable, TypeVar
 
 from core.input_layer import AssetFrame
 from core.schema import BBox, ExpressionState, OrientationState, PoseState
 from perception.detector import BackendConfig, Detector, DetectorOutput, YoloPersonDetectorAdapter
 from perception.frame_context import FrameLike, ensure_frame_context, unwrap_frame
+from perception.mask_store import DEFAULT_MASK_STORE
 from perception.face import EmoNetFaceAnalyzerAdapter, FaceAnalyzer, FacePrediction
 from perception.objects import MonoDepthEstimator, ObjectDetector, ObjectPrediction, YoloObjectDetectorAdapter
 from perception.parser import HumanParser, ParserStackConfig, ParsingPrediction, SegFormerHumanParserAdapter
@@ -26,6 +28,13 @@ class PerceptionBackendsConfig:
     parser: ParserStackConfig | BackendConfig = field(default_factory=ParserStackConfig)
     objects: BackendConfig = field(default_factory=lambda: BackendConfig(backend="builtin", checkpoint="yolov8n.pt"))
     face: BackendConfig = field(default_factory=lambda: BackendConfig(backend="builtin", checkpoint=""))
+    perception_backend: str = "auto"
+    parser_model: str = "fashn-ai/fashn-human-parser"
+    yolo_seg_model: str = "yolo11n-seg.pt"
+    yolo_pose_model: str = "yolo11n-pose.pt"
+    perception_device: str = "auto"
+    strict_perception: bool = False
+    reset_mask_store_per_analyze: bool = False
 
 
 @dataclass(slots=True)
@@ -59,9 +68,12 @@ class PersonFacts:
     body_part_masks: dict[str, str] = field(default_factory=dict)
     face_region_masks: dict[str, str] = field(default_factory=dict)
     accessory_masks: dict[str, str] = field(default_factory=dict)
+    background_masks: dict[str, str] = field(default_factory=dict)
     coverage_hints: dict[str, list[str]] = field(default_factory=dict)
     visibility_hints: dict[str, str] = field(default_factory=dict)
     provenance_by_region: dict[str, str] = field(default_factory=dict)
+    parser_class_names: dict[str, str] = field(default_factory=dict)
+    region_mask_refs: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -82,6 +94,9 @@ class PerceptionOutput:
     module_confidence: dict[str, float] = field(default_factory=dict)
     module_latency_ms: dict[str, float] = field(default_factory=dict)
     module_fallbacks: dict[str, str] = field(default_factory=dict)
+    mask_store: dict[str, dict[str, object]] = field(default_factory=dict)
+    parser_summary: dict[str, object] = field(default_factory=dict)
+    diagnostics: list[dict[str, object]] = field(default_factory=list)
     depth_score: float | None = None
     input_mode: str = "unknown"
 
@@ -110,7 +125,7 @@ class PerceptionPipeline:
             self.pose = MediaPipePoseAdapter(cfg.pose)
         else:
             self.pose = VitPoseAdapter(cfg.pose)
-        self.parser = parser or SegFormerHumanParserAdapter(cfg.parser)
+        self.parser = parser or SegFormerHumanParserAdapter(self._parser_stack_config(cfg.parser))
         self.face = face or EmoNetFaceAnalyzerAdapter(cfg.face)
         self.objects = objects or YoloObjectDetectorAdapter(cfg.objects)
         self.tracker = tracker or ByteTrackAdapter()
@@ -122,6 +137,14 @@ class PerceptionPipeline:
         self._builtin_tracker_fallback: PersonTracker | None = None
         self._builtin_objects_fallback: ObjectDetector | None = None
         self._builtin_depth_fallback: MonoDepthEstimator | None = None
+        self.strict_perception = cfg.strict_perception
+        self.reset_mask_store_per_analyze = cfg.reset_mask_store_per_analyze
+
+    @staticmethod
+    def _parser_stack_config(config: ParserStackConfig | BackendConfig) -> ParserStackConfig:
+        if isinstance(config, BackendConfig):
+            return ParserStackConfig.from_legacy_backend_config(config)
+        return config
 
     def _safe_module_call(
         self,
@@ -141,6 +164,9 @@ class PerceptionPipeline:
             return value
         except Exception as exc:
             warnings.append(f"{module_name}_unavailable:{exc}")
+            out.diagnostics.append({"module": module_name, "level": "error", "message": str(exc)})
+            if self.strict_perception:
+                raise RuntimeError(f"strict perception backend failed for {module_name}: {exc}") from exc
             if fallback_fn is None:
                 warnings.append(f"{module_name}_no_fallback")
                 out.module_fallbacks[module_name] = "error:no-fallback"
@@ -209,7 +235,10 @@ class PerceptionPipeline:
         backend = getattr(config, "backend", None)
         return "builtin" if backend in {"", "builtin"} else "native"
 
-    def analyze(self, frame: FrameLike) -> PerceptionOutput:
+    def analyze(self, frame: FrameLike, *, reset_mask_store: bool | None = None) -> PerceptionOutput:
+        should_reset = self.reset_mask_store_per_analyze if reset_mask_store is None else reset_mask_store
+        if should_reset:
+            DEFAULT_MASK_STORE.clear()
         frame_ctx = ensure_frame_context(frame)
         out = PerceptionOutput()
         warnings = out.warnings
@@ -300,15 +329,19 @@ class PerceptionPipeline:
                         "coverage_targets": g.coverage_targets,
                         "attachment_targets": g.attachment_targets,
                         "layer_hint": g.layer_hint,
+                        "bbox_xyxy": g.bbox_xyxy,
+                        "pixel_count": g.pixel_count,
+                        "parser_class_name": g.parser_class_name,
+                        "class_id": g.class_id,
                     }
                     for g in parsed.garments
                 ]
                 body_parts = [
-                    {"part_type": b.part_type, "mask_ref": b.mask_ref, "confidence": b.confidence, "visibility": b.visibility, "source": b.source}
+                    {"part_type": b.part_type, "mask_ref": b.mask_ref, "confidence": b.confidence, "visibility": b.visibility, "source": b.source, "bbox_xyxy": b.bbox_xyxy, "pixel_count": b.pixel_count, "parser_class_name": b.parser_class_name, "class_id": b.class_id}
                     for b in parsed.body_parts
                 ]
                 face_regions = [
-                    {"region_type": r.region_type, "mask_ref": r.mask_ref, "confidence": r.confidence, "source": r.source}
+                    {"region_type": r.region_type, "mask_ref": r.mask_ref, "confidence": r.confidence, "source": r.source, "bbox_xyxy": r.bbox_xyxy, "pixel_count": r.pixel_count, "parser_class_name": r.parser_class_name, "class_id": r.class_id}
                     for r in parsed.face_regions
                 ]
 
@@ -344,9 +377,12 @@ class PerceptionPipeline:
                     body_part_masks=(parsed.enriched.body_part_masks if parsed else {}),
                     face_region_masks=(parsed.enriched.face_region_masks if parsed else {}),
                     accessory_masks=(parsed.enriched.accessory_masks if parsed else {}),
+                    background_masks=(parsed.enriched.background_masks if parsed else {}),
                     coverage_hints=(parsed.enriched.coverage_hints if parsed else {}),
                     visibility_hints=(parsed.enriched.visibility_hints if parsed else {}),
                     provenance_by_region=(parsed.enriched.provenance_by_region if parsed else {}),
+                    parser_class_names=(parsed.enriched.parser_class_names if parsed else {}),
+                    region_mask_refs=(parsed.enriched.region_mask_refs if parsed else {}),
                 )
             )
 
@@ -364,6 +400,20 @@ class PerceptionPipeline:
             out.input_mode = "frame_tensor"
         out.module_fallbacks["input_mode"] = out.input_mode
 
+        out.mask_store = DEFAULT_MASK_STORE.snapshot_metadata()
+        refs_by_canonical: dict[str, list[str]] = {}
+        parser_classes: dict[str, str] = {}
+        for person in out.persons:
+            parser_classes.update(person.parser_class_names)
+            for key, refs in person.region_mask_refs.items():
+                refs_by_canonical.setdefault(key, []).extend(refs)
+        out.parser_summary = {
+            "persons": len(out.persons),
+            "parser_classes": parser_classes,
+            "canonical_regions": sorted(refs_by_canonical.keys()),
+            "region_mask_refs": refs_by_canonical,
+            "mask_refs": sorted(out.mask_store.keys()),
+        }
         out.module_confidence = {
             "detector": max([p.bbox_confidence for p in out.persons], default=0.0),
             "pose": max([p.pose_confidence for p in out.persons], default=0.0),
@@ -375,10 +425,12 @@ class PerceptionPipeline:
         return out
 
     def analyze_video(self, frames: list[FrameLike], batch_size: int = 4) -> list[PerceptionOutput]:
+        if self.reset_mask_store_per_analyze:
+            DEFAULT_MASK_STORE.clear()
         outputs: list[PerceptionOutput] = []
         for start in range(0, len(frames), max(1, batch_size)):
             for frame in frames[start : start + max(1, batch_size)]:
-                outputs.append(self.analyze(frame))
+                outputs.append(self.analyze(frame, reset_mask_store=False))
         return outputs
 
 
@@ -388,9 +440,17 @@ class ParserOnlyPipeline:
     def __init__(self, detector: Detector | None = None, parser: HumanParser | None = None, backends: PerceptionBackendsConfig | None = None) -> None:
         cfg = backends or PerceptionBackendsConfig()
         self.detector = detector or YoloPersonDetectorAdapter(cfg.detector)
-        self.parser = parser or SegFormerHumanParserAdapter(cfg.parser)
+        self.parser = parser or SegFormerHumanParserAdapter(PerceptionPipeline._parser_stack_config(cfg.parser))
         self._builtin_detector_fallback: Detector | None = None
         self._builtin_parser_fallback: HumanParser | None = None
+        self.strict_perception = cfg.strict_perception
+        self.reset_mask_store_per_analyze = cfg.reset_mask_store_per_analyze
+
+    @staticmethod
+    def _parser_stack_config(config: ParserStackConfig | BackendConfig) -> ParserStackConfig:
+        if isinstance(config, BackendConfig):
+            return ParserStackConfig.from_legacy_backend_config(config)
+        return config
 
     def _safe_module_call(
         self,
@@ -410,6 +470,9 @@ class ParserOnlyPipeline:
             return value
         except Exception as exc:
             warnings.append(f"{module_name}_unavailable:{exc}")
+            out.diagnostics.append({"module": module_name, "level": "error", "message": str(exc)})
+            if self.strict_perception:
+                raise RuntimeError(f"strict perception backend failed for {module_name}: {exc}") from exc
             if fallback_fn is None:
                 warnings.append(f"{module_name}_no_fallback")
                 out.module_fallbacks[module_name] = "error:no-fallback"
@@ -437,7 +500,10 @@ class ParserOnlyPipeline:
             self._builtin_parser_fallback = SegFormerHumanParserAdapter(BackendConfig(backend="builtin"))
         return self._builtin_parser_fallback
 
-    def analyze(self, frame: FrameLike, profiler: StageTimer | None = None) -> PerceptionOutput:
+    def analyze(self, frame: FrameLike, profiler: StageTimer | None = None, *, reset_mask_store: bool | None = None) -> PerceptionOutput:
+        should_reset = self.reset_mask_store_per_analyze if reset_mask_store is None else reset_mask_store
+        if should_reset:
+            DEFAULT_MASK_STORE.clear()
         out = PerceptionOutput()
         timer = profiler or StageTimer(enabled=False)
         frame_ctx = ensure_frame_context(frame)
@@ -502,9 +568,12 @@ class ParserOnlyPipeline:
                     body_part_masks=(parsed.enriched.body_part_masks if parsed else {}),
                     face_region_masks=(parsed.enriched.face_region_masks if parsed else {}),
                     accessory_masks=(parsed.enriched.accessory_masks if parsed else {}),
+                    background_masks=(parsed.enriched.background_masks if parsed else {}),
                     coverage_hints=(parsed.enriched.coverage_hints if parsed else {}),
                     visibility_hints=(parsed.enriched.visibility_hints if parsed else {}),
                     provenance_by_region=(parsed.enriched.provenance_by_region if parsed else {}),
+                    parser_class_names=(parsed.enriched.parser_class_names if parsed else {}),
+                    region_mask_refs=(parsed.enriched.region_mask_refs if parsed else {}),
                 )
             )
         out.persons = persons
@@ -518,6 +587,20 @@ class ParserOnlyPipeline:
             "tracker": "disabled:parser-only",
             "objects": "disabled:parser-only",
             "depth": "disabled:parser-only",
+        }
+        out.mask_store = DEFAULT_MASK_STORE.snapshot_metadata()
+        refs_by_canonical: dict[str, list[str]] = {}
+        parser_classes: dict[str, str] = {}
+        for person in out.persons:
+            parser_classes.update(person.parser_class_names)
+            for key, refs in person.region_mask_refs.items():
+                refs_by_canonical.setdefault(key, []).extend(refs)
+        out.parser_summary = {
+            "persons": len(out.persons),
+            "parser_classes": parser_classes,
+            "canonical_regions": sorted(refs_by_canonical.keys()),
+            "region_mask_refs": refs_by_canonical,
+            "mask_refs": sorted(out.mask_store.keys()),
         }
         out.module_confidence = {
             "detector": max([p.bbox_confidence for p in out.persons], default=0.0),
@@ -545,3 +628,42 @@ class ParserOnlyPipeline:
             out.input_mode = "frame_tensor"
         out.module_fallbacks["input_mode"] = out.input_mode
         return out
+
+
+def _resolve_perception_device(device: str) -> str:
+    if device != "auto":
+        return device
+    if importlib.util.find_spec("torch") is None:
+        return "cpu"
+    try:
+        import torch  # type: ignore
+
+        return "cuda" if bool(torch.cuda.is_available()) else "cpu"
+    except Exception:
+        return "cpu"
+
+
+def real_human_parsing_config(
+    *,
+    device: str = "auto",
+    parser_model: str = "fashn-ai/fashn-human-parser",
+    yolo_seg_model: str = "yolo11n-seg.pt",
+    yolo_pose_model: str = "yolo11n-pose.pt",
+    strict_perception: bool = False,
+    reset_mask_store_per_analyze: bool = False,
+) -> PerceptionBackendsConfig:
+    runtime_device = _resolve_perception_device(device)
+    return PerceptionBackendsConfig(
+        detector=BackendConfig(backend="ultralytics", checkpoint=yolo_seg_model, device=runtime_device),
+        pose=BackendConfig(backend="ultralytics", checkpoint=yolo_pose_model, device=runtime_device),
+        parser=BackendConfig(backend="hf", checkpoint=parser_model, device=runtime_device),
+        objects=BackendConfig(backend="builtin"),
+        face=BackendConfig(backend="builtin"),
+        perception_backend="real_human_parsing",
+        parser_model=parser_model,
+        yolo_seg_model=yolo_seg_model,
+        yolo_pose_model=yolo_pose_model,
+        perception_device=runtime_device,
+        strict_perception=strict_perception,
+        reset_mask_store_per_analyze=reset_mask_store_per_analyze,
+    )
