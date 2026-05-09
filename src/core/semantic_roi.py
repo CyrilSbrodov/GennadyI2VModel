@@ -66,6 +66,17 @@ class SemanticROIHelper:
         width = max(1, len(payload[0]) if isinstance(payload[0], list) else 1)
         return (min(xs) / width, min(ys) / height, (max(xs) + 1) / width, (max(ys) + 1) / height)
 
+    @staticmethod
+    def _project_local_xyxy_to_frame(
+        bbox: tuple[float, float, float, float],
+        roi_bbox: tuple[float, float, float, float] | None,
+    ) -> tuple[float, float, float, float]:
+        if roi_bbox is None:
+            return bbox
+        rx, ry, rw, rh = [float(v) for v in roi_bbox]
+        x1, y1, x2, y2 = bbox
+        return (rx + x1 * rw, ry + y1 * rh, rx + x2 * rw, ry + y2 * rh)
+
     def _bbox_from_mask_ref(self, mask_ref: str | None) -> BBox | None:
         if not mask_ref:
             return None
@@ -73,8 +84,10 @@ class SemanticROIHelper:
         if stored is None:
             return None
         bbox = stored.extra.get("bbox_xyxy") if isinstance(stored.extra, dict) else None
+        from_payload = False
         if not (isinstance(bbox, tuple) or isinstance(bbox, list)) or len(bbox) != 4:
             bbox = self._bbox_xyxy_from_payload(stored.payload)
+            from_payload = bbox is not None
         if not (isinstance(bbox, tuple) or isinstance(bbox, list)) or len(bbox) != 4:
             roi = stored.roi_bbox
             if roi is None:
@@ -82,6 +95,9 @@ class SemanticROIHelper:
             x, y, w, h = roi
             return self.normalize_bbox(BBox(float(x), float(y), float(w), float(h)))
         x1, y1, x2, y2 = [max(0.0, min(1.0, float(v))) for v in bbox]
+        if from_payload:
+            x1, y1, x2, y2 = self._project_local_xyxy_to_frame((x1, y1, x2, y2), stored.roi_bbox)
+            x1, y1, x2, y2 = [max(0.0, min(1.0, float(v))) for v in (x1, y1, x2, y2)]
         return self.normalize_bbox(BBox(x1, y1, max(0.02, x2 - x1), max(0.02, y2 - y1)))
 
     @staticmethod

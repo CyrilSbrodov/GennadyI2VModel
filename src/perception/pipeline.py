@@ -68,6 +68,7 @@ class PersonFacts:
     body_part_masks: dict[str, str] = field(default_factory=dict)
     face_region_masks: dict[str, str] = field(default_factory=dict)
     accessory_masks: dict[str, str] = field(default_factory=dict)
+    background_masks: dict[str, str] = field(default_factory=dict)
     coverage_hints: dict[str, list[str]] = field(default_factory=dict)
     visibility_hints: dict[str, str] = field(default_factory=dict)
     provenance_by_region: dict[str, str] = field(default_factory=dict)
@@ -376,6 +377,7 @@ class PerceptionPipeline:
                     body_part_masks=(parsed.enriched.body_part_masks if parsed else {}),
                     face_region_masks=(parsed.enriched.face_region_masks if parsed else {}),
                     accessory_masks=(parsed.enriched.accessory_masks if parsed else {}),
+                    background_masks=(parsed.enriched.background_masks if parsed else {}),
                     coverage_hints=(parsed.enriched.coverage_hints if parsed else {}),
                     visibility_hints=(parsed.enriched.visibility_hints if parsed else {}),
                     provenance_by_region=(parsed.enriched.provenance_by_region if parsed else {}),
@@ -566,6 +568,7 @@ class ParserOnlyPipeline:
                     body_part_masks=(parsed.enriched.body_part_masks if parsed else {}),
                     face_region_masks=(parsed.enriched.face_region_masks if parsed else {}),
                     accessory_masks=(parsed.enriched.accessory_masks if parsed else {}),
+                    background_masks=(parsed.enriched.background_masks if parsed else {}),
                     coverage_hints=(parsed.enriched.coverage_hints if parsed else {}),
                     visibility_hints=(parsed.enriched.visibility_hints if parsed else {}),
                     provenance_by_region=(parsed.enriched.provenance_by_region if parsed else {}),

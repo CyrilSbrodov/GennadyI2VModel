@@ -15,7 +15,6 @@ if str(SRC) not in sys.path:
 import numpy as np
 from PIL import Image, ImageDraw
 
-from core.schema import BBox
 from perception.detector import BackendConfig, PersonDetection
 from perception.mask_store import DEFAULT_MASK_STORE
 from perception.pipeline import PerceptionPipeline, real_human_parsing_config
@@ -69,6 +68,51 @@ def _bbox_from_mask_payload(mask_payload: object) -> tuple[float, float, float, 
     return (float(xs.min()) / max(1, w), float(ys.min()) / max(1, h), float(xs.max() + 1) / max(1, w), float(ys.max() + 1) / max(1, h))
 
 
+
+
+def _project_local_xyxy_to_frame(
+    bbox: tuple[float, float, float, float],
+    roi_bbox: tuple[float, float, float, float] | None,
+) -> tuple[float, float, float, float]:
+    if roi_bbox is None:
+        return bbox
+    rx, ry, rw, rh = [float(v) for v in roi_bbox]
+    x1, y1, x2, y2 = bbox
+    return (rx + x1 * rw, ry + y1 * rh, rx + x2 * rw, ry + y2 * rh)
+
+
+def _bbox_for_stored_mask(item: Any) -> tuple[float, float, float, float] | None:
+    bbox = _clamp_bbox_xyxy(item.extra.get("bbox_xyxy") if isinstance(item.extra, dict) else None)
+    if bbox is not None:
+        return bbox
+    payload_bbox = _clamp_bbox_xyxy(_bbox_from_mask_payload(item.payload))
+    if payload_bbox is None:
+        return None
+    return _clamp_bbox_xyxy(_project_local_xyxy_to_frame(payload_bbox, item.roi_bbox))
+
+
+def _filter_refs_by_min_pixels(refs: list[str], min_pixels: int) -> list[str]:
+    if min_pixels <= 0:
+        return refs
+    filtered: list[str] = []
+    parser_kinds = {"body_part_mask", "face_region_mask", "garment_mask", "accessory_mask", "background_mask"}
+    for ref in refs:
+        item = DEFAULT_MASK_STORE.get(ref)
+        if item is None:
+            continue
+        if item.mask_kind not in parser_kinds:
+            filtered.append(ref)
+            continue
+        pixel_count = 0
+        if isinstance(item.extra, dict):
+            try:
+                pixel_count = int(item.extra.get("pixel_count", 0) or 0)
+            except Exception:
+                pixel_count = 0
+        if pixel_count >= min_pixels:
+            filtered.append(ref)
+    return filtered
+
 def _clamp_bbox_xyxy(bbox: object) -> tuple[float, float, float, float] | None:
     if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
         return None
@@ -105,8 +149,7 @@ def _overlay(
         mask = _mask_to_image(item.payload, base.size)
         layer = Image.new("RGBA", base.size, color)
         out.alpha_composite(Image.composite(layer, Image.new("RGBA", base.size, (0, 0, 0, 0)), mask))
-        bbox = _clamp_bbox_xyxy(item.extra.get("bbox_xyxy") if isinstance(item.extra, dict) else None) or _bbox_from_mask_payload(item.payload)
-        bbox = _clamp_bbox_xyxy(bbox)
+        bbox = _bbox_for_stored_mask(item)
         if bbox:
             x1, y1, x2, y2 = bbox
             box = (int(x1 * base.width), int(y1 * base.height), int(x2 * base.width), int(y2 * base.height))
@@ -275,7 +318,7 @@ def main() -> None:
             if args.strict:
                 raise RuntimeError(f"strict mediapipe perception backend failed: {exc}") from exc
 
-    refs = sorted(output.mask_store.keys())
+    refs = _filter_refs_by_min_pixels(sorted(output.mask_store.keys()), args.min_parser_pixels)
     _overlay(img, refs, kinds={"person_mask"}).save(out_dir / "10_yolo_person_seg_overlay.jpg")
     _draw_pose(img, output.persons).save(out_dir / "20_yolo_pose_overlay.jpg")
     _overlay(img, refs, exclude_kinds={"person_mask", "background_mask"}).save(out_dir / "30_parser_all_masks_overlay.jpg")

@@ -382,3 +382,61 @@ def test_gennady_engine_accepts_real_perception_config_without_eager_real_backen
     assert "ultralytics" not in sys.modules
     assert "transformers" not in sys.modules
     assert "mediapipe" not in sys.modules
+
+
+def test_roi_helper_projects_payload_bbox_through_stored_roi_when_extra_bbox_missing() -> None:
+    from core.schema import BodyPartNode, PersonNode, PoseState, SceneGraph
+
+    DEFAULT_MASK_STORE.clear()
+    ref = DEFAULT_MASK_STORE.put(
+        [[0, 1], [0, 1]],
+        0.8,
+        "parser:fashn",
+        "payload_roi_bbox",
+        mask_kind="body_part_mask",
+        roi_bbox=(0.25, 0.25, 0.5, 0.5),
+    )
+    graph = SceneGraph(
+        frame_index=0,
+        persons=[
+            PersonNode(
+                "person_1",
+                "person_1",
+                BBox(0.25, 0.25, 0.5, 0.5),
+                None,
+                PoseState(),
+                body_parts=[BodyPartNode("person_1_torso", "torso", mask_ref=ref, confidence=0.8, source="parser:fashn")],
+            )
+        ],
+    )
+    roi = ROISelector().select(graph, GraphDelta(affected_entities=["person_1"], affected_regions=["torso"]))
+    assert roi
+    assert "roi_source=parser_mask_bbox" in roi[0].reason
+    # The payload occupies the right half of the crop, so frame-space x is 0.5..0.75
+    # before ROI context expansion. If treated as frame-space directly it would be 0.5..1.0.
+    assert 0.45 <= roi[0].bbox.x <= 0.50
+    assert 0.28 <= roi[0].bbox.w <= 0.35
+
+
+def test_background_masks_are_public_perception_fields() -> None:
+    DEFAULT_MASK_STORE.clear()
+    pipe = PerceptionPipeline(detector=_FakeDetector(), pose=_FakePose(), parser=_FakeParser(), face=_NoneModule(), objects=_NoneModule(), tracker=_NoneModule(), depth=_NoneModule())
+    output = pipe.analyze(_solid())
+    assert output.persons[0].background_masks["background"].startswith("mask://")
+
+
+def test_debug_min_parser_pixels_filters_parser_refs_but_keeps_person_masks() -> None:
+    import importlib.util
+    from pathlib import Path
+
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "debug_real_perception_layers.py"
+    spec = importlib.util.spec_from_file_location("debug_real_perception_layers", script_path)
+    assert spec and spec.loader
+    debug_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(debug_mod)
+
+    DEFAULT_MASK_STORE.clear()
+    person_ref = DEFAULT_MASK_STORE.put([[1]], 0.9, "yolo_person_seg", "person", mask_kind="person_mask")
+    tiny_parser_ref = DEFAULT_MASK_STORE.put([[1]], 0.9, "parser:fashn", "tiny", mask_kind="body_part_mask", extra={"pixel_count": 1})
+    large_parser_ref = DEFAULT_MASK_STORE.put([[1, 1], [1, 1]], 0.9, "parser:fashn", "large", mask_kind="body_part_mask", extra={"pixel_count": 4})
+    assert debug_mod._filter_refs_by_min_pixels([person_ref, tiny_parser_ref, large_parser_ref], 2) == [person_ref, large_parser_ref]
