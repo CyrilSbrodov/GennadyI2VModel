@@ -92,11 +92,12 @@ def build_patch_synthesis_contract(
     hidden_state: dict[str, object],
     synthesis_mode: str,
     transition_context: dict[str, object],
+    region_metadata: dict[str, object] | None = None,
 ) -> PatchSynthesisContract:
     return {
         "roi_before": roi_before,
         "roi_after": roi_after,
-        "region_metadata": {"region_id": region.region_id, "reason": region.reason},
+        "region_metadata": dict(region_metadata) if isinstance(region_metadata, dict) and region_metadata else {"region_id": region.region_id, "reason": region.reason, "metadata_completeness_score": 0.0, "missing_fields": ["region_metadata"]},
         "retrieval_explanation_summary": retrieval_summary,
         "selected_render_strategy": selected_render_strategy,
         # backward-compatible alias for older contract consumers; not a canonical required field.

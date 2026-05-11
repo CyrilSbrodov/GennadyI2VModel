@@ -4,7 +4,7 @@ import importlib
 import sys
 import types
 
-from core.schema import BBox, GraphDelta
+from core.schema import BBox, GraphDelta, RegionRef, VideoMemory
 from perception.detector import DetectorOutput, PersonDetection
 from perception.human_parser_mapping import map_human_parser_class
 from perception.mask_store import DEFAULT_MASK_STORE
@@ -19,6 +19,7 @@ from perception.pipeline import PerceptionPipeline
 from perception.pose import PosePrediction
 from rendering.roi_renderer import ROISelector
 from representation.graph_builder import SceneGraphBuilder
+from runtime.region_metadata import build_region_metadata
 
 
 def _solid(h: int = 16, w: int = 16):
@@ -134,10 +135,44 @@ def test_fake_real_pipeline_scene_graph_and_roi_use_parser_masks() -> None:
     face = next(p for p in person.body_parts if p.part_type == "face")
     dress = next(g for g in person.garments if g.mask_ref)
     assert face.mask_ref is not None and face.source == "hf_human_parser"
+    assert "parser_class:face" in face.alternatives
     assert dress.mask_ref is not None and dress.confidence > 0
+    assert any(alt.startswith("parser_class:") for alt in dress.alternatives)
+    face_metadata = build_region_metadata(
+        scene_graph=graph,
+        memory=VideoMemory(),
+        region=RegionRef(f"{person.person_id}:face", face.bbox if hasattr(face, "bbox") else BBox(0.2, 0.2, 0.3, 0.2), "roi_source=parser_mask_bbox"),
+        route_decision=None,
+        delta=None,
+    )
+    assert face_metadata["parser_class_name"] == "face"
 
     roi = ROISelector().select(graph, GraphDelta(affected_entities=[person.person_id], affected_regions=["face", "dress"]))
     assert any("roi_source=parser_mask_bbox" in r.reason for r in roi)
+
+
+def test_store_mask_preserves_parser_class_metadata_for_region_bridge() -> None:
+    from perception.parser import _store_mask
+
+    DEFAULT_MASK_STORE.clear()
+    ref = _store_mask(
+        [[1, 0], [1, 1]],
+        0.93,
+        "parser:fashn",
+        "unit_parser_class",
+        "body_part_mask",
+        "fashn",
+        frame_size=(20, 10),
+        parser_class_name="left_arm",
+        class_id=12,
+    )
+
+    assert ref is not None
+    stored = DEFAULT_MASK_STORE.get(ref)
+    assert stored is not None
+    assert stored.extra["parser_class_name"] == "left_arm"
+    assert stored.extra["class_id"] == 12
+    assert stored.extra["pixel_count"] == 3
 
 
 def test_lazy_import_does_not_require_heavy_real_dependencies() -> None:

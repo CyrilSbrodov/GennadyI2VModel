@@ -110,7 +110,10 @@ class PatchBatch:
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
-    return float(value) if isinstance(value, (int, float)) else default
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 
 def _clip01(value: np.ndarray | float) -> np.ndarray | float:
@@ -999,6 +1002,58 @@ def _delta_features(request: PatchSynthesisRequest, profile: RenderConditioningP
     return delta_vec, planner
 
 
+
+def extract_region_metadata_conditioning(request: PatchSynthesisRequest) -> dict[str, object]:
+    metadata = request.region_metadata if isinstance(getattr(request, "region_metadata", {}), dict) else {}
+    used = bool(metadata) and float(metadata.get("metadata_completeness_score", 0.0) or 0.0) > 0.0
+    roi_source = str(metadata.get("roi_source", "unknown")) if metadata else "unknown"
+    source_node_type = str(metadata.get("source_node_type", "unknown")) if metadata else "unknown"
+    bbox = metadata.get("bbox_xywh", {}) if isinstance(metadata.get("bbox_xywh", {}), dict) else {}
+    area_from_bbox = min(1.0, _safe_float(bbox.get("w"), 0.0) * _safe_float(bbox.get("h"), 0.0))
+    frame_size = metadata.get("mask_frame_size")
+    frame_area = 0.0
+    if isinstance(frame_size, (tuple, list)) and len(frame_size) == 2:
+        frame_area = max(0.0, _safe_float(frame_size[0]) * _safe_float(frame_size[1]))
+    if metadata.get("mask_ref") and frame_area > 0.0:
+        mask_area_ratio = min(1.0, max(0.0, _safe_float(metadata.get("mask_pixel_count"), 0.0) / frame_area))
+    else:
+        mask_area_ratio = area_from_bbox if metadata.get("mask_ref") else 0.0
+    feature_values = {
+        "has_parser_mask": 1.0 if metadata.get("mask_ref") and roi_source == "parser_mask_bbox" else 0.0,
+        "mask_area_ratio": mask_area_ratio,
+        "source_confidence": min(1.0, _safe_float(metadata.get("source_confidence"), 0.0)),
+        "is_identity_sensitive": 1.0 if metadata.get("is_identity_sensitive") else 0.0,
+        "is_garment_region": 1.0 if metadata.get("is_garment_region") else 0.0,
+        "is_body_region": 1.0 if metadata.get("is_body_region") else 0.0,
+        "is_face_region": 1.0 if metadata.get("is_face_region") else 0.0,
+        "is_reveal": 1.0 if metadata.get("newly_revealed") or str(metadata.get("reveal_mode", "none")) != "none" else 0.0,
+        "is_newly_occluded": 1.0 if metadata.get("newly_occluded") else 0.0,
+        "memory_reliable_for_reuse": 1.0 if metadata.get("memory_reliable_for_reuse") else 0.0,
+        "memory_suitable_for_reveal": 1.0 if metadata.get("memory_suitable_for_reveal") else 0.0,
+        "metadata_completeness_score": min(1.0, _safe_float(metadata.get("metadata_completeness_score"), 0.0)),
+        "evidence_strength_score": min(1.0, _safe_float(metadata.get("evidence_strength_score"), 0.0)),
+        "roi_source_parser_mask_bbox": 1.0 if roi_source == "parser_mask_bbox" else 0.0,
+        "roi_source_body_part_keypoints": 1.0 if roi_source == "body_part_keypoints" else 0.0,
+        "roi_source_garment_coverage": 1.0 if roi_source == "garment_coverage" else 0.0,
+        "roi_source_person_bbox_fallback": 1.0 if roi_source == "person_bbox_fallback" else 0.0,
+        "source_node_body_part": 1.0 if source_node_type == "body_part" else 0.0,
+        "source_node_garment": 1.0 if source_node_type == "garment" else 0.0,
+        "source_node_face_region": 1.0 if source_node_type == "face_region" else 0.0,
+        "source_node_canonical_region": 1.0 if source_node_type == "canonical_region" else 0.0,
+        "source_node_fallback": 1.0 if source_node_type == "fallback" else 0.0,
+    }
+    return {
+        "region_metadata_used": used,
+        "metadata_completeness_score": feature_values["metadata_completeness_score"],
+        "evidence_strength_score": feature_values["evidence_strength_score"],
+        "metadata_feature_keys": [k for k, v in feature_values.items() if float(v) != 0.0],
+        "mask_ref_present": bool(metadata.get("mask_ref")),
+        "roi_source": roi_source,
+        "source_node_type": source_node_type,
+        "mask_kind": str(metadata.get("mask_kind", "")),
+        "feature_values": feature_values,
+    }
+
 def _graph_features(request: PatchSynthesisRequest) -> np.ndarray:
     g = request.scene_state
     graph_emb = request.graph_encoding.graph_embedding if request.graph_encoding else []
@@ -1055,6 +1110,16 @@ def _memory_and_appearance_features(request: PatchSynthesisRequest, roi_before: 
         dtype=np.float32,
     )
     bundle_cond = extract_memory_bundle_conditioning(request)
+    metadata_cond = extract_region_metadata_conditioning(request)
+    metadata_values = metadata_cond["feature_values"] if isinstance(metadata_cond.get("feature_values"), dict) else {}
+    if metadata_cond.get("region_metadata_used"):
+        mem_vec[6] = max(
+            mem_vec[6],
+            0.20 * _safe_float(metadata_values.get("metadata_completeness_score")) + 0.30 * _safe_float(metadata_values.get("evidence_strength_score")),
+        )
+        mem_vec[7] = max(mem_vec[7], _safe_float(metadata_values.get("has_parser_mask")))
+        mem_vec[8] = max(mem_vec[8], _safe_float(metadata_values.get("source_confidence")))
+        mem_vec[9] = min(1.0, mem_vec[9] + 0.35 * _safe_float(metadata_values.get("is_reveal")) + 0.20 * _safe_float(metadata_values.get("memory_suitable_for_reveal")))
 
     mean = np.mean(roi_before, axis=(0, 1))
     std = np.std(roi_before, axis=(0, 1))
@@ -1064,6 +1129,9 @@ def _memory_and_appearance_features(request: PatchSynthesisRequest, roi_before: 
         [float(mean[0]), float(mean[1]), float(mean[2]), float(std[0]), float(std[1]), float(std[2]), luminance, chroma],
         dtype=np.float32,
     )
+    if metadata_cond.get("region_metadata_used"):
+        appearance[6] = min(1.0, appearance[6] + 0.05 * _safe_float(metadata_values.get("is_identity_sensitive")) + 0.03 * _safe_float(metadata_values.get("is_garment_region")))
+        appearance[7] = min(1.0, appearance[7] + 0.08 * _safe_float(metadata_values.get("mask_area_ratio")) + 0.04 * _safe_float(metadata_values.get("is_newly_occluded")))
     return apply_memory_bundle_conditioning_to_vectors(mem_vec, appearance, bundle_cond, region_id=request.region.region_id)
 
 
@@ -1268,6 +1336,14 @@ def summarize_patch_batch(batch: PatchBatch) -> dict[str, object]:
         "edit_strength": _safe_float(batch.conditioning_summary.get("edit_strength")),
         "preservation_strength": _safe_float(batch.conditioning_summary.get("preservation_strength")),
         "memory_dependency": _safe_float(batch.conditioning_summary.get("memory_dependency")),
+        "region_metadata_used": bool(batch.conditioning_summary.get("region_metadata_used", False)),
+        "metadata_completeness_score": _safe_float(batch.conditioning_summary.get("metadata_completeness_score")),
+        "evidence_strength_score": _safe_float(batch.conditioning_summary.get("evidence_strength_score")),
+        "metadata_feature_keys": list(batch.conditioning_summary.get("metadata_feature_keys", [])) if isinstance(batch.conditioning_summary.get("metadata_feature_keys", []), list) else [],
+        "mask_ref_present": bool(batch.conditioning_summary.get("mask_ref_present", False)),
+        "roi_source": batch.conditioning_summary.get("roi_source", "unknown"),
+        "source_node_type": batch.conditioning_summary.get("source_node_type", "unknown"),
+        "mask_kind": batch.conditioning_summary.get("mask_kind", ""),
     }
 
 
@@ -1279,12 +1355,20 @@ def summarize_request_contract(request: PatchSynthesisRequest) -> dict[str, obje
     if delta is not None:
         raw_mode = str(getattr(delta, "region_transition_mode", {}).get(region_type, ""))
     transition_mode = _canonical_transition_mode(str(ctx.get("region_transition_mode", raw_mode)), region_type)
+    metadata_cond = extract_region_metadata_conditioning(request)
     return {
         "requested_transition_mode": transition_mode,
         "requested_profile_role": _resolve_profile_role(request, region_type),
         "region_type": region_type,
         "reason": request.region.reason,
         "has_graph_delta": delta is not None,
+        "region_metadata_used": metadata_cond["region_metadata_used"],
+        "metadata_completeness_score": metadata_cond["metadata_completeness_score"],
+        "evidence_strength_score": metadata_cond["evidence_strength_score"],
+        "metadata_feature_keys": metadata_cond["metadata_feature_keys"],
+        "mask_ref_present": metadata_cond["mask_ref_present"],
+        "roi_source": metadata_cond["roi_source"],
+        "source_node_type": metadata_cond["source_node_type"],
     }
 
 
@@ -1319,6 +1403,7 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
     if bundle_cond["memory_bundle_low_evidence_newly_revealed"]:
         uncertainty_target = np.clip(uncertainty_target + 0.08 * changed_mask, 0.0, 1.0).astype(np.float32)
 
+    metadata_cond = extract_region_metadata_conditioning(request)
     conditioning_summary = {
         "transition_mode": profile.transition_mode,
         "profile_role": profile.profile_role,
@@ -1340,6 +1425,14 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
         "memory_bundle_is_revealed_history": bundle_cond["memory_bundle_is_revealed_history"],
         "memory_bundle_reveal_lifecycle": bundle_cond["memory_bundle_reveal_lifecycle"],
         "memory_bundle_low_evidence_newly_revealed": bundle_cond["memory_bundle_low_evidence_newly_revealed"],
+        "region_metadata_used": metadata_cond["region_metadata_used"],
+        "metadata_completeness_score": metadata_cond["metadata_completeness_score"],
+        "evidence_strength_score": metadata_cond["evidence_strength_score"],
+        "metadata_feature_keys": metadata_cond["metadata_feature_keys"],
+        "mask_ref_present": metadata_cond["mask_ref_present"],
+        "roi_source": metadata_cond["roi_source"],
+        "source_node_type": metadata_cond["source_node_type"],
+        "mask_kind": metadata_cond["mask_kind"],
     }
     return PatchBatch(
         roi_before=roi_before,
@@ -1421,6 +1514,14 @@ def output_from_prediction(
         "reveal_like": bool(batch.conditioning_summary.get("reveal_like", False)) if batch is not None else False,
         "diagnostics": diagnostics,
         "conditioning_summary": conditioning_summary,
+        "region_metadata_used": bool(conditioning_summary.get("region_metadata_used", False)),
+        "region_metadata_completeness_score": _safe_float(conditioning_summary.get("metadata_completeness_score")),
+        "region_metadata_evidence_strength_score": _safe_float(conditioning_summary.get("evidence_strength_score")),
+        "region_metadata_roi_source": conditioning_summary.get("roi_source", "unknown"),
+        "region_metadata_source_node_type": conditioning_summary.get("source_node_type", "unknown"),
+        "region_metadata_mask_kind": conditioning_summary.get("mask_kind", ""),
+        "region_metadata_mask_ref_present": bool(conditioning_summary.get("mask_ref_present", False)),
+        "region_metadata_feature_keys": list(conditioning_summary.get("metadata_feature_keys", [])) if isinstance(conditioning_summary.get("metadata_feature_keys", []), list) else [],
         "alpha_semantics": "blend_probability_for_true_changed_region_with_seam_support",
         "uncertainty_semantics": "local_synthesis_ambiguity_map_for_compositor_and_confidence",
         "confidence_semantics": "patch_reliability_summary_after_preservation_and_ambiguity_checks",

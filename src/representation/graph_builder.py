@@ -60,27 +60,68 @@ class SceneGraphBuilder:
                 "upper_body",
                 "lower_body",
             ]
-            body_parts = [
-                BodyPartNode(
-                    part_id=f"{person_id}_{part_name}",
-                    part_type=part_name,
-                    mask_ref=canonical_regions[part_name].mask_ref,
-                    confidence=self._calibrate_confidence(canonical_regions[part_name].confidence, canonical_regions[part_name].provenance),
-                    visibility=canonical_regions[part_name].visibility_state,
-                    source=canonical_regions[part_name].provenance,
-                    frame_index=frame_index,
-                    alternatives=[
-                        f"raw:{','.join(canonical_regions[part_name].source_regions) or 'none'}",
-                        f"attachment:{','.join(canonical_regions[part_name].attachment_hints) or 'none'}",
-                    ],
+            body_parser_meta: dict[str, dict[str, object]] = {}
+            for raw_part in p.body_parts:
+                part_type = str(raw_part.get("part_type", "")).lower().strip()
+                if part_type:
+                    body_parser_meta[part_type] = raw_part
+            for raw_face in p.face_regions:
+                region_type = str(raw_face.get("region_type", "")).lower().strip()
+                if region_type:
+                    body_parser_meta.setdefault(region_type, raw_face)
+
+            body_parts: list[BodyPartNode] = []
+            for part_name in body_part_order:
+                region = canonical_regions[part_name]
+                parser_meta = body_parser_meta.get(part_name, {})
+                parser_class = parser_meta.get("parser_class_name") or p.parser_class_names.get(f"body:{part_name}") or p.parser_class_names.get(f"face:{part_name}")
+                class_id = parser_meta.get("class_id")
+                alternatives = [
+                    f"raw:{','.join(region.source_regions) or 'none'}",
+                    f"attachment:{','.join(region.attachment_hints) or 'none'}",
+                ]
+                if parser_class:
+                    alternatives.append(f"parser_class:{parser_class}")
+                if class_id is not None:
+                    alternatives.append(f"class_id:{class_id}")
+                body_parts.append(
+                    BodyPartNode(
+                        part_id=f"{person_id}_{part_name}",
+                        part_type=part_name,
+                        mask_ref=region.mask_ref,
+                        confidence=self._calibrate_confidence(region.confidence, region.provenance),
+                        visibility=region.visibility_state,
+                        source=region.provenance,
+                        frame_index=frame_index,
+                        alternatives=alternatives,
+                    )
                 )
-                for part_name in body_part_order
-            ]
+
+            garment_parser_meta: dict[str, dict[str, object]] = {}
+            for raw_garment in p.garments:
+                raw_type = str(raw_garment.get("type", "")).lower().strip()
+                if raw_type:
+                    garment_parser_meta[raw_type] = raw_garment
 
             garments: list[GarmentNode] = []
             garment_regions = ["upper_garment", "lower_garment", "outer_garment", "inner_garment", "accessories"]
             for g_name in garment_regions:
                 region = canonical_regions[g_name]
+                parser_meta = next(
+                    (garment_parser_meta[src.split(":", 1)[-1]] for src in region.source_regions if src.split(":", 1)[-1] in garment_parser_meta),
+                    {},
+                )
+                parser_class = parser_meta.get("parser_class_name")
+                class_id = parser_meta.get("class_id")
+                alternatives = [
+                    f"source_regions:{','.join(region.source_regions) or 'none'}",
+                    f"ownership:{','.join(region.ownership_hints) or 'person'}",
+                    f"layer_hint:{g_name}",
+                ]
+                if parser_class:
+                    alternatives.append(f"parser_class:{parser_class}")
+                if class_id is not None:
+                    alternatives.append(f"class_id:{class_id}")
                 garments.append(
                     GarmentNode(
                         garment_id=f"{person_id}_{g_name}",
@@ -93,11 +134,7 @@ class SceneGraphBuilder:
                         visibility=region.visibility_state,
                         source=region.provenance,
                         frame_index=frame_index,
-                        alternatives=[
-                            f"source_regions:{','.join(region.source_regions) or 'none'}",
-                            f"ownership:{','.join(region.ownership_hints) or 'person'}",
-                            f"layer_hint:{g_name}",
-                        ],
+                        alternatives=alternatives,
                     )
                 )
 

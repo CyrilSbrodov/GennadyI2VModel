@@ -44,6 +44,7 @@ class PatchSynthesisRequest:
     memory_channels: dict[str, object] = field(default_factory=dict)
     graph_encoding: GraphEncodingOutput | None = None
     identity_embedding: list[float] = field(default_factory=list)
+    region_metadata: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
