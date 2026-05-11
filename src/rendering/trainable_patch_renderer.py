@@ -1003,14 +1003,23 @@ def _delta_features(request: PatchSynthesisRequest, profile: RenderConditioningP
 
 
 
-def extract_region_metadata_conditioning(request: PatchSynthesisRequest) -> dict[str, object]:
-    metadata = request.region_metadata if isinstance(getattr(request, "region_metadata", {}), dict) else {}
-    used = bool(metadata) and float(metadata.get("metadata_completeness_score", 0.0) or 0.0) > 0.0
+def extract_region_metadata_conditioning_from_metadata(metadata: dict[str, object] | None) -> dict[str, object]:
+    metadata = metadata if isinstance(metadata, dict) else {}
+    used = bool(metadata) and _safe_float(metadata.get("metadata_completeness_score"), 0.0) > 0.0
     roi_source = str(metadata.get("roi_source", "unknown")) if metadata else "unknown"
     source_node_type = str(metadata.get("source_node_type", "unknown")) if metadata else "unknown"
-    bbox = metadata.get("bbox_xywh", {}) if isinstance(metadata.get("bbox_xywh", {}), dict) else {}
-    area_from_bbox = min(1.0, _safe_float(bbox.get("w"), 0.0) * _safe_float(bbox.get("h"), 0.0))
-    frame_size = metadata.get("mask_frame_size")
+    bbox_raw = metadata.get("bbox_xywh", {}) if metadata else {}
+    if isinstance(bbox_raw, dict):
+        bbox_w = _safe_float(bbox_raw.get("w"), 0.0)
+        bbox_h = _safe_float(bbox_raw.get("h"), 0.0)
+    elif isinstance(bbox_raw, (list, tuple)) and len(bbox_raw) >= 4:
+        bbox_w = _safe_float(bbox_raw[2], 0.0)
+        bbox_h = _safe_float(bbox_raw[3], 0.0)
+    else:
+        bbox_w = 0.0
+        bbox_h = 0.0
+    area_from_bbox = min(1.0, bbox_w * bbox_h)
+    frame_size = metadata.get("mask_frame_size") if metadata else None
     frame_area = 0.0
     if isinstance(frame_size, (tuple, list)) and len(frame_size) == 2:
         frame_area = max(0.0, _safe_float(frame_size[0]) * _safe_float(frame_size[1]))
@@ -1053,6 +1062,54 @@ def extract_region_metadata_conditioning(request: PatchSynthesisRequest) -> dict
         "mask_kind": str(metadata.get("mask_kind", "")),
         "feature_values": feature_values,
     }
+
+
+def extract_region_metadata_conditioning(request: PatchSynthesisRequest) -> dict[str, object]:
+    metadata = request.region_metadata if isinstance(getattr(request, "region_metadata", {}), dict) else {}
+    return extract_region_metadata_conditioning_from_metadata(metadata)
+
+
+def apply_region_metadata_conditioning_to_vectors(
+    memory_cond: np.ndarray,
+    appearance_cond: np.ndarray,
+    region_metadata: dict[str, object] | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    mem_vec = np.asarray(memory_cond, dtype=np.float32).reshape(-1).copy()
+    appearance = np.asarray(appearance_cond, dtype=np.float32).reshape(-1).copy()
+    metadata_cond = extract_region_metadata_conditioning_from_metadata(region_metadata)
+    metadata_values = metadata_cond["feature_values"] if isinstance(metadata_cond.get("feature_values"), dict) else {}
+    if metadata_cond.get("region_metadata_used"):
+        if mem_vec.size > 6:
+            mem_vec[6] = max(
+                float(mem_vec[6]),
+                0.20 * _safe_float(metadata_values.get("metadata_completeness_score")) + 0.30 * _safe_float(metadata_values.get("evidence_strength_score")),
+            )
+        if mem_vec.size > 7:
+            mem_vec[7] = max(float(mem_vec[7]), _safe_float(metadata_values.get("has_parser_mask")))
+        if mem_vec.size > 8:
+            mem_vec[8] = max(float(mem_vec[8]), _safe_float(metadata_values.get("source_confidence")))
+        if mem_vec.size > 9:
+            mem_vec[9] = min(
+                1.0,
+                float(mem_vec[9])
+                + 0.35 * _safe_float(metadata_values.get("is_reveal"))
+                + 0.20 * _safe_float(metadata_values.get("memory_suitable_for_reveal")),
+            )
+        if appearance.size > 6:
+            appearance[6] = min(
+                1.0,
+                float(appearance[6])
+                + 0.05 * _safe_float(metadata_values.get("is_identity_sensitive"))
+                + 0.03 * _safe_float(metadata_values.get("is_garment_region")),
+            )
+        if appearance.size > 7:
+            appearance[7] = min(
+                1.0,
+                float(appearance[7])
+                + 0.08 * _safe_float(metadata_values.get("mask_area_ratio"))
+                + 0.04 * _safe_float(metadata_values.get("is_newly_occluded")),
+            )
+    return mem_vec.astype(np.float32), appearance.astype(np.float32)
 
 def _graph_features(request: PatchSynthesisRequest) -> np.ndarray:
     g = request.scene_state
@@ -1110,16 +1167,6 @@ def _memory_and_appearance_features(request: PatchSynthesisRequest, roi_before: 
         dtype=np.float32,
     )
     bundle_cond = extract_memory_bundle_conditioning(request)
-    metadata_cond = extract_region_metadata_conditioning(request)
-    metadata_values = metadata_cond["feature_values"] if isinstance(metadata_cond.get("feature_values"), dict) else {}
-    if metadata_cond.get("region_metadata_used"):
-        mem_vec[6] = max(
-            mem_vec[6],
-            0.20 * _safe_float(metadata_values.get("metadata_completeness_score")) + 0.30 * _safe_float(metadata_values.get("evidence_strength_score")),
-        )
-        mem_vec[7] = max(mem_vec[7], _safe_float(metadata_values.get("has_parser_mask")))
-        mem_vec[8] = max(mem_vec[8], _safe_float(metadata_values.get("source_confidence")))
-        mem_vec[9] = min(1.0, mem_vec[9] + 0.35 * _safe_float(metadata_values.get("is_reveal")) + 0.20 * _safe_float(metadata_values.get("memory_suitable_for_reveal")))
 
     mean = np.mean(roi_before, axis=(0, 1))
     std = np.std(roi_before, axis=(0, 1))
@@ -1129,9 +1176,7 @@ def _memory_and_appearance_features(request: PatchSynthesisRequest, roi_before: 
         [float(mean[0]), float(mean[1]), float(mean[2]), float(std[0]), float(std[1]), float(std[2]), luminance, chroma],
         dtype=np.float32,
     )
-    if metadata_cond.get("region_metadata_used"):
-        appearance[6] = min(1.0, appearance[6] + 0.05 * _safe_float(metadata_values.get("is_identity_sensitive")) + 0.03 * _safe_float(metadata_values.get("is_garment_region")))
-        appearance[7] = min(1.0, appearance[7] + 0.08 * _safe_float(metadata_values.get("mask_area_ratio")) + 0.04 * _safe_float(metadata_values.get("is_newly_occluded")))
+    mem_vec, appearance = apply_region_metadata_conditioning_to_vectors(mem_vec, appearance, request.region_metadata)
     return apply_memory_bundle_conditioning_to_vectors(mem_vec, appearance, bundle_cond, region_id=request.region.region_id)
 
 

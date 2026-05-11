@@ -260,3 +260,26 @@ The metadata contract includes:
 - diagnostics: `metadata_completeness_score`, `evidence_strength_score`, `missing_fields`, `metadata_source_trace`, and `parse_error` for malformed region ids.
 
 Runtime patch debug records expose a compact summary (`region_metadata_completeness_score`, source node type, mask kind, ROI source, missing fields, source trace), while `PatchSynthesisOutput.execution_trace` records whether metadata was used and which metadata-derived feature keys affected conditioning. Fallback ROIs remain valid, but they carry lower completeness and explicit missing mask evidence instead of silently pretending to be parser-derived regions.
+
+## Renderer Training Manifest v2
+
+Renderer patch training can now use a strict manifest-backed contract instead of ad-hoc ROI JSON. Runtime exports use `contract_version: "renderer_patch_manifest_v2"` at both the manifest and record level, preserving `region_metadata` as a structured dict all the way into renderer dataset loading and `PatchSynthesisRequest` reconstruction.
+
+Required v2 record fields are: `record_id`, `frame_index`, `step_index`, `region_id`, `canonical_region`, `entity_id`, `roi_before`, `roi_after`, `alpha_mask`, `region_metadata`, `transition_context_summary`, `selected_render_strategy`, `synthesis_mode`, `execution_trace_summary`, `metadata_completeness_score`, `evidence_strength_score`, `roi_source`, `source_node_type`, `mask_kind`, and `mask_ref_present`. Optional supervision/conditioning tensors such as `changed_mask`, `preservation_mask`, `uncertainty_target`, and `seam_prior` are included when available.
+
+The exporter deliberately stores compact summaries rather than raw runtime objects: graph delta affected entities/regions and reveal/occlusion semantics, memory support and retrieval reasons, route decisions, learned target profile, execution trace, source image/frame refs, and target provenance. Invalid v2 records raise clear validation errors in strict dataset mode; legacy/minimal manifests still load through the versioned compatibility path with explicit low-completeness metadata diagnostics.
+
+Export runtime renderer records by passing `export_renderer_manifest_path` to `GennadyEngine.run(...)`. Smoke training/eval can read the resulting manifest through the existing renderer trainer path, for example:
+
+```bash
+python -m training.cli --stage renderer --epochs 1 --learned-dataset-path /path/to/renderer_manifest.json
+python -m training.cli --eval-renderer --weights-path artifacts/checkpoints/renderer/renderer_weights.json --learned-dataset-path /path/to/renderer_manifest.json
+```
+
+Useful checks:
+
+```bash
+pytest tests/test_region_metadata_bridge.py
+pytest tests/test_renderer_manifest_v2.py
+pytest tests/test_real_human_parsing_integration.py
+```

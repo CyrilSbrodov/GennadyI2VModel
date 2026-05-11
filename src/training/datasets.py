@@ -29,6 +29,7 @@ from memory.video_memory import MemoryManager
 from perception.pipeline import ObjectFacts, PerceptionOutput, PerceptionPipeline, PersonFacts
 from representation.graph_builder import SceneGraphBuilder
 from rendering.roi_renderer import ROISelector
+from learned.interfaces import PatchSynthesisRequest
 from rendering.target_provenance_policy import (
     ALLOWED_TARGET_SOURCES as POLICY_ALLOWED_TARGET_SOURCES,
     ALLOWED_TRAINING_TARGET_QUALITIES as POLICY_ALLOWED_TRAINING_TARGET_QUALITIES,
@@ -1273,6 +1274,7 @@ class RendererDataset(BaseStageDataset):
         records = payload.get("records", [])
         manifest_type_raw = payload.get("manifest_type")
         manifest_type = str(manifest_type_raw).strip() if manifest_type_raw is not None else "unknown"
+        contract_version = str(payload.get("contract_version", "")).strip()
         supported_manifest_types = {"renderer_patch_manifest", "manifest_paired_roi", "paired_roi_renderer_manifest", "unknown"}
         samples: list[TrainingSample] = []
         diagnostics: dict[str, object] = {
@@ -1313,6 +1315,18 @@ class RendererDataset(BaseStageDataset):
             "supervised_quality_avg_mean_abs_delta": 0.0,
             "supervised_quality_semantic_family_counts": {},
             "supervised_quality_warnings_count_by_type": {},
+            "contract_version": contract_version,
+            "v2_record_count": 0,
+            "region_metadata_used_count": 0,
+            "percent_records_with_region_metadata_used": 0.0,
+            "metadata_completeness_score_sum": 0.0,
+            "evidence_strength_score_sum": 0.0,
+            "average_metadata_completeness_score": 0.0,
+            "average_evidence_strength_score": 0.0,
+            "roi_source_distribution": {},
+            "source_node_type_distribution": {},
+            "mask_kind_distribution": {},
+            "fallback_person_bbox_record_count": 0,
         }
         if manifest_type not in supported_manifest_types:
             diagnostics["unsupported_manifest_type"] = 1
@@ -1336,13 +1350,14 @@ class RendererDataset(BaseStageDataset):
                     raise ValueError("roi_before and roi_after shape mismatch")
 
                 family = str(rec.get("semantic_family", rec.get("region_family", ""))).strip().lower()
-                region_id = str(rec.get("region_id", rec.get("region", {}).get("region_id", ""))).strip().lower()
+                region_id = str(rec.get("region_id", rec.get("region", {}).get("region_id", ""))).strip()
+                region_id_for_family = region_id.lower()
                 if not family:
-                    if "face" in region_id or "head" in region_id:
+                    if "face" in region_id_for_family or "head" in region_id_for_family:
                         family = "face_expression"
-                    elif "torso" in region_id or "inner" in region_id:
+                    elif "torso" in region_id_for_family or "inner" in region_id_for_family:
                         family = "torso_reveal"
-                    elif "arm" in region_id or "sleeve" in region_id or "outer" in region_id:
+                    elif "arm" in region_id_for_family or "sleeve" in region_id_for_family or "outer" in region_id_for_family:
                         family = "sleeve_arm_transition"
                     else:
                         family = "sleeve_arm_transition"
@@ -1350,10 +1365,47 @@ class RendererDataset(BaseStageDataset):
                     raise ValueError(f"unsupported semantic_family={family!r}")
                 diagnostics["family_counts"][family] = int(diagnostics["family_counts"][family]) + 1
 
+                rec_contract_version = str(rec.get("contract_version", contract_version)).strip()
+                is_v2 = rec_contract_version == "renderer_patch_manifest_v2"
+                region_metadata = rec.get("region_metadata") if isinstance(rec.get("region_metadata"), dict) else None
+                patch_contract = rec.get("patch_synthesis_contract") if isinstance(rec.get("patch_synthesis_contract"), dict) else {}
+                if region_metadata is None and isinstance(patch_contract.get("region_metadata"), dict):
+                    region_metadata = copy.deepcopy(patch_contract["region_metadata"])
+                if is_v2:
+                    diagnostics["v2_record_count"] = int(diagnostics.get("v2_record_count", 0)) + 1
+                    required_v2 = {"record_id", "frame_index", "step_index", "region_id", "canonical_region", "entity_id", "roi_before", "roi_after", "alpha_mask", "region_metadata", "transition_context_summary", "selected_render_strategy", "synthesis_mode", "execution_trace_summary", "metadata_completeness_score", "evidence_strength_score", "roi_source", "source_node_type", "mask_kind", "mask_ref_present"}
+                    missing_v2 = sorted(required_v2.difference(rec.keys()))
+                    if missing_v2:
+                        raise ValueError(f"renderer manifest v2 missing required fields: {missing_v2}")
+                    if not isinstance(region_metadata, dict) or not region_metadata:
+                        raise ValueError("renderer manifest v2 requires non-empty region_metadata")
+                    if "metadata_completeness_score" not in rec or "metadata_completeness_score" not in region_metadata:
+                        raise ValueError("renderer manifest v2 requires metadata_completeness_score")
+                elif strict and contract_version == "renderer_patch_manifest_v2":
+                    raise ValueError("manifest declares renderer_patch_manifest_v2 but record is not v2")
+                if not isinstance(region_metadata, dict):
+                    region_metadata = {"region_id": region_id, "metadata_completeness_score": 0.0, "evidence_strength_score": 0.0, "missing_fields": ["region_metadata"]}
+                metadata_completeness = cls._safe_float(rec.get("metadata_completeness_score", region_metadata.get("metadata_completeness_score", 0.0)), 0.0)
+                evidence_strength = cls._safe_float(rec.get("evidence_strength_score", region_metadata.get("evidence_strength_score", 0.0)), 0.0)
+                roi_source = str(rec.get("roi_source", region_metadata.get("roi_source", "unknown")))
+                source_node_type = str(rec.get("source_node_type", region_metadata.get("source_node_type", "unknown")))
+                mask_kind = str(rec.get("mask_kind", region_metadata.get("mask_kind", "")))
+                mask_ref_present = bool(rec.get("mask_ref_present", bool(region_metadata.get("mask_ref"))))
+                if region_metadata and metadata_completeness > 0.0:
+                    diagnostics["region_metadata_used_count"] = int(diagnostics.get("region_metadata_used_count", 0)) + 1
+                diagnostics["metadata_completeness_score_sum"] = float(diagnostics.get("metadata_completeness_score_sum", 0.0)) + metadata_completeness
+                diagnostics["evidence_strength_score_sum"] = float(diagnostics.get("evidence_strength_score_sum", 0.0)) + evidence_strength
+                for dist_key, value in (("roi_source_distribution", roi_source), ("source_node_type_distribution", source_node_type), ("mask_kind_distribution", mask_kind)):
+                    dist = diagnostics.get(dist_key, {})
+                    if isinstance(dist, dict):
+                        dist[value] = int(dist.get(value, 0)) + 1
+                if roi_source == "person_bbox_fallback":
+                    diagnostics["fallback_person_bbox_record_count"] = int(diagnostics.get("fallback_person_bbox_record_count", 0)) + 1
+
                 changed_mask = rec.get("changed_mask")
                 if changed_mask is None:
                     changed_mask = np.clip(np.mean(np.abs(a - b), axis=2, keepdims=True) * 3.0, 0.0, 1.0).tolist()
-                alpha_target = rec.get("alpha_target")
+                alpha_target = rec.get("alpha_target", rec.get("alpha_mask"))
                 if alpha_target is None:
                     alpha_target = np.clip(0.15 + 0.85 * np.asarray(changed_mask, dtype=np.float32), 0.0, 1.0).tolist()
                 blend_hint = rec.get("blend_hint")
@@ -1408,9 +1460,22 @@ class RendererDataset(BaseStageDataset):
                     "alpha_target": alpha_target,
                     "blend_hint": blend_hint,
                     "changed_mask": changed_mask,
+                    "preservation_mask": cls._as_hw1_tensor(rec["preservation_mask"], "preservation_mask") if rec.get("preservation_mask") is not None else None,
+                    "uncertainty_target": cls._as_hw1_tensor(rec["uncertainty_target"], "uncertainty_target") if rec.get("uncertainty_target") is not None else None,
+                    "seam_prior": cls._as_hw1_tensor(rec["seam_prior"], "seam_prior") if rec.get("seam_prior") is not None else None,
                     "target_source": target_source,
                     "training_target_quality": training_target_quality,
                     "target_training_role": target_training_role,
+                    "conditioning_summary": {
+                        "region_metadata_used": bool(region_metadata and metadata_completeness > 0.0),
+                        "metadata_completeness_score": metadata_completeness,
+                        "evidence_strength_score": evidence_strength,
+                        "metadata_raw_keys": [str(k) for k in region_metadata.keys() if k not in {"missing_fields", "metadata_source_trace"}],
+                        "mask_ref_present": mask_ref_present,
+                        "roi_source": roi_source,
+                        "source_node_type": source_node_type,
+                        "mask_kind": mask_kind,
+                    },
                 }
                 if supervised_quality is not None:
                     renderer_contract["supervised_quality"] = sq_copy
@@ -1432,7 +1497,23 @@ class RendererDataset(BaseStageDataset):
                         "delta_contract": rec.get("graph_delta", rec.get("delta_contract", {})),
                         "graph_transition_contract": rec.get("graph_transition_contract", {}),
                         "memory_records": rec.get("memory_records", []),
-                        "patch_synthesis_contract": rec.get("patch_synthesis_contract", {}),
+                        "patch_synthesis_contract": {**(rec.get("patch_synthesis_contract", {}) if isinstance(rec.get("patch_synthesis_contract", {}), dict) else {}), "region_metadata": region_metadata},
+                        "region_metadata": region_metadata,
+                        "transition_context_summary": rec.get("transition_context_summary", rec.get("transition_context", {})),
+                        "selected_render_strategy": rec.get("selected_render_strategy", "unknown"),
+                        "synthesis_mode": rec.get("synthesis_mode", "unknown"),
+                        "execution_trace_summary": rec.get("execution_trace_summary", {}),
+                        "metadata_completeness_score": metadata_completeness,
+                        "evidence_strength_score": evidence_strength,
+                        "roi_source": roi_source,
+                        "source_node_type": source_node_type,
+                        "mask_kind": mask_kind,
+                        "mask_ref_present": mask_ref_present,
+                        "canonical_region": rec.get("canonical_region", region_metadata.get("canonical_region", "")),
+                        "entity_id": rec.get("entity_id", region_metadata.get("entity_id", "unknown")),
+                        "record_id": rec.get("record_id", f"legacy_renderer_{idx}"),
+                        "frame_index": int(rec.get("frame_index", 0) or 0),
+                        "step_index": int(rec.get("step_index", -1) if rec.get("step_index") is not None else -1),
                     }
                 if supervised_quality is not None:
                     sample["supervised_quality"] = sq_copy
@@ -1467,6 +1548,9 @@ class RendererDataset(BaseStageDataset):
         sq_present = int(diagnostics.get("supervised_quality_present_count", 0) or 0)
         diagnostics["supervised_quality_avg_changed_ratio"] = round(float(diagnostics.get("_supervised_quality_changed_ratio_sum", 0.0) or 0.0) / max(1.0, float(sq_present)), 6)
         diagnostics["supervised_quality_avg_mean_abs_delta"] = round(float(diagnostics.get("_supervised_quality_mean_abs_delta_sum", 0.0) or 0.0) / max(1.0, float(sq_present)), 6)
+        diagnostics["percent_records_with_region_metadata_used"] = round(float(diagnostics.get("region_metadata_used_count", 0) or 0) / max(1.0, float(loaded)), 6)
+        diagnostics["average_metadata_completeness_score"] = round(float(diagnostics.get("metadata_completeness_score_sum", 0.0) or 0.0) / max(1.0, float(loaded)), 6)
+        diagnostics["average_evidence_strength_score"] = round(float(diagnostics.get("evidence_strength_score_sum", 0.0) or 0.0) / max(1.0, float(loaded)), 6)
         diagnostics.pop("_supervised_quality_changed_ratio_sum", None)
         diagnostics.pop("_supervised_quality_mean_abs_delta_sum", None)
         warnings = diagnostics.get("warnings")
@@ -1484,6 +1568,51 @@ class RendererDataset(BaseStageDataset):
         ds = cls(samples=samples)
         ds.diagnostics = diagnostics
         return ds
+
+    @staticmethod
+    def _safe_float(value: object, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
+
+    @staticmethod
+    def _bbox_xywh_to_bbox(value: object) -> BBox:
+        if isinstance(value, dict):
+            missing = [key for key in ("x", "y", "w", "h") if key not in value]
+            if missing:
+                raise ValueError(f"bbox_xywh dict missing keys: {missing}")
+            return BBox(float(value["x"]), float(value["y"]), float(value["w"]), float(value["h"]))
+        if isinstance(value, (list, tuple)) and len(value) >= 4:
+            return BBox(float(value[0]), float(value[1]), float(value[2]), float(value[3]))
+        raise ValueError("bbox_xywh must be a dict with x/y/w/h or a 4-item list/tuple")
+
+    @staticmethod
+    def sample_to_patch_request(sample: TrainingSample) -> PatchSynthesisRequest:
+        """Reconstruct a PatchSynthesisRequest-compatible object from a manifest sample."""
+
+        metadata = sample.get("region_metadata", {}) if isinstance(sample.get("region_metadata", {}), dict) else {}
+        region_id = str(sample.get("region_id", metadata.get("region_id", "unknown:region")))
+        bbox_raw = metadata.get("bbox_xywh", sample.get("canonical_region_bbox_xywh", [0.2, 0.2, 0.4, 0.4]))
+        try:
+            bbox = RendererDataset._bbox_xywh_to_bbox(bbox_raw)
+        except (TypeError, ValueError, OverflowError):
+            bbox = BBox(0.2, 0.2, 0.4, 0.4)
+        roi_pairs = sample.get("roi_pairs") or []
+        before = roi_pairs[0][0] if roi_pairs else (sample.get("frames", [[[]]])[0])
+        transition_context = sample.get("transition_context_summary", {}) if isinstance(sample.get("transition_context_summary", {}), dict) else {}
+        contract = sample.get("renderer_batch_contract", {}) if isinstance(sample.get("renderer_batch_contract", {}), dict) else {}
+        if contract:
+            transition_context = dict(transition_context, renderer_batch_contract=contract)
+        return PatchSynthesisRequest(
+            region=RegionRef(region_id=region_id, bbox=bbox, reason=str(metadata.get("roi_reason", sample.get("source", "manifest_renderer_record")))),
+            scene_state=SceneGraph(frame_index=int(sample.get("frame_index", 0) or 0)),
+            memory_summary={},
+            transition_context=transition_context,
+            retrieval_summary=sample.get("memory_retrieval_evidence", {}) if isinstance(sample.get("memory_retrieval_evidence", {}), dict) else {},
+            current_frame=before,
+            region_metadata=dict(metadata),
+        )
 
     @classmethod
     def synthetic(cls, size: int) -> "RendererDataset":
