@@ -165,6 +165,7 @@ def patch_io_to_contract(request: PatchSynthesisRequest, output: PatchSynthesisO
         hidden_state=request.memory_channels.get("hidden_regions", {}),
         synthesis_mode=str(output.execution_trace.get("synthesis_mode", "deterministic")),
         transition_context=request.transition_context,
+        region_metadata=request.region_metadata,
     )
 
 
@@ -270,6 +271,19 @@ def semantic_parity_checks(
         patch_obj = getattr(output, "rgb_patch", None)
         if patch_obj and selected_render_strategy.strip() in {"", "unknown"}:
             _push(issues, "warnings", "selected_render_strategy_missing_for_non_empty_patch")
+        region_metadata = contract.get("region_metadata", {}) if isinstance(contract, dict) else {}
+        if not isinstance(region_metadata, dict) or not region_metadata:
+            _push(issues, "errors", "region_metadata_missing")
+        else:
+            completeness = region_metadata.get("metadata_completeness_score")
+            if not isinstance(completeness, (int, float)):
+                _push(issues, "warnings", "region_metadata_completeness_missing")
+            elif float(completeness) <= 0.0:
+                _push(issues, "warnings", "region_metadata_low_completeness")
+            if not region_metadata.get("roi_source"):
+                _push(issues, "warnings", "region_metadata_roi_source_missing")
+            if not region_metadata.get("source_node_type"):
+                _push(issues, "warnings", "region_metadata_source_node_type_missing")
         if isinstance(request, PatchSynthesisRequest) and request.memory_channels.get("identity") and not request.identity_embedding:
             _push(issues, "warnings", "identity_channel_requested_but_embedding_empty")
     if stage == "temporal":

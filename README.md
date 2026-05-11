@@ -240,3 +240,23 @@ Benchmark report теперь содержит:
 - coverage по scenario families,
 - missing/invalid dataset diagnostics,
 - regression-oriented warnings и comparison deltas между `learned_primary` и `legacy`.
+
+## Region Metadata Bridge
+
+`PatchSynthesisRequest` now carries a structured `region_metadata` bridge so the renderer is conditioned on semantic evidence rather than only a `RegionRef` and broad transition context. The bridge is learned-ready contract data, not a claim of final image-quality improvement.
+
+Flow:
+
+```text
+Perception masks/parser stats → SceneGraph canonical/body/garment nodes → SemanticROI reason/bbox → RegionRouter decision → runtime.region_metadata.build_region_metadata → PatchSynthesisRequest.region_metadata → trainable patch renderer conditioning + debug/audit traces
+```
+
+The metadata contract includes:
+
+- core ROI identity: `region_id`, `entity_id`, `canonical_region`, normalized `bbox_xywh`, `roi_reason`, and `roi_source` (`parser_mask_bbox`, `body_part_keypoints`, `garment_coverage`, `person_bbox_fallback`, or `unknown`);
+- graph source evidence: `source_node_type`, source node id/confidence/provenance, visibility/lifecycle, parser class, alternatives, and canonical region hints;
+- mask evidence from `DEFAULT_MASK_STORE`: `mask_ref`, kind/confidence/source/backend, pixel count, bbox, frame size, and tags;
+- routing/memory/transition evidence: route decision, renderer mode/reveal hints, synthesis requirement, memory reuse/reveal reliability, lifecycle, newly revealed/occluded flags, and semantic reasons;
+- diagnostics: `metadata_completeness_score`, `evidence_strength_score`, `missing_fields`, `metadata_source_trace`, and `parse_error` for malformed region ids.
+
+Runtime patch debug records expose a compact summary (`region_metadata_completeness_score`, source node type, mask kind, ROI source, missing fields, source trace), while `PatchSynthesisOutput.execution_trace` records whether metadata was used and which metadata-derived feature keys affected conditioning. Fallback ROIs remain valid, but they carry lower completeness and explicit missing mask evidence instead of silently pretending to be parser-derived regions.

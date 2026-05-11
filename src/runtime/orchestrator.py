@@ -27,6 +27,7 @@ from rendering.roi_renderer import ROISelector, RenderedPatch
 from representation.graph_builder import SceneGraphBuilder
 from representation.learned_bridge import summarize_memory
 from runtime.profiles import PROFILES, RuntimeProfile
+from runtime.region_metadata import build_region_metadata
 from runtime.region_routing import CanonicalRegionRouter
 from text.intent_parser import IntentParser
 from utils_tensor import shape, zeros
@@ -274,6 +275,13 @@ class GennadyEngine:
                     region_entity_id = entity_id
                     canonical_region = region.region_id
                 region_memory_bundle = self.memory_manager.get_region_memory_bundle(memory, region_entity_id, canonical_region)
+                region_metadata = build_region_metadata(
+                    scene_graph=scene_graph,
+                    memory=memory,
+                    region=region,
+                    route_decision=region_route,
+                    delta=delta,
+                )
                 transition_metadata = transition_output.metadata if isinstance(transition_output.metadata, dict) else {}
                 learned_temporal_contract = transition_metadata.get("temporal_transition_contract", {})
                 learned_human_state_contract = transition_metadata.get("human_state_contract", {})
@@ -316,6 +324,7 @@ class GennadyEngine:
                     memory_channels=patch_channels,
                     graph_encoding=graph_encoding,
                     identity_embedding=identity_embedding,
+                    region_metadata=region_metadata,
                 )
                 patch_out = self.backends.patch_backend.synthesize_patch(patch_request)
                 patch_contract_validation = self._validate_patch_output_contract(patch_out, expected_region_id=region.region_id)
@@ -388,6 +397,13 @@ class GennadyEngine:
                         "synthesis_mode": synth_mode,
                         "retrieval_summary": str(patch_request.retrieval_summary)[:120],
                         "learned_ready": patch_out.metadata.get("learned_ready_usage", {}),
+                        "region_metadata_completeness_score": region_metadata.get("metadata_completeness_score", 0.0),
+                        "region_metadata_evidence_strength_score": region_metadata.get("evidence_strength_score", 0.0),
+                        "region_metadata_source_node_type": region_metadata.get("source_node_type", "unknown"),
+                        "region_metadata_mask_kind": region_metadata.get("mask_kind", ""),
+                        "region_metadata_roi_source": region_metadata.get("roi_source", "unknown"),
+                        "region_metadata_missing_fields": region_metadata.get("missing_fields", []),
+                        "region_metadata_source_trace": region_metadata.get("metadata_source_trace", []),
                         "hidden_reconstruction": {
                             "patch_hidden_reconstruction_case": patch_hidden_case,
                             "strategy": strategy,

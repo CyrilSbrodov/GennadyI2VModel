@@ -222,6 +222,8 @@ def _store_mask(
     roi_bbox: tuple[float, float, float, float] | None = None,
     frame_size: tuple[int, int] | None = None,
     person_id: str | None = None,
+    parser_class_name: str | None = None,
+    class_id: int | None = None,
 ) -> str | None:
     try:
         arr = _safe_array(mask)
@@ -238,7 +240,12 @@ def _store_mask(
             roi_bbox=roi_bbox,
             frame_size=frame_size,
             tags=[f"person:{person_id}"] if person_id else [],
-            extra={"pixel_count": pixel_count, "bbox_xyxy": bbox_xyxy},
+            extra={
+                "pixel_count": pixel_count,
+                "bbox_xyxy": bbox_xyxy,
+                **({"parser_class_name": parser_class_name} if parser_class_name else {}),
+                **({"class_id": class_id} if class_id is not None else {}),
+            },
         )
     except Exception:
         return None
@@ -641,6 +648,8 @@ class ParserFusionEngine:
                 roi_bbox=parser_roi,
                 frame_size=frame_size,
                 person_id=person.detection_id,
+                parser_class_name=part,
+                class_id=pascal.class_ids.get(part, fashn.class_ids.get(part)),
             )
             if ref is None:
                 continue
@@ -690,6 +699,8 @@ class ParserFusionEngine:
                     roi_bbox=parser_roi,
                     frame_size=frame_size,
                     person_id=person.detection_id,
+                    parser_class_name=g,
+                    class_id=out.class_ids.get(g),
                 )
                 pixel_count, bbox_xyxy = _mask_stats(mask, roi_bbox=parser_roi)
                 target = garment_targets.get(mapping.canonical_region_type, "upper_torso")
@@ -732,6 +743,8 @@ class ParserFusionEngine:
                     roi_bbox=(person.bbox.x, person.bbox.y, person.bbox.w, person.bbox.h),
                     frame_size=frame_size,
                     person_id=person.detection_id,
+                    parser_class_name=acc,
+                    class_id=fashn.class_ids.get(acc),
                 )
                 if ref:
                     enriched.accessory_masks[acc] = ref
@@ -775,6 +788,8 @@ class ParserFusionEngine:
                 roi_bbox=(person.bbox.x, person.bbox.y, person.bbox.w, person.bbox.h),
                 frame_size=frame_size,
                 person_id=person.detection_id,
+                parser_class_name=region,
+                class_id=face_source.class_ids.get(region),
             )
             if ref is None:
                 continue
