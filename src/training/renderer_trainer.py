@@ -24,7 +24,9 @@ from rendering.trainable_patch_renderer import (
     TemporalLocalPatchModel,
     TrainableLocalPatchModel,
     apply_memory_bundle_conditioning_to_vectors,
+    apply_region_metadata_conditioning_to_vectors,
     extract_memory_bundle_conditioning_from_context,
+    extract_region_metadata_conditioning_from_metadata,
 )
 from training.rollout_eval import evaluate_rollout_modes_on_video_manifest
 from rendering.target_provenance_policy import classify_target_training_role, target_quality_warning, target_supervision_summary
@@ -162,6 +164,9 @@ class RendererBatchAdapter:
         graph_cond = self._vector_to_size(contract.get("graph_cond", [0.0] * GRAPH_DIM), GRAPH_DIM)
         memory_cond = self._vector_to_size(contract.get("memory_cond", [0.0] * MEMORY_DIM), MEMORY_DIM)
         appearance_cond = self._vector_to_size(contract.get("appearance_cond", np.concatenate([np.mean(b, axis=(0, 1)), np.std(b, axis=(0, 1))]).tolist()), APPEARANCE_DIM)
+        region_metadata = sample.get("region_metadata", {}) if isinstance(sample.get("region_metadata", {}), dict) else {}
+        metadata_cond = extract_region_metadata_conditioning_from_metadata(region_metadata)
+        memory_cond, appearance_cond = apply_region_metadata_conditioning_to_vectors(memory_cond, appearance_cond, region_metadata)
         raw_bundle = contract.get("region_memory_bundle_serialized", {}) if isinstance(contract.get("region_memory_bundle_serialized", {}), dict) else {}
         bundle_cond = extract_memory_bundle_conditioning_from_context({"region_memory_bundle_serialized": raw_bundle})
         memory_cond, appearance_cond = apply_memory_bundle_conditioning_to_vectors(
@@ -178,6 +183,9 @@ class RendererBatchAdapter:
             changed_mask = np.mean(changed_mask, axis=2, keepdims=True)
         blend_hint = np.asarray(contract.get("blend_hint", changed_mask.tolist()), dtype=np.float32)
         alpha_target = np.asarray(contract.get("alpha_target", np.clip(0.2 + 0.8 * changed_mask, 0.0, 1.0).tolist()), dtype=np.float32)
+        preservation_mask = np.asarray(contract.get("preservation_mask"), dtype=np.float32) if contract.get("preservation_mask") is not None else None
+        uncertainty_target = np.asarray(contract.get("uncertainty_target"), dtype=np.float32) if contract.get("uncertainty_target") is not None else None
+        seam_prior = np.asarray(contract.get("seam_prior"), dtype=np.float32) if contract.get("seam_prior") is not None else None
         if blend_hint.ndim == 2:
             blend_hint = blend_hint[..., None]
         if alpha_target.ndim == 2:
@@ -220,6 +228,19 @@ class RendererBatchAdapter:
         }
         extra_summary = contract.get("conditioning_summary", {}) if isinstance(contract.get("conditioning_summary", {}), dict) else {}
         conditioning_summary.update(extra_summary)
+        if region_metadata:
+            conditioning_summary.update(
+                {
+                    "region_metadata_used": bool(metadata_cond.get("region_metadata_used", False)),
+                    "metadata_completeness_score": float(metadata_cond.get("metadata_completeness_score", 0.0) or 0.0),
+                    "evidence_strength_score": float(metadata_cond.get("evidence_strength_score", 0.0) or 0.0),
+                    "metadata_active_feature_keys": list(metadata_cond.get("metadata_feature_keys", [])) if isinstance(metadata_cond.get("metadata_feature_keys", []), list) else [],
+                    "mask_ref_present": bool(metadata_cond.get("mask_ref_present", False)),
+                    "roi_source": str(metadata_cond.get("roi_source", "unknown")),
+                    "source_node_type": str(metadata_cond.get("source_node_type", "unknown")),
+                    "mask_kind": str(metadata_cond.get("mask_kind", "")),
+                }
+            )
         conditioning_summary.update(provenance_summary)
         conditioning_summary.update(target_role_summary)
         return PatchBatch(
@@ -236,6 +257,9 @@ class RendererBatchAdapter:
             appearance_cond=appearance_cond,
             bbox_cond=bbox_cond,
             conditioning_summary=conditioning_summary,
+            preservation_mask=preservation_mask,
+            uncertainty_target=uncertainty_target,
+            seam_prior=seam_prior,
             previous_roi=prev_np if temporal_mode else None,
             predicted_family=selected.predicted_family,
             predicted_phase=selected.predicted_phase,
@@ -424,6 +448,13 @@ class RendererTrainer:
         target_bootstrap_self_generated = 0.0
         target_weak_unknown = 0.0
         target_weight_sum = 0.0
+        region_metadata_used = 0.0
+        metadata_completeness_sum = 0.0
+        evidence_strength_sum = 0.0
+        roi_source_distribution: dict[str, int] = {}
+        source_node_type_distribution: dict[str, int] = {}
+        mask_kind_distribution: dict[str, int] = {}
+        fallback_person_bbox_records = 0
         for b, e in zip(batches, eval_entries):
             sample_mae = float(e.get("mae", e.get("total_loss", 1.0)))
             if b.semantic_embed[0] > 0.5:
@@ -449,6 +480,17 @@ class RendererTrainer:
             target_bootstrap_self_generated += 1.0 if target_role == "bootstrap_self_generated" else 0.0
             target_weak_unknown += 1.0 if target_role == "weak_unknown" else 0.0
             target_weight_sum += float(summary.get("target_supervision_weight", 0.6))
+            region_metadata_used += 1.0 if bool(summary.get("region_metadata_used", False)) else 0.0
+            metadata_completeness_sum += float(summary.get("metadata_completeness_score", 0.0) or 0.0)
+            evidence_strength_sum += float(summary.get("evidence_strength_score", 0.0) or 0.0)
+            roi_source = str(summary.get("roi_source", "unknown"))
+            source_node_type = str(summary.get("source_node_type", "unknown"))
+            mask_kind = str(summary.get("mask_kind", ""))
+            roi_source_distribution[roi_source] = roi_source_distribution.get(roi_source, 0) + 1
+            source_node_type_distribution[source_node_type] = source_node_type_distribution.get(source_node_type, 0) + 1
+            mask_kind_distribution[mask_kind] = mask_kind_distribution.get(mask_kind, 0) + 1
+            if roi_source == "person_bbox_fallback":
+                fallback_person_bbox_records += 1
         memory_bundle_present = 0.0
         memory_support_known = 0.0
         memory_support_strong = 0.0
@@ -503,6 +545,13 @@ class RendererTrainer:
             "target_bootstrap_self_generated_ratio": float(target_bootstrap_self_generated / len(batches)),
             "target_weak_unknown_ratio": float(target_weak_unknown / len(batches)),
             "avg_target_supervision_weight": float(target_weight_sum / len(batches)),
+            "percent_records_with_region_metadata_used": float(region_metadata_used / len(batches)),
+            "average_metadata_completeness_score": float(metadata_completeness_sum / len(batches)),
+            "average_evidence_strength_score": float(evidence_strength_sum / len(batches)),
+            "roi_source_distribution": roi_source_distribution,
+            "source_node_type_distribution": source_node_type_distribution,
+            "mask_kind_distribution": mask_kind_distribution,
+            "fallback_person_bbox_record_count": float(fallback_person_bbox_records),
             "score": score,
             **temporal_eval,
         }
@@ -606,6 +655,9 @@ class RendererTrainer:
                 "runtime_loadable": 1.0,
                 "torch_backend_used": 1.0 if isinstance(self.model, TorchLocalPatchGenerator) else 0.0,
                 "target_role_policy_compatibility_fallback": 1.0 if bool(self.dataset_diagnostics.get("target_role_policy_compatibility_fallback", False)) else 0.0,
+                "percent_records_with_region_metadata_used": float(sum(1.0 for b in train_batches if bool((b.conditioning_summary or {}).get("region_metadata_used", False))) / max(1, len(train_batches))),
+                "average_metadata_completeness_score": float(sum(float((b.conditioning_summary or {}).get("metadata_completeness_score", 0.0) or 0.0) for b in train_batches) / max(1, len(train_batches))),
+                "average_evidence_strength_score": float(sum(float((b.conditioning_summary or {}).get("evidence_strength_score", 0.0) or 0.0) for b in train_batches) / max(1, len(train_batches))),
             }
             last_val = eval_metrics
             last_val["contract_conditioning_mode"] = self.contract_conditioning_mode

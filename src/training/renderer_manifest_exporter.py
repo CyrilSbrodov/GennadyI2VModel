@@ -4,6 +4,7 @@ import json
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 
@@ -82,8 +83,16 @@ class RendererManifestRecordExporter:
             "target_source": target_source,
             "training_target_quality": training_target_quality,
         }
+        region_metadata = _region_metadata_v2(request)
+        metadata_completeness_score = _safe_float(region_metadata.get("metadata_completeness_score"), 0.0)
+        evidence_strength_score = _safe_float(region_metadata.get("evidence_strength_score"), 0.0)
+        roi_source = str(region_metadata.get("roi_source", "unknown"))
+        source_node_type = str(region_metadata.get("source_node_type", "unknown"))
+        mask_kind = str(region_metadata.get("mask_kind", ""))
+        mask_ref_present = bool(region_metadata.get("mask_ref"))
+
         patch_synthesis_contract = {
-            "region_metadata": {"region_id": request.region.region_id, "reason": request.region.reason},
+            "region_metadata": region_metadata,
             "retrieval_explanation_summary": _safe_json(request.retrieval_summary),
             "selected_render_strategy": selected_render_strategy,
             "synthesis_mode": synthesis_mode,
@@ -92,10 +101,36 @@ class RendererManifestRecordExporter:
             "training_target_quality": training_target_quality,
         }
 
+        record_id = _record_id(request, frame_index, step_index)
+        bbox = request.region.bbox
+        canonical_region = str(region_metadata.get("canonical_region", _region_type(request.region.region_id)))
+        entity_id = str(region_metadata.get("entity_id", _entity_id(request.region.region_id)))
         record: dict[str, object] = {
+            "contract_version": "renderer_patch_manifest_v2",
+            "record_id": record_id,
+            "frame_index": int(frame_index if frame_index is not None else ctx.get("frame_index", -1)),
+            "step_index": int(step_index if step_index is not None else ctx.get("step_index", -1)),
+            "region_id": request.region.region_id,
+            "canonical_region": canonical_region,
+            "entity_id": entity_id,
             "roi_before": before,
             "roi_after": after,
-            "region_id": request.region.region_id,
+            "alpha_mask": alpha_target,
+            "alpha_target": alpha_target,
+            "changed_mask": changed_mask,
+            "preservation_mask": _mask_from_contract_or_none(ctx, trace, "preservation_mask"),
+            "uncertainty_target": _mask_from_contract_or_none(ctx, trace, "uncertainty_target"),
+            "seam_prior": _mask_from_contract_or_none(ctx, trace, "seam_prior"),
+            "region_metadata": region_metadata,
+            "transition_context_summary": transition_summary,
+            "metadata_completeness_score": metadata_completeness_score,
+            "evidence_strength_score": evidence_strength_score,
+            "roi_source": roi_source,
+            "source_node_type": source_node_type,
+            "mask_kind": mask_kind,
+            "mask_ref_present": mask_ref_present,
+            "canonical_region_bbox_xywh": [float(bbox.x), float(bbox.y), float(bbox.w), float(bbox.h)],
+            "source_frame_ref": {"frame_index": int(frame_index if frame_index is not None else ctx.get("frame_index", -1)), "current_frame_shape": _shape_of(request.current_frame)},
             "semantic_family": family,
             "region_family": family,
             "source": "runtime_patch_export",
@@ -111,16 +146,15 @@ class RendererManifestRecordExporter:
             "target_source": target_source,
             "training_target_quality": training_target_quality,
             "renderer_memory_bundle": memory_bundle,
+            "memory_retrieval_evidence": _memory_summary(memory_bundle, request.retrieval_summary),
             "execution_trace_summary": execution_trace_summary,
         }
-        if step_index is not None:
-            record["step_index"] = int(step_index)
-        if frame_index is not None:
-            record["frame_index"] = int(frame_index)
         planner_selected = trace.get("planner_selected_strategy") or ctx.get("planner_selected_strategy")
         if planner_selected is not None:
             record["planner_selected_strategy"] = _safe_json(planner_selected)
-        return _safe_json(record)
+        safe = _safe_json(record)
+        validate_renderer_manifest_v2_record(safe, strict=True)
+        return safe
 
     def write_manifest(
         self,
@@ -141,7 +175,7 @@ class RendererManifestRecordExporter:
         payload = {
             "manifest_type": manifest_type,
             "source": "runtime_patch_export",
-            "contract_version": "renderer_patch_manifest.v1",
+            "contract_version": "renderer_patch_manifest_v2",
             "record_count": len(safe_records),
             "target_quality_counts": target_quality_counts,
             "contains_self_generated_targets": target_quality_counts["self_generated_runtime_target"] > 0,
@@ -381,6 +415,13 @@ def _normalize_family(value: str) -> str:
     return aliases.get(v, v)
 
 
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def _safe_json(value: Any) -> Any:
     if is_dataclass(value):
         return _safe_json(asdict(value))
@@ -397,3 +438,112 @@ def _safe_json(value: Any) -> Any:
     if hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "tolist"):
         return _safe_json(value.detach().cpu().tolist())
     return {"type": type(value).__name__, "summary": str(value)[:240]}
+
+RENDERER_PATCH_MANIFEST_V2 = "renderer_patch_manifest_v2"
+RENDERER_MANIFEST_V2_REQUIRED_FIELDS = (
+    "record_id",
+    "frame_index",
+    "step_index",
+    "region_id",
+    "canonical_region",
+    "entity_id",
+    "roi_before",
+    "roi_after",
+    "alpha_mask",
+    "region_metadata",
+    "transition_context_summary",
+    "selected_render_strategy",
+    "synthesis_mode",
+    "execution_trace_summary",
+    "metadata_completeness_score",
+    "evidence_strength_score",
+    "roi_source",
+    "source_node_type",
+    "mask_kind",
+    "mask_ref_present",
+)
+
+
+def validate_renderer_manifest_v2_record(record: dict[str, object], *, strict: bool = True) -> list[str]:
+    """Validate the non-optional v2 patch-renderer training record surface."""
+
+    issues: list[str] = []
+    if record.get("contract_version") != RENDERER_PATCH_MANIFEST_V2:
+        issues.append("contract_version must be renderer_patch_manifest_v2")
+    for field in RENDERER_MANIFEST_V2_REQUIRED_FIELDS:
+        if field not in record:
+            issues.append(f"missing required field: {field}")
+    metadata = record.get("region_metadata")
+    if not isinstance(metadata, dict) or not metadata:
+        issues.append("region_metadata must be a non-empty object")
+    elif "metadata_completeness_score" not in metadata:
+        issues.append("region_metadata.metadata_completeness_score missing")
+    if "metadata_completeness_score" not in record:
+        issues.append("metadata_completeness_score missing")
+    try:
+        json.dumps(record)
+    except TypeError as exc:
+        issues.append(f"record is not JSON serializable: {exc}")
+    if issues and strict:
+        raise ValueError("invalid renderer manifest v2 record: " + "; ".join(issues))
+    return issues
+
+
+def _region_metadata_v2(request: PatchSynthesisRequest) -> dict[str, object]:
+    metadata = dict(request.region_metadata) if isinstance(request.region_metadata, dict) and request.region_metadata else {}
+    metadata.setdefault("region_id", request.region.region_id)
+    metadata.setdefault("entity_id", _entity_id(request.region.region_id))
+    metadata.setdefault("canonical_region", _region_type(request.region.region_id))
+    metadata.setdefault("bbox_xywh", [float(request.region.bbox.x), float(request.region.bbox.y), float(request.region.bbox.w), float(request.region.bbox.h)])
+    metadata.setdefault("roi_reason", request.region.reason)
+    metadata.setdefault("roi_source", "unknown")
+    metadata.setdefault("source_node_type", "unknown")
+    metadata.setdefault("mask_kind", "")
+    metadata.setdefault("metadata_completeness_score", 0.0)
+    metadata.setdefault("evidence_strength_score", 0.0)
+    metadata.setdefault("missing_fields", ["region_metadata"] if not request.region_metadata else [])
+    return _safe_json(metadata)
+
+
+def _entity_id(region_id: str) -> str:
+    return str(region_id).split(":", 1)[0] if ":" in str(region_id) else "unknown"
+
+
+def _region_type(region_id: str) -> str:
+    return str(region_id).split(":", 1)[1] if ":" in str(region_id) else str(region_id)
+
+
+def _record_id(request: PatchSynthesisRequest, frame_index: int | None, step_index: int | None) -> str:
+    ctx = request.transition_context if isinstance(request.transition_context, dict) else {}
+    for key in ("record_id", "patch_record_id", "runtime_record_id"):
+        if ctx.get(key):
+            return str(ctx[key])
+    return f"renderer_patch:{frame_index if frame_index is not None else ctx.get('frame_index', -1)}:{step_index if step_index is not None else ctx.get('step_index', -1)}:{request.region.region_id}:{uuid4().hex[:8]}"
+
+
+def _mask_from_contract_or_none(ctx: dict[str, object], trace: dict[str, object], key: str) -> object:
+    contract = ctx.get("renderer_batch_contract") if isinstance(ctx.get("renderer_batch_contract"), dict) else {}
+    value = contract.get(key) if isinstance(contract, dict) else None
+    if value is None:
+        value = ctx.get(key, trace.get(key))
+    return _safe_json(value) if value is not None else None
+
+
+def _shape_of(value: object) -> list[int]:
+    try:
+        return [int(x) for x in np.asarray(value).shape]
+    except Exception:
+        return []
+
+
+def _memory_summary(memory_bundle: dict[str, object], retrieval_summary: object) -> dict[str, object]:
+    retrieval = retrieval_summary if isinstance(retrieval_summary, dict) else {}
+    return _safe_json(
+        {
+            "memory_support_level": str(memory_bundle.get("memory_support_level", "none")),
+            "reliable_for_reuse": bool(memory_bundle.get("reliable_for_reuse", memory_bundle.get("has_current_reuse", False))),
+            "suitable_for_reveal": bool(memory_bundle.get("suitable_for_reveal", memory_bundle.get("has_hidden_slot", False))),
+            "retrieval_reasons": memory_bundle.get("retrieval_reasons", retrieval.get("reasons", [])),
+            "retrieval_summary": retrieval,
+        }
+    )
