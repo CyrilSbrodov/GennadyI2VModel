@@ -276,8 +276,16 @@ def build_region_metadata(
     if region.region_id in memory.canonical_region_memory:
         trace.append("memory_entry:present")
     score, missing = _completeness(metadata)
+    fallback_without_mask = metadata.get("roi_source") == "person_bbox_fallback" and not metadata.get("mask_ref")
+    if fallback_without_mask:
+        score = min(score, 0.45)
+        if "mask_ref" not in missing:
+            missing.append("mask_ref")
     metadata["metadata_completeness_score"] = score
-    metadata["evidence_strength_score"] = _evidence_strength(metadata)
+    evidence_score = _evidence_strength(metadata)
+    if fallback_without_mask:
+        evidence_score = min(evidence_score, 0.15)
+    metadata["evidence_strength_score"] = evidence_score
     metadata["missing_fields"] = missing
     metadata["metadata_source_trace"] = trace
     return metadata

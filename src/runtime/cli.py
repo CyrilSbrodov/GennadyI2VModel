@@ -18,6 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow runtime to continue with normal patch backend creation if the requested patch checkpoint cannot be loaded.",
     )
     parser.add_argument("--prompt", default="Снимает пальто и садится на стул. Улыбается.", help="Text prompt for the demo run.")
+    parser.add_argument("--export-renderer-manifest-path", default=None, help="Write renderer_patch_manifest_v2 training records from the runtime patch loop.")
     parser.add_argument("inputs", nargs="*", default=["ref_0001.png"], help="Input frame paths for the demo run.")
     return parser
 
@@ -34,7 +35,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     engine = GennadyEngine(backend_config=backend_config_from_args(args))
-    result = engine.run(list(args.inputs), args.prompt)
+    result = engine.run(list(args.inputs), args.prompt, export_renderer_manifest_path=args.export_renderer_manifest_path)
     print(json.dumps({"frames": len(result.frames), "state_steps": len(result.state_plan.steps)}, ensure_ascii=False))
     return 0
 
