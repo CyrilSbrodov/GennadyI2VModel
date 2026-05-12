@@ -253,6 +253,120 @@ def test_build_patch_batch_memory_cond_uses_strong_identity_reference() -> None:
     assert with_bundle.conditioning_summary["memory_bundle_has_identity_reference"] is True
 
 
+def test_strong_observed_identity_reference_affects_patch_batch_conditioning() -> None:
+    req = _request("p1:face", mode="expression_refine")
+    roi = _roi_from_request(req)
+    base = build_patch_batch(req, roi)
+    req.transition_context["region_memory_bundle_serialized"] = {
+        "memory_bundle_present": True,
+        "memory_support_level": "strong",
+        "has_identity_reference": True,
+        "has_appearance_reference": True,
+        "has_garment_reference": False,
+        "has_current_reuse": False,
+        "retrieval_reasons": ["identity_reference_available", "identity_reference_observed_strong"],
+    }
+
+    with_identity = build_patch_batch(req, roi)
+
+    assert with_identity.conditioning_summary["identity_reference_used"] is True
+    assert with_identity.conditioning_summary["identity_reference_strength"] >= 0.9
+    assert with_identity.conditioning_summary["identity_reference_source"] == "observed_strong"
+    assert with_identity.conditioning_summary["identity_preservation_bias"] >= 0.9
+    assert not np.allclose(base.memory_cond, with_identity.memory_cond)
+    assert not np.allclose(base.appearance_cond, with_identity.appearance_cond)
+    assert float(np.mean(with_identity.preservation_mask)) > float(np.mean(base.preservation_mask))
+
+
+def test_generated_identity_reference_is_blocked_for_renderer_conditioning() -> None:
+    req = _request("p1:face", mode="expression_refine")
+    roi = _roi_from_request(req)
+    base = build_patch_batch(req, roi)
+    req.transition_context["region_memory_bundle_serialized"] = {
+        "memory_bundle_present": True,
+        "memory_support_level": "strong",
+        "has_identity_reference": False,
+        "has_appearance_reference": False,
+        "retrieval_reasons": ["identity_reference_blocked_generated"],
+    }
+
+    blocked = build_patch_batch(req, roi)
+
+    assert blocked.conditioning_summary["identity_reference_used"] is False
+    assert blocked.conditioning_summary["identity_reference_blocked"] is True
+    assert blocked.conditioning_summary["identity_reference_source"] == "blocked_generated"
+    assert blocked.conditioning_summary["identity_reference_strength"] == 0.0
+    assert "identity_reference_blocked_generated" in blocked.conditioning_summary["identity_reference_block_reasons"]
+    assert blocked.memory_cond[2] < 0.9
+    assert blocked.memory_cond[8] < 1.0
+    assert float(np.mean(blocked.preservation_mask)) == float(np.mean(base.preservation_mask))
+
+
+def test_low_evidence_newly_revealed_identity_reference_is_blocked() -> None:
+    req = _request("p1:face", mode="expression_refine")
+    req.transition_context["region_memory_bundle_serialized"] = {
+        "memory_bundle_present": True,
+        "memory_support_level": "weak",
+        "has_identity_reference": False,
+        "has_hidden_slot": True,
+        "hidden_slot": {"hidden_type": "newly_revealed"},
+        "reveal_lifecycle": "newly_revealed",
+        "retrieval_reasons": ["newly_revealed", "identity_reference_blocked_low_evidence"],
+    }
+
+    blocked = build_patch_batch(req, _roi_from_request(req))
+
+    assert blocked.conditioning_summary["identity_reference_used"] is False
+    assert blocked.conditioning_summary["identity_reference_blocked"] is True
+    assert blocked.conditioning_summary["identity_reference_source"] == "blocked_low_evidence"
+    assert blocked.conditioning_summary["identity_reference_strength"] == 0.0
+    assert "identity_reference_blocked_low_evidence" in blocked.conditioning_summary["identity_reference_block_reasons"]
+
+
+def test_output_execution_trace_exposes_identity_reference_usage() -> None:
+    backend = TrainablePatchSynthesisModel()
+    req = _request("p1:face", mode="expression_refine")
+    req.transition_context["region_memory_bundle_serialized"] = {
+        "memory_bundle_present": True,
+        "memory_support_level": "strong",
+        "has_identity_reference": True,
+        "has_appearance_reference": True,
+        "retrieval_reasons": ["identity_reference_available", "identity_reference_observed_strong"],
+    }
+
+    out = backend.synthesize_patch(req)
+
+    assert out.execution_trace["identity_reference_used"] is True
+    assert out.execution_trace["identity_reference_strength"] >= 0.9
+    assert out.execution_trace["identity_reference_source"] == "observed_strong"
+    assert out.execution_trace["identity_preservation_bias"] >= 0.9
+    assert out.execution_trace["memory_bundle_present"] is True
+    assert out.execution_trace["memory_support_level"] == "strong"
+    assert out.metadata["identity_reference_used"] is True
+
+
+def test_garment_region_does_not_get_face_identity_boost() -> None:
+    req = _request("p1:outer_garment", mode="garment_surface")
+    roi = _roi_from_request(req)
+    base = build_patch_batch(req, roi)
+    req.transition_context["region_memory_bundle_serialized"] = {
+        "memory_bundle_present": True,
+        "memory_support_level": "strong",
+        "has_identity_reference": False,
+        "has_appearance_reference": True,
+        "has_garment_reference": True,
+        "retrieval_reasons": ["garment_reference_available"],
+    }
+
+    garment = build_patch_batch(req, roi)
+
+    assert garment.conditioning_summary["identity_reference_used"] is False
+    assert garment.conditioning_summary["identity_reference_strength"] == 0.0
+    assert garment.conditioning_summary["identity_preservation_bias"] == 0.0
+    assert garment.conditioning_summary["memory_bundle_has_garment_reference"] is True
+    assert not np.allclose(base.memory_cond, garment.memory_cond)
+    assert not np.allclose(base.appearance_cond, garment.appearance_cond)
+
 def test_build_patch_batch_revealed_history_not_active_hidden() -> None:
     req = _request("p1:face", mode="expression_refine")
     req.transition_context["region_memory_bundle"] = RegionMemoryBundle(
