@@ -283,3 +283,39 @@ pytest tests/test_region_metadata_bridge.py
 pytest tests/test_renderer_manifest_v2.py
 pytest tests/test_real_human_parsing_integration.py
 ```
+
+### Supervised renderer manifests from observed frame pairs
+
+Use `training.renderer_video_manifest_builder.RendererVideoManifestBuilder` when the target is an observed video/paired-frame ROI rather than a runtime-generated patch. The builder crops `roi_before` from the source frame and `roi_after` from the observed target frame using each `RegionRef` bbox (or an explicit target bbox), then delegates serialization to `RendererManifestRecordExporter` so v2 field names and provenance stay unchanged.
+
+```python
+from core.schema import BBox, RegionRef, SceneGraph
+from training.renderer_video_manifest_builder import build_renderer_video_manifest
+
+build_renderer_video_manifest(
+    output_path="artifacts/renderer_observed_pairs.json",
+    source_frame=source_frame,  # list or np.ndarray, HxWx3
+    target_frame=target_frame,  # observed/ground-truth paired frame
+    scene_graph=SceneGraph(frame_index=0),
+    regions=[RegionRef("person_1:face", BBox(0.25, 0.20, 0.30, 0.25), "parser_mask_bbox")],
+    region_metadata={
+        "person_1:face": {
+            "roi_source": "parser_mask_bbox",
+            "source_node_type": "body_part",
+            "metadata_completeness_score": 0.9,
+            "evidence_strength_score": 0.8,
+        }
+    },
+    transition_context={"summary": "observed paired-frame expression transition"},
+    strict=True,
+)
+```
+
+Every exported observed-pair record is marked as supervised target provenance (`target_source: provided_ground_truth_roi`, `training_target_quality: external_or_observed_target`), which the existing renderer dataset policy maps to `target_training_role: supervised_external`. Missing region metadata still produces a valid low-completeness v2 record with diagnostics, while fallback `person_bbox` records remain valid but carry low metadata/evidence scores. In `strict=True`, the builder raises on the first invalid region or if no valid supervised records can be exported, rather than silently falling back to synthetic targets.
+
+Train on the resulting manifest the same way as runtime v2 exports:
+
+```bash
+PYTHONPATH=src pytest tests/test_renderer_video_manifest_builder.py
+python -m training.cli --stage renderer --epochs 1 --learned-dataset-path artifacts/renderer_observed_pairs.json
+```
