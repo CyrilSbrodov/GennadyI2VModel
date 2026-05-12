@@ -38,6 +38,40 @@ from rendering.target_provenance_policy import (
     target_role_allowed_by_policy,
 )
 
+PRIMARY_DYNAMICS_FAMILIES = {"pose_transition", "garment_transition", "interaction_transition", "expression_transition"}
+AUXILIARY_SEMANTIC_FAMILIES = {"visibility_transition"}
+
+
+def _resolve_manifest_primary_family(record: dict[str, object], family_field: str) -> tuple[str, str, list[str], dict[str, object]]:
+    manifest_family = str(record.get(family_field, "pose_transition")).strip().lower()
+    primary_raw = record.get("primary_family")
+    auxiliary_families: list[str] = []
+    metadata: dict[str, object] = {"manifest_family": manifest_family}
+
+    if manifest_family in PRIMARY_DYNAMICS_FAMILIES:
+        metadata["primary_family"] = manifest_family
+        return manifest_family, manifest_family, auxiliary_families, metadata
+
+    if manifest_family in AUXILIARY_SEMANTIC_FAMILIES:
+        if primary_raw is None or not str(primary_raw).strip():
+            raise ValueError("visibility_transition_requires_primary_family")
+        primary_family = str(primary_raw).strip().lower()
+        if primary_family not in PRIMARY_DYNAMICS_FAMILIES:
+            raise ValueError(f"primary_family must be supported primary dynamics family, got {primary_family}")
+        auxiliary_families.append(manifest_family)
+        metadata.update({"primary_family": primary_family, "auxiliary_families": auxiliary_families})
+        return primary_family, manifest_family, auxiliary_families, metadata
+
+    raise ValueError(f"{family_field} must be canonical primary or auxiliary semantic family, got {manifest_family}")
+
+
+def _attach_auxiliary_family_metadata(delta: GraphDelta, auxiliary_families: list[str], metadata: dict[str, object]) -> None:
+    for family in auxiliary_families:
+        if family not in delta.semantic_reasons:
+            delta.semantic_reasons.append(family)
+    if metadata:
+        delta.transition_diagnostics.update(metadata)
+
 
 class TrainingSample(TypedDict, total=False):
     frames: list[list]
@@ -242,9 +276,8 @@ class DynamicsDataset(BaseStageDataset):
                 )
                 if not (delta.pose_deltas or delta.garment_deltas or delta.visibility_deltas or delta.expression_deltas or delta.interaction_deltas):
                     raise ValueError("graph_delta_target requires at least one delta group")
-                family = str(rec.get("transition_family", "pose_transition"))
-                if family not in cls.CANONICAL_FAMILIES:
-                    raise ValueError(f"transition_family must be canonical, got {family}")
+                family, manifest_family, auxiliary_families, family_metadata = _resolve_manifest_primary_family(rec, "transition_family")
+                _attach_auxiliary_family_metadata(delta, auxiliary_families, family_metadata)
                 planner_context = rec.get("planner_context", {}) if isinstance(rec.get("planner_context", {}), dict) else {}
                 phase = str(rec.get("phase_estimate", planner_context.get("phase", delta.transition_phase)))
                 if phase not in cls.CANONICAL_PHASES:
@@ -306,7 +339,7 @@ class DynamicsDataset(BaseStageDataset):
                             },
                             "target_transition_context": rec.get("target_transition_context", {}) if isinstance(rec.get("target_transition_context"), dict) else {},
                             "memory_context": rec.get("memory_context", {}) if isinstance(rec.get("memory_context"), dict) else {},
-                            "metadata": {"record_id": rec.get("record_id", f"video_transition_{idx}"), "transition_family": family, "target_profile": target_profile},
+                            "metadata": {"record_id": rec.get("record_id", f"video_transition_{idx}"), "transition_family": family, "manifest_family": manifest_family, "primary_family": family, "auxiliary_families": auxiliary_families, "target_profile": target_profile},
                         },
                     }
                 )
@@ -439,9 +472,7 @@ class DynamicsDataset(BaseStageDataset):
                 if supervision_mode not in {"explicit", "derived"}:
                     raise ValueError(f"supervision_mode must be explicit|derived, got {supervision_mode}")
 
-                family = str(rec["family"]).strip().lower()
-                if family not in {"pose_transition", "garment_transition", "interaction_transition", "expression_transition"}:
-                    raise ValueError(f"family must be canonical, got {family}")
+                family, manifest_family, auxiliary_families, family_metadata = _resolve_manifest_primary_family(rec, "family")
                 phase = str(rec["phase"]).strip().lower()
                 if phase not in cls.CANONICAL_PHASES:
                     raise ValueError(f"phase must be canonical, got {phase}")
@@ -498,6 +529,7 @@ class DynamicsDataset(BaseStageDataset):
                 )
                 delta.newly_revealed_regions = [RegionRef(region_id=str(x), bbox=BBox(0.0, 0.0, 1.0, 1.0), reason="manifest") for x in rec.get("newly_revealed_regions", []) if isinstance(x, str)]
                 delta.newly_occluded_regions = [RegionRef(region_id=str(x), bbox=BBox(0.0, 0.0, 1.0, 1.0), reason="manifest") for x in rec.get("newly_occluded_regions", []) if isinstance(x, str)]
+                _attach_auxiliary_family_metadata(delta, auxiliary_families, family_metadata)
                 if not delta.affected_regions:
                     raise ValueError("affected_regions must be provided")
                 if not delta.region_transition_mode:
@@ -557,6 +589,9 @@ class DynamicsDataset(BaseStageDataset):
                         "record_id": rec.get("sample_id", rec.get("record_id", f"record_{idx}")),
                         "video_id": rec.get("video_id"),
                         "transition_family": family,
+                        "manifest_family": manifest_family,
+                        "primary_family": family,
+                        "auxiliary_families": auxiliary_families,
                         "transition_mode": transition_mode,
                         "target_profile": target_profile,
                         "supervision_mode": supervision_mode,
