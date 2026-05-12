@@ -3,6 +3,18 @@ from __future__ import annotations
 from core.region_ids import parse_region_id
 from core.schema import GraphDelta, SceneGraph
 
+_CANONICAL_GARMENT_TYPES = {
+    "outer_garment",
+    "upper_garment",
+    "lower_garment",
+    "inner_garment",
+    "accessories",
+}
+
+_GENERIC_GARMENT_REGION = "garments"
+
+_UPRIGHT_POSE_STATES = {"upright_pose", "standing", "standing_stabilization"}
+
 _KNOWN_CANONICAL_REGIONS = {
     "head",
     "face",
@@ -137,22 +149,74 @@ def _apply_garment_visibility(person, key: str, visibility: str) -> None:
             garment.visibility = visibility
 
 
+def _contact_signal(delta: GraphDelta) -> tuple[str | None, float]:
+    if "support_contact" in delta.interaction_deltas:
+        return "support_contact", float(delta.interaction_deltas["support_contact"])
+    if "chair_contact" in delta.interaction_deltas:
+        return "chair_contact", float(delta.interaction_deltas["chair_contact"])
+    return None, 0.0
+
+
+def _explicit_upright_transition(delta: GraphDelta) -> bool:
+    return any(str(value) in _UPRIGHT_POSE_STATES for value in delta.state_after.values())
+
+
+def _apply_pose_delta(person, delta: GraphDelta) -> None:
+    person.pose_state.coarse_pose = "transition"
+    contact_key, contact_value = _contact_signal(delta)
+    if contact_key == "support_contact":
+        if contact_value >= 0.65:
+            person.pose_state.coarse_pose = "seated"
+        elif contact_value <= 0.25 and _explicit_upright_transition(delta):
+            person.pose_state.coarse_pose = "standing"
+    elif contact_key == "chair_contact":
+        if contact_value > 0.5:
+            person.pose_state.coarse_pose = "seated"
+        elif contact_value < 0.3:
+            person.pose_state.coarse_pose = "standing"
+
+
+def _garment_mode_targets_region(delta: GraphDelta, person_id: str, garment_type: str) -> bool:
+    for key, mode in delta.region_transition_mode.items():
+        if "garment" not in str(mode):
+            continue
+        canonical_name = _canonical_from_key(person_id, key)
+        if canonical_name in {garment_type, _GENERIC_GARMENT_REGION}:
+            return True
+    return False
+
+
+def _garment_transition_targets(garment, person, delta: GraphDelta) -> bool:
+    if garment.garment_type not in _CANONICAL_GARMENT_TYPES:
+        return False
+    for region in delta.affected_regions:
+        canonical_name = _canonical_from_key(person.person_id, region)
+        if region == garment.garment_id or canonical_name == garment.garment_type:
+            return True
+        if canonical_name == _GENERIC_GARMENT_REGION:
+            return True
+    return _garment_mode_targets_region(delta, person.person_id, garment.garment_type)
+
+
+def _apply_garment_state_delta(person, delta: GraphDelta) -> None:
+    garment_progression = delta.garment_deltas.get("garment_progression")
+    for garment in person.garments:
+        if garment.garment_type == "coat" and "coat_state" in delta.garment_deltas:
+            garment.garment_state = str(delta.garment_deltas["coat_state"])
+        if garment_progression is not None and _garment_transition_targets(garment, person, delta):
+            garment.garment_state = str(garment_progression)
+
+
 def apply_delta(scene_graph: SceneGraph, delta: GraphDelta) -> SceneGraph:
     for person in _target_persons(scene_graph, delta):
         if "smile_intensity" in delta.expression_deltas:
             person.expression_state.smile_intensity = min(1.0, max(0.0, person.expression_state.smile_intensity + float(delta.expression_deltas["smile_intensity"])))
             person.expression_state.label = str(delta.expression_deltas.get("mouth_state", "smile"))
 
-        if delta.pose_deltas:
-            person.pose_state.coarse_pose = "transition"
-            if delta.interaction_deltas.get("chair_contact", 0.0) > 0.5:
-                person.pose_state.coarse_pose = "seated"
-            elif delta.interaction_deltas.get("chair_contact", 1.0) < 0.3:
-                person.pose_state.coarse_pose = "standing"
+        if delta.pose_deltas or "support_contact" in delta.interaction_deltas or "chair_contact" in delta.interaction_deltas:
+            _apply_pose_delta(person, delta)
 
-        for garment in person.garments:
-            if garment.garment_type == "coat" and "coat_state" in delta.garment_deltas:
-                garment.garment_state = str(delta.garment_deltas["coat_state"])
+        _apply_garment_state_delta(person, delta)
 
         for key, visibility in delta.predicted_visibility_changes.items():
             vis = str(visibility)
