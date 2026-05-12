@@ -35,8 +35,16 @@ class RendererInferenceError(RuntimeError):
     pass
 
 
+IDENTITY_SENSITIVE_REGIONS = {"face", "head", "hair", "mouth", "eyes", "cheek", "neck"}
+CORE_IDENTITY_REGIONS = {"face", "head", "hair"}
+IDENTITY_BLOCKED_REASONS = (
+    "identity_reference_blocked_generated",
+    "identity_reference_blocked_inferred",
+    "identity_reference_blocked_low_evidence",
+)
+
 ROI_FAMILIES = {
-    "face_expression": {"face", "head", "mouth", "eyes", "cheek", "neck"},
+    "face_expression": {"face", "head", "mouth", "eyes", "cheek", "neck", "hair"},
     "torso_reveal": {"torso", "inner_garment", "innerwear", "chest", "pelvis"},
     "sleeve_arm_transition": {"left_arm", "right_arm", "arm", "sleeves", "outer_garment", "garments", "legs"},
 }
@@ -288,6 +296,20 @@ def _build_render_profile(request: PatchSynthesisRequest) -> RenderConditioningP
 
     if transition_mode == "expression_refine":
         base.uncertainty_bias = max(0.03, base.uncertainty_bias - identity_bonus)
+
+    bundle_cond = extract_memory_bundle_conditioning(request)
+    identity_bias = _identity_preservation_bias(
+        region_type,
+        float(bundle_cond.get("identity_reference_strength", 0.0)),
+        bool(bundle_cond.get("identity_reference_blocked", False)),
+    )
+    if identity_bias >= 0.9:
+        base.preservation_strength = min(0.995, base.preservation_strength + 0.10)
+        base.seam_strictness = min(1.0, base.seam_strictness + 0.04)
+        base.uncertainty_bias = max(0.02, base.uncertainty_bias - 0.06)
+        base.memory_dependency = min(1.0, base.memory_dependency + 0.10)
+        if transition_mode != "expression_refine":
+            base.edit_strength *= 0.90
     return base
 
 
@@ -785,12 +807,24 @@ def summarize_memory_bundle_trace(transition_context: dict[str, object] | None) 
     bundle_has_hidden_slot = False
     bundle_hidden_type = "none"
     bundle_reveal_lifecycle = "unknown"
-    if memory_bundle is None and isinstance(ctx.get("region_memory_bundle_serialized"), dict):
-        bundle_data = ctx.get("region_memory_bundle_serialized", {})
+    serialized_bundle = ctx.get("region_memory_bundle_serialized")
+    if isinstance(serialized_bundle, str):
+        try:
+            parsed_serialized = json.loads(serialized_bundle)
+        except json.JSONDecodeError:
+            parsed_serialized = {}
+        serialized_bundle = parsed_serialized if isinstance(parsed_serialized, dict) else {}
+    if memory_bundle is None and isinstance(serialized_bundle, dict):
+        bundle_data = serialized_bundle
         if isinstance(bundle_data, dict):
             memory_bundle_present = bool(bundle_data.get("memory_bundle_present", bool(bundle_data)))
-            bundle_support_level = str(bundle_data.get("memory_support_level", "none" if not bundle_data else "unknown"))
-            reasons = bundle_data.get("retrieval_reasons", bundle_data.get("memory_bundle_retrieval_reasons", []))
+            bundle_support_level = str(
+                bundle_data.get(
+                    "memory_support_level",
+                    bundle_data.get("region_memory_support_level", ctx.get("region_memory_support_level", "none" if not bundle_data else "unknown")),
+                )
+            )
+            reasons = bundle_data.get("retrieval_reasons", bundle_data.get("memory_bundle_retrieval_reasons", ctx.get("region_memory_retrieval_reasons", [])))
             bundle_retrieval_reasons = list(reasons) if isinstance(reasons, list) else []
             bundle_has_current_reuse = bool(bundle_data.get("has_current_reuse", bundle_data.get("memory_bundle_has_current_reuse", False)))
             bundle_has_identity_reference = bool(bundle_data.get("has_identity_reference", bundle_data.get("memory_bundle_has_identity_reference", False)))
@@ -804,8 +838,8 @@ def summarize_memory_bundle_trace(transition_context: dict[str, object] | None) 
             bundle_reveal_lifecycle = str(bundle_data.get("reveal_lifecycle", bundle_data.get("memory_bundle_reveal_lifecycle", "unknown")))
     else:
         memory_bundle_present = memory_bundle is not None
-        bundle_support_level = memory_bundle.memory_support_level if memory_bundle else "none"
-        bundle_retrieval_reasons = list(memory_bundle.retrieval_reasons) if memory_bundle else []
+        bundle_support_level = memory_bundle.memory_support_level if memory_bundle else str(ctx.get("region_memory_support_level", "none"))
+        bundle_retrieval_reasons = list(memory_bundle.retrieval_reasons) if memory_bundle else list(ctx.get("region_memory_retrieval_reasons", []))
         bundle_has_current_reuse = bool(memory_bundle.has_current_reuse) if memory_bundle else False
         bundle_has_identity_reference = bool(memory_bundle.has_identity_reference) if memory_bundle else False
         bundle_has_appearance_reference = bool(memory_bundle.has_appearance_reference) if memory_bundle else False
@@ -813,9 +847,8 @@ def summarize_memory_bundle_trace(transition_context: dict[str, object] | None) 
         bundle_has_hidden_slot = bool(memory_bundle.has_hidden_slot) if memory_bundle else False
         bundle_hidden_type = memory_bundle.hidden_slot.hidden_type if memory_bundle and memory_bundle.hidden_slot else "none"
         bundle_reveal_lifecycle = str(memory_bundle.reveal_lifecycle) if memory_bundle else "unknown"
-    if isinstance(ctx.get("region_memory_bundle_serialized"), dict):
-        serialized = ctx.get("region_memory_bundle_serialized", {})
-        serialized_active = serialized.get("hidden_support_active", serialized.get("memory_bundle_hidden_support_active")) if isinstance(serialized, dict) else None
+    if isinstance(serialized_bundle, dict):
+        serialized_active = serialized_bundle.get("hidden_support_active", serialized_bundle.get("memory_bundle_hidden_support_active"))
     else:
         serialized_active = None
     bundle_hidden_support_active = bool(bundle_has_hidden_slot and bundle_hidden_type not in {"revealed", "revealed_history"})
@@ -836,6 +869,46 @@ def summarize_memory_bundle_trace(transition_context: dict[str, object] | None) 
     }
 
 
+
+def _identity_reference_block_state(retrieval_reasons: list[str]) -> tuple[bool, list[str], str]:
+    normalized = [str(reason).strip().lower() for reason in retrieval_reasons if str(reason).strip()]
+    block_reasons = [reason for reason in IDENTITY_BLOCKED_REASONS if reason in normalized]
+    if "identity_reference_blocked_generated" in block_reasons:
+        source = "blocked_generated"
+    elif "identity_reference_blocked_inferred" in block_reasons:
+        source = "blocked_inferred"
+    elif "identity_reference_blocked_low_evidence" in block_reasons:
+        source = "blocked_low_evidence"
+    else:
+        source = "none"
+    return bool(block_reasons), block_reasons, source
+
+
+def _identity_reference_strength(
+    *,
+    has_identity_reference: bool,
+    support_level: str,
+    retrieval_reasons: list[str],
+) -> tuple[float, bool, str, list[str], bool]:
+    normalized = [str(reason).strip().lower() for reason in retrieval_reasons if str(reason).strip()]
+    blocked, block_reasons, blocked_source = _identity_reference_block_state(normalized)
+    support = str(support_level or "none").strip().lower()
+    observed_strong = "identity_reference_observed_strong" in normalized
+    if blocked:
+        return 0.0, True, blocked_source, block_reasons, False
+    if has_identity_reference and observed_strong and support != "none":
+        return 1.0, False, "observed_strong", [], True
+    if has_identity_reference and support == "medium":
+        return 0.5, False, "none", [], False
+    return 0.0, False, "none", [], False
+
+
+def _identity_preservation_bias(region_type: str, identity_reference_strength: float, identity_reference_blocked: bool) -> float:
+    if identity_reference_blocked or region_type not in IDENTITY_SENSITIVE_REGIONS:
+        return 0.0
+    core_scale = 1.0 if region_type in CORE_IDENTITY_REGIONS else 0.55
+    return float(np.clip(identity_reference_strength * core_scale, 0.0, 1.0))
+
 def extract_memory_bundle_conditioning_from_context(transition_context: dict[str, object] | None) -> dict[str, object]:
     trace = summarize_memory_bundle_trace(transition_context if isinstance(transition_context, dict) else {})
     support_map = {"none": 0.0, "weak": 0.33, "medium": 0.66, "strong": 1.0}
@@ -854,12 +927,30 @@ def extract_memory_bundle_conditioning_from_context(transition_context: dict[str
     if not low_evidence_newly_revealed and hidden_type == "newly_revealed":
         low_evidence_newly_revealed = support_level in {"none", "weak"} or reason_has_low_evidence
     active_hidden_support = bool(trace.get("memory_bundle_hidden_support_active", False) and not reveal_like_hidden)
+    has_identity_reference = bool(trace.get("memory_bundle_has_identity_reference", False))
+    identity_strength, identity_blocked, identity_source, identity_block_reasons, identity_used = _identity_reference_strength(
+        has_identity_reference=has_identity_reference,
+        support_level=support_level,
+        retrieval_reasons=retrieval_reasons,
+    )
     return {
         "memory_bundle_present": bool(trace.get("memory_bundle_present", False)),
         "memory_support_level": support_level,
         "memory_bundle_support_value": float(support_map.get(support_level, 0.0)),
+        "has_current_reuse": bool(trace.get("memory_bundle_has_current_reuse", False)),
+        "has_identity_reference": has_identity_reference,
+        "has_appearance_reference": bool(trace.get("memory_bundle_has_appearance_reference", False)),
+        "has_garment_reference": bool(trace.get("memory_bundle_has_garment_reference", False)),
+        "has_hidden_slot": bool(trace.get("memory_bundle_has_hidden_slot", False)),
+        "reveal_lifecycle": reveal_lifecycle,
+        "retrieval_reasons": retrieval_reasons,
+        "identity_reference_strength": identity_strength,
+        "identity_reference_used": identity_used,
+        "identity_reference_blocked": identity_blocked,
+        "identity_reference_source": identity_source,
+        "identity_reference_block_reasons": identity_block_reasons,
         "memory_bundle_has_current_reuse": bool(trace.get("memory_bundle_has_current_reuse", False)),
-        "memory_bundle_has_identity_reference": bool(trace.get("memory_bundle_has_identity_reference", False)),
+        "memory_bundle_has_identity_reference": has_identity_reference,
         "memory_bundle_has_appearance_reference": bool(trace.get("memory_bundle_has_appearance_reference", False)),
         "memory_bundle_has_garment_reference": bool(trace.get("memory_bundle_has_garment_reference", False)),
         "memory_bundle_has_active_hidden_support": active_hidden_support,
@@ -894,12 +985,15 @@ def apply_memory_bundle_conditioning_to_vectors(
     has_active_hidden = bool(bundle_cond.get("memory_bundle_has_active_hidden_support", False))
     is_revealed_history = bool(bundle_cond.get("memory_bundle_is_revealed_history", False))
     low_evidence_newly_revealed = bool(bundle_cond.get("memory_bundle_low_evidence_newly_revealed", False))
+    identity_strength = float(bundle_cond.get("identity_reference_strength", 0.0))
+    identity_blocked = bool(bundle_cond.get("identity_reference_blocked", False))
     if mem_vec.size > 6:
         mem_vec[6] = float(np.clip(max(float(mem_vec[6]), support_value), 0.0, 1.0))
     if mem_vec.size > 7:
         mem_vec[7] = float(np.clip(max(float(mem_vec[7]), 1.0 if has_current_reuse else 0.0), 0.0, 1.0))
     if mem_vec.size > 8:
-        mem_vec[8] = float(np.clip(max(float(mem_vec[8]), 1.0 if (has_identity_reference or has_appearance_reference or has_garment_reference) else 0.0), 0.0, 1.0))
+        usable_reference_present = (has_identity_reference and not identity_blocked) or has_appearance_reference or has_garment_reference
+        mem_vec[8] = float(np.clip(max(float(mem_vec[8]), 1.0 if usable_reference_present else 0.0), 0.0, 1.0))
     if mem_vec.size > 9:
         mem_vec[9] = float(np.clip(max(float(mem_vec[9]), 1.0 if has_active_hidden else 0.0) - (0.35 if is_revealed_history else 0.0), 0.0, 1.0))
     try:
@@ -910,9 +1004,19 @@ def apply_memory_bundle_conditioning_to_vectors(
         region_type = "unknown"
     if has_current_reuse and appearance.size >= 6:
         appearance[3:6] = appearance[3:6] * np.float32(0.94)
-    if has_identity_reference and appearance.size > 7 and region_type in {"face", "head", "mouth", "eyes", "cheek", "neck", "hair"}:
-        appearance[6] = float(np.clip(appearance[6] + 0.06 * support_value, 0.0, 1.0))
-        appearance[7] = float(np.clip(max(0.0, appearance[7] - 0.03 * support_value), 0.0, 1.0))
+    identity_bias = _identity_preservation_bias(region_type, identity_strength, identity_blocked)
+    if identity_bias > 0.0:
+        if mem_vec.size > 2:
+            mem_vec[2] = float(np.clip(max(float(mem_vec[2]), 0.35 + 0.55 * identity_bias), 0.0, 1.0))
+        if mem_vec.size > 8:
+            mem_vec[8] = float(np.clip(max(float(mem_vec[8]), 0.72 + 0.28 * identity_bias), 0.0, 1.0))
+        if mem_vec.size > 9:
+            mem_vec[9] = float(np.clip(float(mem_vec[9]) + 0.16 * identity_bias, 0.0, 1.0))
+        if appearance.size > 7:
+            appearance[6] = float(np.clip(appearance[6] + 0.12 * identity_bias, 0.0, 1.0))
+            appearance[7] = float(np.clip(max(0.0, appearance[7] - 0.08 * identity_bias), 0.0, 1.0))
+    elif identity_blocked and appearance.size > 7:
+        appearance[7] = float(np.clip(appearance[7] + 0.04, 0.0, 1.0))
     if has_garment_reference and appearance.size > 7 and region_type in {"torso", "inner_garment", "outer_garment", "garments", "sleeves"}:
         appearance[6] = float(np.clip(appearance[6] + 0.05 * support_value, 0.0, 1.0))
         appearance[7] = float(np.clip(max(0.0, appearance[7] - 0.02 * support_value), 0.0, 1.0))
@@ -1381,6 +1485,14 @@ def summarize_patch_batch(batch: PatchBatch) -> dict[str, object]:
         "edit_strength": _safe_float(batch.conditioning_summary.get("edit_strength")),
         "preservation_strength": _safe_float(batch.conditioning_summary.get("preservation_strength")),
         "memory_dependency": _safe_float(batch.conditioning_summary.get("memory_dependency")),
+        "memory_bundle_present": bool(batch.conditioning_summary.get("memory_bundle_present", False)),
+        "memory_support_level": batch.conditioning_summary.get("memory_support_level", "none"),
+        "identity_reference_used": bool(batch.conditioning_summary.get("identity_reference_used", False)),
+        "identity_reference_strength": _safe_float(batch.conditioning_summary.get("identity_reference_strength")),
+        "identity_reference_source": batch.conditioning_summary.get("identity_reference_source", "none"),
+        "identity_reference_blocked": bool(batch.conditioning_summary.get("identity_reference_blocked", False)),
+        "identity_reference_block_reasons": list(batch.conditioning_summary.get("identity_reference_block_reasons", [])) if isinstance(batch.conditioning_summary.get("identity_reference_block_reasons", []), list) else [],
+        "identity_preservation_bias": _safe_float(batch.conditioning_summary.get("identity_preservation_bias")),
         "region_metadata_used": bool(batch.conditioning_summary.get("region_metadata_used", False)),
         "metadata_completeness_score": _safe_float(batch.conditioning_summary.get("metadata_completeness_score")),
         "evidence_strength_score": _safe_float(batch.conditioning_summary.get("evidence_strength_score")),
@@ -1449,6 +1561,11 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
         uncertainty_target = np.clip(uncertainty_target + 0.08 * changed_mask, 0.0, 1.0).astype(np.float32)
 
     metadata_cond = extract_region_metadata_conditioning(request)
+    identity_preservation_bias = _identity_preservation_bias(
+        region_type,
+        float(bundle_cond.get("identity_reference_strength", 0.0)),
+        bool(bundle_cond.get("identity_reference_blocked", False)),
+    )
     conditioning_summary = {
         "transition_mode": profile.transition_mode,
         "profile_role": profile.profile_role,
@@ -1470,6 +1587,15 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
         "memory_bundle_is_revealed_history": bundle_cond["memory_bundle_is_revealed_history"],
         "memory_bundle_reveal_lifecycle": bundle_cond["memory_bundle_reveal_lifecycle"],
         "memory_bundle_low_evidence_newly_revealed": bundle_cond["memory_bundle_low_evidence_newly_revealed"],
+        "retrieval_reasons": bundle_cond["retrieval_reasons"],
+        "identity_sensitive_region": region_type in IDENTITY_SENSITIVE_REGIONS,
+        "core_identity_region": region_type in CORE_IDENTITY_REGIONS,
+        "identity_reference_used": bundle_cond["identity_reference_used"],
+        "identity_reference_strength": bundle_cond["identity_reference_strength"],
+        "identity_reference_source": bundle_cond["identity_reference_source"],
+        "identity_reference_blocked": bundle_cond["identity_reference_blocked"],
+        "identity_reference_block_reasons": bundle_cond["identity_reference_block_reasons"],
+        "identity_preservation_bias": identity_preservation_bias,
         "region_metadata_used": metadata_cond["region_metadata_used"],
         "metadata_completeness_score": metadata_cond["metadata_completeness_score"],
         "evidence_strength_score": metadata_cond["evidence_strength_score"],
@@ -1567,6 +1693,14 @@ def output_from_prediction(
         "region_metadata_mask_kind": conditioning_summary.get("mask_kind", ""),
         "region_metadata_mask_ref_present": bool(conditioning_summary.get("mask_ref_present", False)),
         "region_metadata_feature_keys": list(conditioning_summary.get("metadata_feature_keys", [])) if isinstance(conditioning_summary.get("metadata_feature_keys", []), list) else [],
+        "identity_reference_used": bool(conditioning_summary.get("identity_reference_used", False)),
+        "identity_reference_strength": _safe_float(conditioning_summary.get("identity_reference_strength")),
+        "identity_reference_source": conditioning_summary.get("identity_reference_source", "none"),
+        "identity_reference_blocked": bool(conditioning_summary.get("identity_reference_blocked", False)),
+        "identity_reference_block_reasons": list(conditioning_summary.get("identity_reference_block_reasons", [])) if isinstance(conditioning_summary.get("identity_reference_block_reasons", []), list) else [],
+        "identity_preservation_bias": _safe_float(conditioning_summary.get("identity_preservation_bias")),
+        "memory_bundle_present": bool(conditioning_summary.get("memory_bundle_present", memory_bundle_trace.get("memory_bundle_present", False))),
+        "memory_support_level": conditioning_summary.get("memory_support_level", memory_bundle_trace.get("memory_support_level", "none")),
         "alpha_semantics": "blend_probability_for_true_changed_region_with_seam_support",
         "uncertainty_semantics": "local_synthesis_ambiguity_map_for_compositor_and_confidence",
         "confidence_semantics": "patch_reliability_summary_after_preservation_and_ambiguity_checks",
@@ -1614,6 +1748,14 @@ def output_from_prediction(
             "transition_mode": exec_trace["transition_mode"],
             "profile_role": exec_trace["profile_role"],
             "conditioning_summary": conditioning_summary,
+            "identity_reference_used": bool(conditioning_summary.get("identity_reference_used", False)),
+            "identity_reference_strength": _safe_float(conditioning_summary.get("identity_reference_strength")),
+            "identity_reference_source": conditioning_summary.get("identity_reference_source", "none"),
+            "identity_reference_blocked": bool(conditioning_summary.get("identity_reference_blocked", False)),
+            "identity_reference_block_reasons": list(conditioning_summary.get("identity_reference_block_reasons", [])) if isinstance(conditioning_summary.get("identity_reference_block_reasons", []), list) else [],
+            "identity_preservation_bias": _safe_float(conditioning_summary.get("identity_preservation_bias")),
+            "memory_bundle_present": bool(conditioning_summary.get("memory_bundle_present", memory_bundle_trace.get("memory_bundle_present", False))),
+            "memory_support_level": conditioning_summary.get("memory_support_level", memory_bundle_trace.get("memory_support_level", "none")),
             "blend_hint_mean": float(np.mean(batch.blend_hint)) if batch is not None else 0.0,
             "changed_mask_mean": float(np.mean(batch.changed_mask)) if batch is not None else 0.0,
             "alpha_mean": float(np.mean(alpha)),
