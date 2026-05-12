@@ -158,3 +158,97 @@ def test_apply_delta_preserves_existing_expression_pose_garment_behavior() -> No
     assert person.pose_state.coarse_pose == "seated"
     assert person.garments[0].garment_state == "opening"
     assert person.garments[0].visibility == "partially_visible"
+
+
+def test_support_contact_applies_as_primary_pose_signal() -> None:
+    graph = _scene_with_person()
+    delta = GraphDelta(
+        affected_entities=["p1"],
+        pose_deltas={"torso_pitch": 0.2},
+        interaction_deltas={"support_contact": 0.9},
+    )
+
+    updated = apply_delta(graph, delta)
+
+    assert updated.persons[0].pose_state.coarse_pose == "seated"
+
+
+def test_chair_contact_remains_legacy_pose_fallback() -> None:
+    graph = _scene_with_person()
+    delta = GraphDelta(
+        affected_entities=["p1"],
+        pose_deltas={"torso_pitch": 0.2},
+        interaction_deltas={"chair_contact": 0.9},
+    )
+
+    updated = apply_delta(graph, delta)
+
+    assert updated.persons[0].pose_state.coarse_pose == "seated"
+
+
+def test_support_contact_overrides_legacy_chair_contact() -> None:
+    graph = _scene_with_person()
+    delta = GraphDelta(
+        affected_entities=["p1"],
+        pose_deltas={"torso_pitch": 0.2},
+        interaction_deltas={"support_contact": 0.9, "chair_contact": 0.0},
+    )
+
+    updated = apply_delta(graph, delta)
+
+    assert updated.persons[0].pose_state.coarse_pose == "seated"
+
+
+def test_support_contact_updates_pose_even_without_pose_deltas() -> None:
+    graph = _scene_with_person()
+    delta = GraphDelta(
+        affected_entities=["p1"],
+        interaction_deltas={"support_contact": 0.9},
+    )
+
+    updated = apply_delta(graph, delta)
+
+    assert updated.persons[0].pose_state.coarse_pose == "seated"
+
+
+def test_legacy_chair_contact_updates_pose_even_without_pose_deltas() -> None:
+    graph = _scene_with_person()
+    delta = GraphDelta(
+        affected_entities=["p1"],
+        interaction_deltas={"chair_contact": 0.9},
+    )
+
+    updated = apply_delta(graph, delta)
+
+    assert updated.persons[0].pose_state.coarse_pose == "seated"
+
+
+def test_garment_progression_applies_to_canonical_outer_garment() -> None:
+    graph = _scene_with_person()
+    graph.persons[0].garments = [
+        GarmentNode(
+            garment_id="outer_1",
+            garment_type="outer_garment",
+            garment_state="worn",
+            visibility="visible",
+        )
+    ]
+    delta = GraphDelta(
+        affected_entities=["p1"],
+        garment_deltas={"garment_progression": "opening", "outer_attachment": -0.5},
+        affected_regions=["outer_garment"],
+        region_transition_mode={"outer_garment": "garment_surface"},
+    )
+
+    updated = apply_delta(graph, delta)
+
+    assert updated.persons[0].garments[0].garment_state == "opening"
+
+
+def test_legacy_coat_state_still_updates_coat_garment_state() -> None:
+    graph = _scene_with_person()
+    delta = GraphDelta(affected_entities=["p1"], garment_deltas={"coat_state": "removed"})
+
+    updated = apply_delta(graph, delta)
+
+    assert updated.persons[0].garments[0].garment_state == "removed"
