@@ -64,6 +64,72 @@ class MemoryManager:
     def __init__(self) -> None:
         self.roi = SemanticROIHelper()
 
+    def _is_identity_sensitive_region(self, region_type: str) -> bool:
+        canonical = self._canonical_from_region_type(region_type) or region_type
+        return canonical in self.IDENTITY_SENSITIVE_REGIONS
+
+    def _source_indicates_generated(self, *values: object) -> bool:
+        generated_markers = ("generated", "synthetic", "renderer", "rendered", "model_output")
+        for value in values:
+            if isinstance(value, bool):
+                if value:
+                    return True
+                continue
+            text = str(value or "").strip().lower()
+            if text and any(marker in text for marker in generated_markers):
+                return True
+        return False
+
+    def _evidence_source_rank(
+        self,
+        *,
+        observed_directly: bool,
+        generated: bool,
+        inferred: bool,
+        evidence_score: float,
+        confidence: float,
+    ) -> str:
+        if generated:
+            return "generated"
+        if inferred or not observed_directly:
+            return "inferred"
+        if evidence_score >= 0.7 and confidence >= 0.65:
+            return "strong_observed"
+        return "weak_observed"
+
+    def _can_update_identity_reference(
+        self,
+        *,
+        region_type: str,
+        observed_directly: bool,
+        generated: bool,
+        inferred: bool,
+        evidence_score: float,
+        confidence: float,
+        reveal_lifecycle: str = "unknown",
+    ) -> bool:
+        if not self._is_identity_sensitive_region(region_type):
+            return True
+        if reveal_lifecycle == "newly_revealed" and evidence_score < 0.7:
+            return False
+        return self._evidence_source_rank(
+            observed_directly=observed_directly,
+            generated=generated,
+            inferred=inferred,
+            evidence_score=evidence_score,
+            confidence=confidence,
+        ) == "strong_observed"
+
+    def _reference_kind_for_region(self, region_type: str) -> str:
+        canonical = self._canonical_from_region_type(region_type) or region_type
+        if canonical in self.IDENTITY_SENSITIVE_REGIONS:
+            return "identity_reference"
+        if canonical in self.GARMENT_SENSITIVE_REGIONS:
+            return "garment_reference"
+        if canonical in self.APPEARANCE_SENSITIVE_REGIONS:
+            return "appearance_reference"
+        return "none"
+
     def _is_body_like_region(self, region_type: str) -> bool:
         return region_type in {
             "face",
@@ -279,6 +345,12 @@ class MemoryManager:
         context = transition_context or memory.last_transition_context or {}
         visibility_phase = context.get("visibility_phase", "stable")
         garment_phase = context.get("garment_phase", "worn")
+        frame_generated = self._source_indicates_generated(
+            context.get("frame_source"),
+            context.get("update_source"),
+            context.get("generated"),
+            context.get("is_generated"),
+        )
         for person in scene_graph.persons:
             for region_type in self._semantic_region_types(person):
                 region_ref = self.roi.resolve_region(scene_graph, person.person_id, region_type)
@@ -312,19 +384,37 @@ class MemoryManager:
                 if descriptor:
                     descriptor.last_update_frame = scene_graph.frame_index
                     descriptor.confidence = min(1.0, descriptor.confidence * (1.0 - 0.2 * confidence_boost) + 0.2 * evidence)
+                patch_evidence = min(1.0, evidence)
+                patch_confidence = min(1.0, 0.35 + person.confidence * 0.25 + evidence * confidence_boost)
+                observed_from_frame = not frame_generated
                 self._refresh_canonical_memory_from_descriptor(
                     memory=memory,
                     entity_id=person.person_id,
                     canonical_region=region_type,
                     source_frame=scene_graph.frame_index,
-                    evidence_score=min(1.0, evidence),
-                    confidence=min(1.0, 0.35 + person.confidence * 0.25 + evidence * confidence_boost),
-                    observed_directly=True,
-                    generated=False,
+                    evidence_score=patch_evidence,
+                    confidence=patch_confidence,
+                    observed_directly=observed_from_frame,
+                    generated=frame_generated,
                 )
 
                 identity = memory.identity_memory.get(person.person_id)
-                if identity is not None:
+                can_update_identity_embedding = (
+                    identity is not None
+                    and (
+                        not self._is_identity_sensitive_region(region_type)
+                        or self._can_update_identity_reference(
+                            region_type=region_type,
+                            observed_directly=observed_from_frame,
+                            generated=frame_generated,
+                            inferred=not observed_from_frame,
+                            evidence_score=patch_evidence,
+                            confidence=patch_confidence,
+                            reveal_lifecycle="currently_visible",
+                        )
+                    )
+                )
+                if can_update_identity_embedding:
                     emb = self._descriptor_to_embedding(desc)
                     blend = 0.18 if visibility_phase == "revealing" else 0.1
                     identity.embedding = [identity.embedding[i] * (1.0 - blend) + emb[i] * blend for i in range(min(len(identity.embedding), len(emb)))]
@@ -521,6 +611,16 @@ class MemoryManager:
             reasons.append("current_reuse_reliable")
         if identity_reference is not None:
             reasons.append("identity_reference_available")
+            if self._can_update_identity_reference(
+                region_type=entry.canonical_region,
+                observed_directly=entry.observed_directly,
+                generated=entry.generated,
+                inferred=entry.inferred,
+                evidence_score=entry.evidence_score,
+                confidence=entry.confidence,
+                reveal_lifecycle=entry.reveal_lifecycle,
+            ):
+                reasons.append("identity_reference_observed_strong")
         if appearance_reference is not None:
             reasons.append("appearance_reference_available")
         if garment_reference is not None:
@@ -539,6 +639,21 @@ class MemoryManager:
             elif active_hidden_support:
                 reasons.append("active_hidden_slot_candidates")
         if entry is not None:
+            if self._is_identity_sensitive_region(entry.canonical_region) and identity_reference is None:
+                if entry.generated:
+                    reasons.append("identity_reference_blocked_generated")
+                if entry.inferred:
+                    reasons.append("identity_reference_blocked_inferred")
+                if (
+                    not entry.generated
+                    and not entry.inferred
+                    and (
+                        entry.evidence_score < 0.7
+                        or entry.confidence < 0.65
+                        or (entry.reveal_lifecycle == "newly_revealed" and entry.evidence_score < 0.7)
+                    )
+                ):
+                    reasons.append("identity_reference_blocked_low_evidence")
             reasons.append(f"lifecycle:{entry.reveal_lifecycle}")
             if entry.reveal_lifecycle == "newly_occluded":
                 reasons.append("occluded_state")
@@ -1012,13 +1127,17 @@ class MemoryManager:
             and (entry.reveal_lifecycle != "newly_revealed" or entry.evidence_score >= 0.62)
             and entry.reveal_lifecycle not in {"newly_occluded", "currently_hidden"}
         )
-        reference_kind = "none"
-        if entry.canonical_region in self.IDENTITY_SENSITIVE_REGIONS:
-            reference_kind = "identity_reference"
-        elif entry.canonical_region in self.GARMENT_SENSITIVE_REGIONS:
-            reference_kind = "garment_reference"
-        elif entry.canonical_region in self.APPEARANCE_SENSITIVE_REGIONS:
-            reference_kind = "appearance_reference"
+        reference_kind = self._reference_kind_for_region(entry.canonical_region)
+        if reference_kind == "identity_reference" and not self._can_update_identity_reference(
+            region_type=entry.canonical_region,
+            observed_directly=entry.observed_directly,
+            generated=entry.generated,
+            inferred=entry.inferred,
+            evidence_score=entry.evidence_score,
+            confidence=entry.confidence,
+            reveal_lifecycle=entry.reveal_lifecycle,
+        ):
+            reference_kind = "none"
         entry.reference_kind = reference_kind
         hidden_or_occluded = str(entry.visibility_state) in {
             "hidden",
@@ -1036,6 +1155,18 @@ class MemoryManager:
             and entry.confidence >= 0.62
         )
         if entry.reveal_lifecycle == "newly_revealed" and entry.evidence_score < 0.62:
+            strong_direct_reference = False
+        if self._is_identity_sensitive_region(entry.canonical_region):
+            strong_direct_reference = self._can_update_identity_reference(
+                region_type=entry.canonical_region,
+                observed_directly=entry.observed_directly,
+                generated=entry.generated,
+                inferred=entry.inferred,
+                evidence_score=entry.evidence_score,
+                confidence=entry.confidence,
+                reveal_lifecycle=entry.reveal_lifecycle,
+            )
+        elif entry.generated:
             strong_direct_reference = False
         entry.reliable_as_reference = bool(
             reference_kind != "none"
@@ -1120,8 +1251,8 @@ class MemoryManager:
             and entry.observed_directly
             and not entry.generated
             and not entry.inferred
-            and entry.evidence_score >= 0.65
-            and entry.confidence >= 0.7
+            and entry.evidence_score >= 0.7
+            and entry.confidence >= 0.65
         )
 
     def _update_canonical_region_memory(self, memory: VideoMemory, person: object, frame_index: int) -> None:
@@ -1138,6 +1269,14 @@ class MemoryManager:
             provenance = str(raw.get("provenance", "unknown"))
             source_regions = [str(v) for v in raw.get("source_regions", [])] if isinstance(raw.get("source_regions", []), list) else []
             source_signals = [str(v) for v in raw.get("raw_sources", [])] if isinstance(raw.get("raw_sources", []), list) else []
+            generated = self._source_indicates_generated(
+                raw.get("generated"),
+                raw.get("is_generated"),
+                raw.get("frame_source"),
+                raw.get("update_source"),
+                last_update_source,
+                provenance,
+            )
             observed_directly, inferred, evidence_score = self._derive_observation_semantics(
                 canonical_name=canonical_name,
                 visibility=visibility,
@@ -1147,6 +1286,10 @@ class MemoryManager:
                 source_regions=source_regions,
                 source_signals=source_signals,
             )
+            if generated:
+                observed_directly = False
+                inferred = True
+                evidence_score = min(evidence_score, confidence * 0.65)
             existing = memory.canonical_region_memory.get(make_region_id(person.person_id, canonical_name))
             resolved_visibility = self._resolve_visibility_state(
                 existing_visibility=(str(existing.visibility_state) if existing else None),
@@ -1169,7 +1312,7 @@ class MemoryManager:
                 evidence_quality=self._evidence_quality(evidence_score, resolved_visibility, observed_directly),
                 observed_directly=observed_directly,
                 inferred=inferred,
-                generated=False,
+                generated=generated,
                 reliable_for_reuse=False,
                 reliable_as_reference=False,
                 reference_kind="none",
