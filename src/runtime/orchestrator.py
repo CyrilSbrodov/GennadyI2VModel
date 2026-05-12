@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from core.input_layer import InputAssetLayer
-from core.schema import SceneGraph
+from core.schema import GraphDelta, SceneGraph
 from dynamics.state_update import apply_delta
 from learned.factory import BackendBundle, BackendConfig, LearnedBackendFactory
 from learned.interfaces import DynamicsTransitionRequest, PatchSynthesisRequest, TemporalRefinementRequest
@@ -107,6 +107,41 @@ class GennadyEngine:
         meta = getattr(temporal_out, "metadata", {}) if isinstance(getattr(temporal_out, "metadata", {}), dict) else {}
         temporal_path = str(meta.get("temporal_path", "unknown"))
         return {"issues": issues, "temporal_path": temporal_path, "is_learned_primary": temporal_path == "learned_primary"}
+
+    @staticmethod
+    def _memory_update_context_for_generated_frame(
+        delta: GraphDelta,
+        *,
+        temporal_refinement_enabled: bool,
+    ) -> dict[str, object]:
+        """Build provenance-aware context for memory updates from runtime outputs.
+
+        The stable frame at this point is renderer/compositor output, optionally
+        passed through temporal refinement, not an externally observed input
+        frame. Marking this explicitly lets MemoryManager keep identity-sensitive
+        observed references from being refreshed by generated pixels while still
+        preserving the transition phase semantics used by memory scoring.
+        """
+
+        update_source = (
+            "renderer_temporal_refined_generated_output"
+            if temporal_refinement_enabled
+            else "renderer_composited_generated_output"
+        )
+        context: dict[str, object] = {
+            "transition_phase": delta.transition_phase,
+            "visibility_phase": delta.state_after.get("visibility_phase", "stable"),
+            "garment_phase": delta.state_after.get("garment_phase", "worn"),
+            "pose_phase": delta.state_after.get("pose_phase", "stable"),
+            "generated": True,
+            "is_generated": True,
+            "frame_source": "runtime_generated_stable_frame",
+            "update_source": update_source,
+        }
+        if delta.affected_regions:
+            primary_region = delta.affected_regions[0]
+            context["region_transition_mode"] = delta.region_transition_mode.get(primary_region, "stable")
+        return context
 
     @staticmethod
     def build_dynamics_memory_channels(memory_channels: dict[str, object]) -> dict[str, object]:
@@ -515,15 +550,15 @@ class GennadyEngine:
             scene_graph = apply_delta(scene_graph, delta)
             graph_encoding = self.backends.graph_encoder.encode(scene_graph)
             memory = self.memory_manager.update_from_graph(memory, scene_graph)
-            transition_context = {
-                "transition_phase": delta.transition_phase,
-                "visibility_phase": delta.state_after.get("visibility_phase", "stable"),
-                "garment_phase": delta.state_after.get("garment_phase", "worn"),
-                "pose_phase": delta.state_after.get("pose_phase", "stable"),
+            transition_context = self._memory_update_context_for_generated_frame(
+                delta,
+                temporal_refinement_enabled=profile.temporal_refinement,
+            )
+            memory_update_provenance = {
+                "generated": transition_context["generated"],
+                "frame_source": transition_context["frame_source"],
+                "update_source": transition_context["update_source"],
             }
-            if delta.affected_regions:
-                primary_region = delta.affected_regions[0]
-                transition_context["region_transition_mode"] = delta.region_transition_mode.get(primary_region, "stable")
             memory.last_transition_context = transition_context
             memory = self.memory_manager.update_from_frame(memory, stable_frame, scene_graph, transition_context=transition_context)
 
@@ -559,6 +594,7 @@ class GennadyEngine:
                         "unknown_hidden_count": hidden_recon_stats["unknown_hidden"],
                         "hidden_reveal_count": hidden_recon_stats["hidden_reveal"],
                     },
+                    "memory_update_provenance": memory_update_provenance,
                     "temporal": {
                         "backend": self.backends.backend_names.get("temporal_backend", "unknown"),
                         "temporal_path": temporal_out.metadata.get("temporal_path", "unknown"),
@@ -594,6 +630,7 @@ class GennadyEngine:
                     "identity_encoder_used": bool(identity_embedding),
                     "graph_embedding_dim": len(graph_encoding.graph_embedding),
                     "dynamics_backend_usage": transition_output.metadata.get("learned_ready_usage", {}),
+                    "memory_update_provenance": memory_update_provenance,
                 }
             )
             if step_hidden_reconstruction:
