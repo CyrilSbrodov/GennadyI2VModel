@@ -105,6 +105,25 @@ def test_runtime_exporter_writes_manifest_v2_record_with_region_metadata() -> No
     json.dumps(record)
 
 
+def test_explicit_observed_roi_after_is_supervised_external_target(tmp_path: Path) -> None:
+    roi_after = np.full((4, 4, 3), 0.35, dtype=np.float32)
+    roi_after[1:3, 1:3, :] = [0.8, 0.4, 0.25]
+    record = RendererManifestRecordExporter().build_record(
+        request=_request(),
+        output=_output(),
+        roi_before=np.zeros((4, 4, 3), dtype=np.float32),
+        roi_after=roi_after,
+        frame_index=3,
+        step_index=2,
+    )
+
+    assert record["target_source"] == "provided_ground_truth_roi"
+    assert record["training_target_quality"] == "external_or_observed_target"
+
+    ds = RendererDataset.from_renderer_manifest(str(_write_manifest(tmp_path, record)), strict=True)
+    assert ds.samples[0]["target_training_role"] == "supervised_external"
+    assert ds.diagnostics["target_training_role_counts"]["supervised_external"] == 1
+
 def test_dataset_loader_reads_v2_and_reconstructs_request_with_region_metadata(tmp_path: Path) -> None:
     record = RendererManifestRecordExporter().build_record(request=_request(), output=_output(), roi_before=np.zeros((4, 4, 3), dtype=np.float32), frame_index=3, step_index=2)
     ds = RendererDataset.from_renderer_manifest(str(_write_manifest(tmp_path, record)), strict=True)

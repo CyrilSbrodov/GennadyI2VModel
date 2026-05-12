@@ -155,11 +155,16 @@ class GennadyEngine:
         graph_encoding = self.backends.graph_encoder.encode(scene_graph)
         fallback_log: list[str] = []
         renderer_manifest_records: list[dict[str, object]] = []
+        renderer_manifest_export_warnings: list[str] = []
+        renderer_manifest_export_error: str | None = None
+        renderer_manifest_export_contract_version: str | None = None
         renderer_manifest_exporter = None
+        renderer_manifest_export_strict = bool(self.backend_config.patch_strict_mode)
         if export_renderer_manifest_path:
             from training.renderer_manifest_exporter import RendererManifestRecordExporter
 
             renderer_manifest_exporter = RendererManifestRecordExporter()
+            renderer_manifest_export_contract_version = "renderer_patch_manifest_v2"
 
         action_plan = self.intent_parser.parse(request.text, scene_graph=scene_graph)
         text_encoding = self.backends.text_encoder.encode(request.text, scene_graph=scene_graph, action_plan=action_plan)
@@ -331,16 +336,30 @@ class GennadyEngine:
                 if patch_contract_validation["issues"]:
                     raise ValueError(f"Patch contract violation at step={planned_state.step_index}, region={region.region_id}: {patch_contract_validation['issues']}")
                 if renderer_manifest_exporter is not None:
-                    roi_before_export = self._extract_region_roi_for_export(current_frame, region, patch_out.height, patch_out.width)
-                    renderer_manifest_records.append(
-                        renderer_manifest_exporter.build_record(
-                            request=patch_request,
-                            output=patch_out,
-                            roi_before=roi_before_export,
-                            step_index=planned_state.step_index,
-                            frame_index=len(frames),
+                    export_frame_index = len(frames)
+                    try:
+                        roi_before_export = self._extract_region_roi_for_export(current_frame, region, patch_out.height, patch_out.width)
+                        roi_after_export = self._resolve_observed_roi_after_for_export(patch_request, patch_out)
+                        renderer_manifest_records.append(
+                            renderer_manifest_exporter.build_record(
+                                request=patch_request,
+                                output=patch_out,
+                                roi_before=roi_before_export,
+                                roi_after=roi_after_export,
+                                step_index=planned_state.step_index,
+                                frame_index=export_frame_index,
+                            )
                         )
-                    )
+                    except Exception as exc:
+                        warning = (
+                            f"step_index={planned_state.step_index};"
+                            f"frame_index={export_frame_index};"
+                            f"region_id={region.region_id};"
+                            f"error={type(exc).__name__}: {exc}"
+                        )
+                        renderer_manifest_export_warnings.append(warning)
+                        if renderer_manifest_export_strict:
+                            raise
                 patch_contract = patch_io_to_contract(patch_request, patch_out)
                 patch_parity = build_parity_result(
                     contract=patch_contract,
@@ -580,14 +599,24 @@ class GennadyEngine:
             if step_hidden_reconstruction:
                 hidden_recon_stats["steps_with_hidden_reconstruction"] += 1
 
-        renderer_manifest_export_debug = {"enabled": False}
+        if export_renderer_manifest_path and not renderer_manifest_records:
+            renderer_manifest_export_warnings.append("renderer manifest export enabled but no patch records were exported")
         if renderer_manifest_exporter is not None and export_renderer_manifest_path:
-            renderer_manifest_exporter.write_manifest(renderer_manifest_records, export_renderer_manifest_path)
-            renderer_manifest_export_debug = {
-                "enabled": True,
-                "path": export_renderer_manifest_path,
-                "record_count": len(renderer_manifest_records),
-            }
+            try:
+                Path(export_renderer_manifest_path).parent.mkdir(parents=True, exist_ok=True)
+                renderer_manifest_exporter.write_manifest(renderer_manifest_records, export_renderer_manifest_path)
+            except Exception as exc:
+                renderer_manifest_export_error = f"{type(exc).__name__}: {exc}"
+                if renderer_manifest_export_strict:
+                    raise
+        renderer_manifest_export_debug = {
+            "enabled": bool(export_renderer_manifest_path),
+            "path": export_renderer_manifest_path,
+            "record_count": len(renderer_manifest_records),
+            "contract_version": renderer_manifest_export_contract_version if export_renderer_manifest_path else None,
+            "warnings": list(renderer_manifest_export_warnings),
+            "error": renderer_manifest_export_error,
+        }
 
         video_uri = self._export_video(frames, fps)
         return InferenceArtifacts(
@@ -607,6 +636,12 @@ class GennadyEngine:
                 },
                 "video_export": video_uri,
                 "renderer_manifest_export": renderer_manifest_export_debug,
+                "renderer_manifest_export_enabled": bool(export_renderer_manifest_path),
+                "renderer_manifest_export_path": export_renderer_manifest_path,
+                "renderer_manifest_export_record_count": len(renderer_manifest_records),
+                "renderer_manifest_export_contract_version": renderer_manifest_export_contract_version if export_renderer_manifest_path else None,
+                "renderer_manifest_export_warnings": list(renderer_manifest_export_warnings),
+                "renderer_manifest_export_error": renderer_manifest_export_error,
                 "input_metadata": {
                     "input_type": request.input_type,
                     "orig_size": request.orig_size,
@@ -645,6 +680,36 @@ class GennadyEngine:
                 },
             },
         )
+
+
+    @staticmethod
+    def _resolve_observed_roi_after_for_export(request: PatchSynthesisRequest, output: object) -> object | None:
+        """Return explicit observed post-transition ROI when runtime context provides one.
+
+        Normal inference usually has no ground-truth future crop, so callers pass
+        ``None`` and the manifest exporter marks ``output.rgb_patch`` as a
+        self-generated runtime target. Tests/advanced orchestrators may attach an
+        observed ROI to the request context or output metadata, in which case the
+        same exporter records it as external/observed supervision.
+        """
+
+        ctx = request.transition_context if isinstance(request.transition_context, dict) else {}
+        metadata = getattr(output, "metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        for source in (ctx, metadata):
+            for key in (
+                "roi_after",
+                "observed_roi_after",
+                "ground_truth_roi_after",
+                "post_transition_roi",
+                "post_transition_roi_observed",
+                "target_roi_after",
+            ):
+                value = source.get(key)
+                if value is not None:
+                    return value
+        return None
 
     @staticmethod
     def _extract_region_roi_for_export(frame: list, region: object, height: int, width: int) -> list:

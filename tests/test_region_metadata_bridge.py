@@ -138,8 +138,8 @@ def test_builder_marks_person_bbox_fallback_as_lower_completeness_with_missing_m
     assert metadata["roi_source"] == "person_bbox_fallback"
     assert metadata["source_node_type"] in {"fallback", "canonical_region", "body_part", "face_region"}
     assert not metadata.get("mask_ref")
-    assert 0.0 < float(metadata["metadata_completeness_score"]) <= 0.75
-    assert float(metadata["evidence_strength_score"]) < 0.2
+    assert 0.0 < float(metadata["metadata_completeness_score"]) <= 0.45
+    assert float(metadata["evidence_strength_score"]) <= 0.15
     assert "mask_ref" in metadata["missing_fields"]
     assert "mask_kind" in metadata["missing_fields"]
 
