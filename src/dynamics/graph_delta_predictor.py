@@ -21,6 +21,47 @@ from planning.transition_engine import PlannedState
 from representation.scene_graph_queries import SceneGraphQueries
 
 
+AUXILIARY_SEMANTIC_FAMILIES = {"visibility_transition"}
+PRIMARY_DYNAMICS_FAMILIES = set(FAMILIES)
+
+
+def _resolve_primary_transition_family(
+    requested_family: str,
+    active_families: list[str] | tuple[str, ...] | set[str],
+    *,
+    strict_mode: bool,
+) -> tuple[str, dict[str, object]]:
+    """Resolve runtime semantic family hints to a supported primary model family."""
+    active = [str(f) for f in active_families if str(f)]
+    diagnostics: dict[str, object] = {}
+    if requested_family in PRIMARY_DYNAMICS_FAMILIES:
+        return requested_family, diagnostics
+
+    active_primary = next((family for family in active if family in PRIMARY_DYNAMICS_FAMILIES), None)
+    if requested_family in AUXILIARY_SEMANTIC_FAMILIES:
+        diagnostics.update(
+            {
+                "unsupported_primary_family": requested_family,
+                "auxiliary_visibility_without_primary_family": active_primary is None,
+            }
+        )
+        if active_primary is not None:
+            diagnostics["selected_family_fallback_reason"] = "auxiliary_semantic_family_with_explicit_primary"
+            return active_primary, diagnostics
+        if strict_mode:
+            raise DynamicsModelContractError(
+                "visibility_transition is an auxiliary semantic family and requires an explicit supported primary family"
+            )
+        diagnostics["selected_family_fallback_reason"] = "visibility_transition_is_auxiliary"
+        return "pose_transition", diagnostics
+
+    diagnostics["unsupported_primary_family"] = requested_family
+    if strict_mode:
+        raise DynamicsModelContractError(f"unsupported primary dynamics family: {requested_family}")
+    diagnostics["selected_family_fallback_reason"] = "unsupported_primary_family"
+    return "pose_transition", diagnostics
+
+
 @dataclass(slots=True)
 class DynamicsMetrics:
     delta_magnitude: float
@@ -56,11 +97,28 @@ class GraphDeltaPredictor:
         context = planner_context or {}
         labels = list(target_state.labels)
         planner = self._parse_planner_context(target_state=target_state, context=context)
-        requested_family = next((x for x in labels if x in FAMILIES), None) or self._derive_families(self._extract_semantic_hints(target_state))[0]
-        selected_family = requested_family if requested_family in FAMILIES else "pose_transition"
+        semantic_hints = self._extract_semantic_hints(target_state)
+        derived_families = self._derive_families(semantic_hints)
+        label_families = [x for x in labels if x in PRIMARY_DYNAMICS_FAMILIES or x in AUXILIARY_SEMANTIC_FAMILIES]
+        if target_state.semantic_transition is not None:
+            requested_family = target_state.semantic_transition.family
+        elif label_families:
+            requested_family = label_families[0]
+        elif derived_families:
+            requested_family = derived_families[0]
+        else:
+            requested_family = "pose_transition"
+        active_families = list(dict.fromkeys(label_families + derived_families))
+        selected_family, family_resolution_diagnostics = _resolve_primary_transition_family(
+            requested_family,
+            active_families,
+            strict_mode=self.strict_mode,
+        )
         runtime_status = self.runtime_bundle.runtime_status()
         if not runtime_status.usable_for_inference:
             delta, metrics = self._predict_legacy(scene_graph, target_state, planner_context, memory)
+            if "visibility_transition" in label_families and "visibility_transition" not in delta.semantic_reasons:
+                delta.semantic_reasons.append("visibility_transition")
             delta.transition_diagnostics.update(
                 {
                     "runtime_path": "legacy_heuristic_fallback",
@@ -70,6 +128,7 @@ class GraphDeltaPredictor:
                     "backend_status": "fallback_only" if runtime_status.checkpoint_status != "torch_unavailable" else "torch_unavailable",
                     "usable_for_inference": False,
                     "fallback_reason": runtime_status.fallback_reason,
+                    **family_resolution_diagnostics,
                 }
             )
             return delta, metrics
@@ -91,6 +150,7 @@ class GraphDeltaPredictor:
                 "checkpoint_status": runtime_status.checkpoint_status,
                 "backend_status": "checkpoint_loaded",
                 "usable_for_inference": True,
+                **family_resolution_diagnostics,
                 "family_contribution": {
                     "pose": sum(abs(v) for v in delta.pose_deltas.values()),
                     "garment": abs(float(delta.garment_deltas.get("attachment_delta", 0.0))) + abs(float(delta.garment_deltas.get("coverage_delta", 0.0))),
@@ -105,18 +165,24 @@ class GraphDeltaPredictor:
                 raise
             self.legacy_mode = True
             delta, metrics = self._predict_legacy(scene_graph, target_state, planner_context, memory)
+            if "visibility_transition" in label_families and "visibility_transition" not in delta.semantic_reasons:
+                delta.semantic_reasons.append("visibility_transition")
             delta.transition_diagnostics["fallback_reason"] = type(exc).__name__
             delta.transition_diagnostics["usable_for_inference"] = False
             delta.transition_diagnostics["backend_status"] = "fallback"
+            delta.transition_diagnostics.update(family_resolution_diagnostics)
             return delta, metrics
         except DynamicsModelError:
             if self.strict_mode:
                 raise
             self.legacy_mode = True
             delta, metrics = self._predict_legacy(scene_graph, target_state, planner_context, memory)
+            if "visibility_transition" in label_families and "visibility_transition" not in delta.semantic_reasons:
+                delta.semantic_reasons.append("visibility_transition")
             delta.transition_diagnostics["fallback_reason"] = "DynamicsModelError"
             delta.transition_diagnostics["usable_for_inference"] = False
             delta.transition_diagnostics["backend_status"] = "fallback"
+            delta.transition_diagnostics.update(family_resolution_diagnostics)
             return delta, metrics
 
     def _predict_legacy(self, scene_graph: SceneGraph, target_state: PlannedState, planner_context: dict[str, float] | None = None, memory: VideoMemory | None = None) -> tuple[GraphDelta, DynamicsMetrics]:
