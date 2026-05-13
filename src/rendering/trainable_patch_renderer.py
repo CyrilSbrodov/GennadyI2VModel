@@ -42,6 +42,19 @@ IDENTITY_BLOCKED_REASONS = (
     "identity_reference_blocked_inferred",
     "identity_reference_blocked_low_evidence",
 )
+REFERENCE_FAMILIES = ("skin", "body_shape", "garment", "accessory")
+REFERENCE_BLOCKED_REASONS = {
+    family: (
+        f"{family}_reference_blocked_generated",
+        f"{family}_reference_blocked_inferred",
+        f"{family}_reference_blocked_low_evidence",
+    )
+    for family in REFERENCE_FAMILIES
+}
+SKIN_REFERENCE_REGIONS = {"face", "neck", "left_hand", "right_hand", "hands", "left_arm", "right_arm"}
+BODY_SHAPE_REFERENCE_REGIONS = {"torso", "upper_body", "lower_body", "pelvis", "left_arm", "right_arm", "left_hand", "right_hand", "left_leg", "right_leg", "legs"}
+GARMENT_REFERENCE_REGIONS = {"upper_garment", "lower_garment", "outer_garment", "inner_garment", "garments", "sleeves"}
+ACCESSORY_REFERENCE_REGIONS = {"accessories"}
 
 ROI_FAMILIES = {
     "face_expression": {"face", "head", "mouth", "eyes", "cheek", "neck", "hair"},
@@ -803,7 +816,10 @@ def summarize_memory_bundle_trace(transition_context: dict[str, object] | None) 
     bundle_has_current_reuse = False
     bundle_has_identity_reference = False
     bundle_has_appearance_reference = False
+    bundle_has_skin_reference = False
+    bundle_has_body_shape_reference = False
     bundle_has_garment_reference = False
+    bundle_has_accessory_reference = False
     bundle_has_hidden_slot = False
     bundle_hidden_type = "none"
     bundle_reveal_lifecycle = "unknown"
@@ -829,7 +845,10 @@ def summarize_memory_bundle_trace(transition_context: dict[str, object] | None) 
             bundle_has_current_reuse = bool(bundle_data.get("has_current_reuse", bundle_data.get("memory_bundle_has_current_reuse", False)))
             bundle_has_identity_reference = bool(bundle_data.get("has_identity_reference", bundle_data.get("memory_bundle_has_identity_reference", False)))
             bundle_has_appearance_reference = bool(bundle_data.get("has_appearance_reference", bundle_data.get("memory_bundle_has_appearance_reference", False)))
+            bundle_has_skin_reference = bool(bundle_data.get("has_skin_reference", bundle_data.get("memory_bundle_has_skin_reference", False)))
+            bundle_has_body_shape_reference = bool(bundle_data.get("has_body_shape_reference", bundle_data.get("memory_bundle_has_body_shape_reference", False)))
             bundle_has_garment_reference = bool(bundle_data.get("has_garment_reference", bundle_data.get("memory_bundle_has_garment_reference", False)))
+            bundle_has_accessory_reference = bool(bundle_data.get("has_accessory_reference", bundle_data.get("memory_bundle_has_accessory_reference", False)))
             bundle_has_hidden_slot = bool(bundle_data.get("has_hidden_slot", bundle_data.get("memory_bundle_has_hidden_slot", False)))
             hidden_slot = bundle_data.get("hidden_slot")
             bundle_hidden_type = str(bundle_data.get("hidden_type", bundle_data.get("memory_bundle_hidden_type", "none")))
@@ -843,10 +862,18 @@ def summarize_memory_bundle_trace(transition_context: dict[str, object] | None) 
         bundle_has_current_reuse = bool(memory_bundle.has_current_reuse) if memory_bundle else False
         bundle_has_identity_reference = bool(memory_bundle.has_identity_reference) if memory_bundle else False
         bundle_has_appearance_reference = bool(memory_bundle.has_appearance_reference) if memory_bundle else False
+        bundle_has_skin_reference = bool(getattr(memory_bundle, "has_skin_reference", False)) if memory_bundle else False
+        bundle_has_body_shape_reference = bool(getattr(memory_bundle, "has_body_shape_reference", False)) if memory_bundle else False
         bundle_has_garment_reference = bool(memory_bundle.has_garment_reference) if memory_bundle else False
+        bundle_has_accessory_reference = bool(getattr(memory_bundle, "has_accessory_reference", False)) if memory_bundle else False
         bundle_has_hidden_slot = bool(memory_bundle.has_hidden_slot) if memory_bundle else False
         bundle_hidden_type = memory_bundle.hidden_slot.hidden_type if memory_bundle and memory_bundle.hidden_slot else "none"
         bundle_reveal_lifecycle = str(memory_bundle.reveal_lifecycle) if memory_bundle else "unknown"
+    normalized_reasons = {str(reason).strip().lower() for reason in bundle_retrieval_reasons if str(reason).strip()}
+    bundle_has_skin_reference = bundle_has_skin_reference or "skin_reference_available" in normalized_reasons
+    bundle_has_body_shape_reference = bundle_has_body_shape_reference or "body_shape_reference_available" in normalized_reasons
+    bundle_has_garment_reference = bundle_has_garment_reference or "garment_reference_available" in normalized_reasons
+    bundle_has_accessory_reference = bundle_has_accessory_reference or "accessory_reference_available" in normalized_reasons
     if isinstance(serialized_bundle, dict):
         serialized_active = serialized_bundle.get("hidden_support_active", serialized_bundle.get("memory_bundle_hidden_support_active"))
     else:
@@ -860,7 +887,10 @@ def summarize_memory_bundle_trace(transition_context: dict[str, object] | None) 
         "memory_bundle_has_current_reuse": bundle_has_current_reuse,
         "memory_bundle_has_identity_reference": bundle_has_identity_reference,
         "memory_bundle_has_appearance_reference": bundle_has_appearance_reference,
+        "memory_bundle_has_skin_reference": bundle_has_skin_reference,
+        "memory_bundle_has_body_shape_reference": bundle_has_body_shape_reference,
         "memory_bundle_has_garment_reference": bundle_has_garment_reference,
+        "memory_bundle_has_accessory_reference": bundle_has_accessory_reference,
         "memory_bundle_has_hidden_slot": bundle_has_hidden_slot,
         "memory_bundle_hidden_type": bundle_hidden_type,
         "memory_bundle_reveal_lifecycle": bundle_reveal_lifecycle,
@@ -903,6 +933,49 @@ def _identity_reference_strength(
     return 0.0, False, "none", [], False
 
 
+def _reference_family_strength(
+    *,
+    family: str,
+    has_reference: bool,
+    support_level: str,
+    retrieval_reasons: list[str],
+) -> tuple[float, bool, str, list[str], bool]:
+    normalized = [str(reason).strip().lower() for reason in retrieval_reasons if str(reason).strip()]
+    blocked_reasons = [reason for reason in REFERENCE_BLOCKED_REASONS.get(family, ()) if reason in normalized]
+    if f"{family}_reference_blocked_generated" in blocked_reasons:
+        source = "blocked_generated"
+    elif f"{family}_reference_blocked_inferred" in blocked_reasons:
+        source = "blocked_inferred"
+    elif f"{family}_reference_blocked_low_evidence" in blocked_reasons:
+        source = "blocked_low_evidence"
+    else:
+        source = "none"
+    if blocked_reasons:
+        return 0.0, True, source, blocked_reasons, False
+    support = str(support_level or "none").strip().lower()
+    observed_strong = f"{family}_reference_observed_strong" in normalized
+    available = has_reference or f"{family}_reference_available" in normalized
+    if available and observed_strong and support != "none":
+        return 1.0, False, "observed_strong", [], True
+    if available and support == "medium":
+        return 0.5, False, "medium", [], False
+    return 0.0, False, "none", [], False
+
+
+def _reference_family_region_bias(region_type: str, family: str, strength: float, blocked: bool) -> float:
+    if blocked:
+        return 0.0
+    region_sets = {
+        "skin": SKIN_REFERENCE_REGIONS,
+        "body_shape": BODY_SHAPE_REFERENCE_REGIONS,
+        "garment": GARMENT_REFERENCE_REGIONS,
+        "accessory": ACCESSORY_REFERENCE_REGIONS,
+    }
+    if region_type not in region_sets.get(family, set()):
+        return 0.0
+    return float(np.clip(strength, 0.0, 1.0))
+
+
 def _identity_preservation_bias(region_type: str, identity_reference_strength: float, identity_reference_blocked: bool) -> float:
     if identity_reference_blocked or region_type not in IDENTITY_SENSITIVE_REGIONS:
         return 0.0
@@ -933,14 +1006,34 @@ def extract_memory_bundle_conditioning_from_context(transition_context: dict[str
         support_level=support_level,
         retrieval_reasons=retrieval_reasons,
     )
+    family_conditions: dict[str, dict[str, object]] = {}
+    for family in REFERENCE_FAMILIES:
+        has_reference = bool(trace.get(f"memory_bundle_has_{family}_reference", False))
+        strength, blocked, source, block_reasons, used = _reference_family_strength(
+            family=family,
+            has_reference=has_reference,
+            support_level=support_level,
+            retrieval_reasons=retrieval_reasons,
+        )
+        family_conditions[family] = {
+            "has": has_reference,
+            "strength": strength,
+            "blocked": blocked,
+            "source": source,
+            "block_reasons": block_reasons,
+            "used": used,
+        }
     return {
         "memory_bundle_present": bool(trace.get("memory_bundle_present", False)),
         "memory_support_level": support_level,
         "memory_bundle_support_value": float(support_map.get(support_level, 0.0)),
         "has_current_reuse": bool(trace.get("memory_bundle_has_current_reuse", False)),
         "has_identity_reference": has_identity_reference,
+        "has_skin_reference": bool(family_conditions["skin"]["has"]),
+        "has_body_shape_reference": bool(family_conditions["body_shape"]["has"]),
+        "has_garment_reference": bool(family_conditions["garment"]["has"]),
+        "has_accessory_reference": bool(family_conditions["accessory"]["has"]),
         "has_appearance_reference": bool(trace.get("memory_bundle_has_appearance_reference", False)),
-        "has_garment_reference": bool(trace.get("memory_bundle_has_garment_reference", False)),
         "has_hidden_slot": bool(trace.get("memory_bundle_has_hidden_slot", False)),
         "reveal_lifecycle": reveal_lifecycle,
         "retrieval_reasons": retrieval_reasons,
@@ -949,10 +1042,33 @@ def extract_memory_bundle_conditioning_from_context(transition_context: dict[str
         "identity_reference_blocked": identity_blocked,
         "identity_reference_source": identity_source,
         "identity_reference_block_reasons": identity_block_reasons,
+        "skin_reference_strength": family_conditions["skin"]["strength"],
+        "skin_reference_used": family_conditions["skin"]["used"],
+        "skin_reference_blocked": family_conditions["skin"]["blocked"],
+        "skin_reference_source": family_conditions["skin"]["source"],
+        "skin_reference_block_reasons": family_conditions["skin"]["block_reasons"],
+        "body_shape_reference_strength": family_conditions["body_shape"]["strength"],
+        "body_shape_reference_used": family_conditions["body_shape"]["used"],
+        "body_shape_reference_blocked": family_conditions["body_shape"]["blocked"],
+        "body_shape_reference_source": family_conditions["body_shape"]["source"],
+        "body_shape_reference_block_reasons": family_conditions["body_shape"]["block_reasons"],
+        "garment_reference_strength": family_conditions["garment"]["strength"],
+        "garment_reference_used": family_conditions["garment"]["used"],
+        "garment_reference_blocked": family_conditions["garment"]["blocked"],
+        "garment_reference_source": family_conditions["garment"]["source"],
+        "garment_reference_block_reasons": family_conditions["garment"]["block_reasons"],
+        "accessory_reference_strength": family_conditions["accessory"]["strength"],
+        "accessory_reference_used": family_conditions["accessory"]["used"],
+        "accessory_reference_blocked": family_conditions["accessory"]["blocked"],
+        "accessory_reference_source": family_conditions["accessory"]["source"],
+        "accessory_reference_block_reasons": family_conditions["accessory"]["block_reasons"],
         "memory_bundle_has_current_reuse": bool(trace.get("memory_bundle_has_current_reuse", False)),
         "memory_bundle_has_identity_reference": has_identity_reference,
         "memory_bundle_has_appearance_reference": bool(trace.get("memory_bundle_has_appearance_reference", False)),
-        "memory_bundle_has_garment_reference": bool(trace.get("memory_bundle_has_garment_reference", False)),
+        "memory_bundle_has_skin_reference": bool(family_conditions["skin"]["has"]),
+        "memory_bundle_has_body_shape_reference": bool(family_conditions["body_shape"]["has"]),
+        "memory_bundle_has_garment_reference": bool(family_conditions["garment"]["has"]),
+        "memory_bundle_has_accessory_reference": bool(family_conditions["accessory"]["has"]),
         "memory_bundle_has_active_hidden_support": active_hidden_support,
         "memory_bundle_is_revealed_history": is_revealed_history,
         "memory_bundle_reveal_lifecycle": reveal_lifecycle,
@@ -981,7 +1097,6 @@ def apply_memory_bundle_conditioning_to_vectors(
     has_current_reuse = bool(bundle_cond.get("memory_bundle_has_current_reuse", False))
     has_identity_reference = bool(bundle_cond.get("memory_bundle_has_identity_reference", False))
     has_appearance_reference = bool(bundle_cond.get("memory_bundle_has_appearance_reference", False))
-    has_garment_reference = bool(bundle_cond.get("memory_bundle_has_garment_reference", False))
     has_active_hidden = bool(bundle_cond.get("memory_bundle_has_active_hidden_support", False))
     is_revealed_history = bool(bundle_cond.get("memory_bundle_is_revealed_history", False))
     low_evidence_newly_revealed = bool(bundle_cond.get("memory_bundle_low_evidence_newly_revealed", False))
@@ -992,7 +1107,18 @@ def apply_memory_bundle_conditioning_to_vectors(
     if mem_vec.size > 7:
         mem_vec[7] = float(np.clip(max(float(mem_vec[7]), 1.0 if has_current_reuse else 0.0), 0.0, 1.0))
     if mem_vec.size > 8:
-        usable_reference_present = (has_identity_reference and not identity_blocked) or has_appearance_reference or has_garment_reference
+        skin_usable = bool(bundle_cond.get("skin_reference_used", False)) or float(bundle_cond.get("skin_reference_strength", 0.0)) > 0.0
+        body_shape_usable = bool(bundle_cond.get("body_shape_reference_used", False)) or float(bundle_cond.get("body_shape_reference_strength", 0.0)) > 0.0
+        garment_usable = bool(bundle_cond.get("garment_reference_used", False)) or float(bundle_cond.get("garment_reference_strength", 0.0)) > 0.0
+        accessory_usable = bool(bundle_cond.get("accessory_reference_used", False)) or float(bundle_cond.get("accessory_reference_strength", 0.0)) > 0.0
+        usable_reference_present = (
+            (has_identity_reference and not identity_blocked)
+            or has_appearance_reference
+            or skin_usable
+            or body_shape_usable
+            or garment_usable
+            or accessory_usable
+        )
         mem_vec[8] = float(np.clip(max(float(mem_vec[8]), 1.0 if usable_reference_present else 0.0), 0.0, 1.0))
     if mem_vec.size > 9:
         mem_vec[9] = float(np.clip(max(float(mem_vec[9]), 1.0 if has_active_hidden else 0.0) - (0.35 if is_revealed_history else 0.0), 0.0, 1.0))
@@ -1017,9 +1143,48 @@ def apply_memory_bundle_conditioning_to_vectors(
             appearance[7] = float(np.clip(max(0.0, appearance[7] - 0.08 * identity_bias), 0.0, 1.0))
     elif identity_blocked and appearance.size > 7:
         appearance[7] = float(np.clip(appearance[7] + 0.04, 0.0, 1.0))
-    if has_garment_reference and appearance.size > 7 and region_type in {"torso", "inner_garment", "outer_garment", "garments", "sleeves"}:
-        appearance[6] = float(np.clip(appearance[6] + 0.05 * support_value, 0.0, 1.0))
-        appearance[7] = float(np.clip(max(0.0, appearance[7] - 0.02 * support_value), 0.0, 1.0))
+    skin_bias = _reference_family_region_bias(
+        region_type,
+        "skin",
+        float(bundle_cond.get("skin_reference_strength", 0.0)),
+        bool(bundle_cond.get("skin_reference_blocked", False)),
+    )
+    body_bias = _reference_family_region_bias(
+        region_type,
+        "body_shape",
+        float(bundle_cond.get("body_shape_reference_strength", 0.0)),
+        bool(bundle_cond.get("body_shape_reference_blocked", False)),
+    )
+    garment_bias = _reference_family_region_bias(
+        region_type,
+        "garment",
+        float(bundle_cond.get("garment_reference_strength", 0.0)),
+        bool(bundle_cond.get("garment_reference_blocked", False)),
+    )
+    accessory_bias = _reference_family_region_bias(
+        region_type,
+        "accessory",
+        float(bundle_cond.get("accessory_reference_strength", 0.0)),
+        bool(bundle_cond.get("accessory_reference_blocked", False)),
+    )
+    if skin_bias > 0.0 and appearance.size > 7:
+        appearance[6] = float(np.clip(appearance[6] + 0.08 * skin_bias, 0.0, 1.0))
+        appearance[7] = float(np.clip(max(0.0, appearance[7] - 0.035 * skin_bias), 0.0, 1.0))
+    if body_bias > 0.0:
+        if mem_vec.size > 5:
+            mem_vec[5] = float(np.clip(max(float(mem_vec[5]), 0.42 + 0.36 * body_bias), 0.0, 1.0))
+        if mem_vec.size > 8:
+            mem_vec[8] = float(np.clip(max(float(mem_vec[8]), 0.58 + 0.32 * body_bias), 0.0, 1.0))
+        if appearance.size > 7:
+            appearance[7] = float(np.clip(max(0.0, appearance[7] - 0.06 * body_bias), 0.0, 1.0))
+    if garment_bias > 0.0 and appearance.size > 7:
+        appearance[6] = float(np.clip(appearance[6] + 0.1 * garment_bias, 0.0, 1.0))
+        appearance[7] = float(np.clip(max(0.0, appearance[7] - 0.045 * garment_bias), 0.0, 1.0))
+    if accessory_bias > 0.0 and appearance.size > 7:
+        appearance[6] = float(np.clip(appearance[6] + 0.075 * accessory_bias, 0.0, 1.0))
+        appearance[7] = float(np.clip(max(0.0, appearance[7] - 0.03 * accessory_bias), 0.0, 1.0))
+    if any(bool(bundle_cond.get(f"{family}_reference_blocked", False)) for family in REFERENCE_FAMILIES) and appearance.size > 7:
+        appearance[7] = float(np.clip(appearance[7] + 0.025, 0.0, 1.0))
     if low_evidence_newly_revealed and appearance.size > 7:
         appearance[7] = float(np.clip(appearance[7] + 0.08, 0.0, 1.0))
     return mem_vec, appearance
@@ -1493,6 +1658,26 @@ def summarize_patch_batch(batch: PatchBatch) -> dict[str, object]:
         "identity_reference_blocked": bool(batch.conditioning_summary.get("identity_reference_blocked", False)),
         "identity_reference_block_reasons": list(batch.conditioning_summary.get("identity_reference_block_reasons", [])) if isinstance(batch.conditioning_summary.get("identity_reference_block_reasons", []), list) else [],
         "identity_preservation_bias": _safe_float(batch.conditioning_summary.get("identity_preservation_bias")),
+        "skin_reference_used": bool(batch.conditioning_summary.get("skin_reference_used", False)),
+        "skin_reference_strength": _safe_float(batch.conditioning_summary.get("skin_reference_strength")),
+        "skin_reference_source": batch.conditioning_summary.get("skin_reference_source", "none"),
+        "skin_reference_blocked": bool(batch.conditioning_summary.get("skin_reference_blocked", False)),
+        "skin_reference_block_reasons": list(batch.conditioning_summary.get("skin_reference_block_reasons", [])) if isinstance(batch.conditioning_summary.get("skin_reference_block_reasons", []), list) else [],
+        "body_shape_reference_used": bool(batch.conditioning_summary.get("body_shape_reference_used", False)),
+        "body_shape_reference_strength": _safe_float(batch.conditioning_summary.get("body_shape_reference_strength")),
+        "body_shape_reference_source": batch.conditioning_summary.get("body_shape_reference_source", "none"),
+        "body_shape_reference_blocked": bool(batch.conditioning_summary.get("body_shape_reference_blocked", False)),
+        "body_shape_reference_block_reasons": list(batch.conditioning_summary.get("body_shape_reference_block_reasons", [])) if isinstance(batch.conditioning_summary.get("body_shape_reference_block_reasons", []), list) else [],
+        "garment_reference_used": bool(batch.conditioning_summary.get("garment_reference_used", False)),
+        "garment_reference_strength": _safe_float(batch.conditioning_summary.get("garment_reference_strength")),
+        "garment_reference_source": batch.conditioning_summary.get("garment_reference_source", "none"),
+        "garment_reference_blocked": bool(batch.conditioning_summary.get("garment_reference_blocked", False)),
+        "garment_reference_block_reasons": list(batch.conditioning_summary.get("garment_reference_block_reasons", [])) if isinstance(batch.conditioning_summary.get("garment_reference_block_reasons", []), list) else [],
+        "accessory_reference_used": bool(batch.conditioning_summary.get("accessory_reference_used", False)),
+        "accessory_reference_strength": _safe_float(batch.conditioning_summary.get("accessory_reference_strength")),
+        "accessory_reference_source": batch.conditioning_summary.get("accessory_reference_source", "none"),
+        "accessory_reference_blocked": bool(batch.conditioning_summary.get("accessory_reference_blocked", False)),
+        "accessory_reference_block_reasons": list(batch.conditioning_summary.get("accessory_reference_block_reasons", [])) if isinstance(batch.conditioning_summary.get("accessory_reference_block_reasons", []), list) else [],
         "region_metadata_used": bool(batch.conditioning_summary.get("region_metadata_used", False)),
         "metadata_completeness_score": _safe_float(batch.conditioning_summary.get("metadata_completeness_score")),
         "evidence_strength_score": _safe_float(batch.conditioning_summary.get("evidence_strength_score")),
@@ -1582,7 +1767,10 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
         "memory_bundle_support_value": bundle_cond["memory_bundle_support_value"],
         "memory_bundle_has_current_reuse": bundle_cond["memory_bundle_has_current_reuse"],
         "memory_bundle_has_identity_reference": bundle_cond["memory_bundle_has_identity_reference"],
+        "memory_bundle_has_skin_reference": bundle_cond["memory_bundle_has_skin_reference"],
+        "memory_bundle_has_body_shape_reference": bundle_cond["memory_bundle_has_body_shape_reference"],
         "memory_bundle_has_garment_reference": bundle_cond["memory_bundle_has_garment_reference"],
+        "memory_bundle_has_accessory_reference": bundle_cond["memory_bundle_has_accessory_reference"],
         "memory_bundle_has_active_hidden_support": bundle_cond["memory_bundle_has_active_hidden_support"],
         "memory_bundle_is_revealed_history": bundle_cond["memory_bundle_is_revealed_history"],
         "memory_bundle_reveal_lifecycle": bundle_cond["memory_bundle_reveal_lifecycle"],
@@ -1596,6 +1784,26 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
         "identity_reference_blocked": bundle_cond["identity_reference_blocked"],
         "identity_reference_block_reasons": bundle_cond["identity_reference_block_reasons"],
         "identity_preservation_bias": identity_preservation_bias,
+        "skin_reference_used": bundle_cond["skin_reference_used"],
+        "skin_reference_strength": bundle_cond["skin_reference_strength"],
+        "skin_reference_source": bundle_cond["skin_reference_source"],
+        "skin_reference_blocked": bundle_cond["skin_reference_blocked"],
+        "skin_reference_block_reasons": bundle_cond["skin_reference_block_reasons"],
+        "body_shape_reference_used": bundle_cond["body_shape_reference_used"],
+        "body_shape_reference_strength": bundle_cond["body_shape_reference_strength"],
+        "body_shape_reference_source": bundle_cond["body_shape_reference_source"],
+        "body_shape_reference_blocked": bundle_cond["body_shape_reference_blocked"],
+        "body_shape_reference_block_reasons": bundle_cond["body_shape_reference_block_reasons"],
+        "garment_reference_used": bundle_cond["garment_reference_used"],
+        "garment_reference_strength": bundle_cond["garment_reference_strength"],
+        "garment_reference_source": bundle_cond["garment_reference_source"],
+        "garment_reference_blocked": bundle_cond["garment_reference_blocked"],
+        "garment_reference_block_reasons": bundle_cond["garment_reference_block_reasons"],
+        "accessory_reference_used": bundle_cond["accessory_reference_used"],
+        "accessory_reference_strength": bundle_cond["accessory_reference_strength"],
+        "accessory_reference_source": bundle_cond["accessory_reference_source"],
+        "accessory_reference_blocked": bundle_cond["accessory_reference_blocked"],
+        "accessory_reference_block_reasons": bundle_cond["accessory_reference_block_reasons"],
         "region_metadata_used": metadata_cond["region_metadata_used"],
         "metadata_completeness_score": metadata_cond["metadata_completeness_score"],
         "evidence_strength_score": metadata_cond["evidence_strength_score"],
@@ -1699,6 +1907,26 @@ def output_from_prediction(
         "identity_reference_blocked": bool(conditioning_summary.get("identity_reference_blocked", False)),
         "identity_reference_block_reasons": list(conditioning_summary.get("identity_reference_block_reasons", [])) if isinstance(conditioning_summary.get("identity_reference_block_reasons", []), list) else [],
         "identity_preservation_bias": _safe_float(conditioning_summary.get("identity_preservation_bias")),
+        "skin_reference_used": bool(conditioning_summary.get("skin_reference_used", False)),
+        "skin_reference_strength": _safe_float(conditioning_summary.get("skin_reference_strength")),
+        "skin_reference_source": conditioning_summary.get("skin_reference_source", "none"),
+        "skin_reference_blocked": bool(conditioning_summary.get("skin_reference_blocked", False)),
+        "skin_reference_block_reasons": list(conditioning_summary.get("skin_reference_block_reasons", [])) if isinstance(conditioning_summary.get("skin_reference_block_reasons", []), list) else [],
+        "body_shape_reference_used": bool(conditioning_summary.get("body_shape_reference_used", False)),
+        "body_shape_reference_strength": _safe_float(conditioning_summary.get("body_shape_reference_strength")),
+        "body_shape_reference_source": conditioning_summary.get("body_shape_reference_source", "none"),
+        "body_shape_reference_blocked": bool(conditioning_summary.get("body_shape_reference_blocked", False)),
+        "body_shape_reference_block_reasons": list(conditioning_summary.get("body_shape_reference_block_reasons", [])) if isinstance(conditioning_summary.get("body_shape_reference_block_reasons", []), list) else [],
+        "garment_reference_used": bool(conditioning_summary.get("garment_reference_used", False)),
+        "garment_reference_strength": _safe_float(conditioning_summary.get("garment_reference_strength")),
+        "garment_reference_source": conditioning_summary.get("garment_reference_source", "none"),
+        "garment_reference_blocked": bool(conditioning_summary.get("garment_reference_blocked", False)),
+        "garment_reference_block_reasons": list(conditioning_summary.get("garment_reference_block_reasons", [])) if isinstance(conditioning_summary.get("garment_reference_block_reasons", []), list) else [],
+        "accessory_reference_used": bool(conditioning_summary.get("accessory_reference_used", False)),
+        "accessory_reference_strength": _safe_float(conditioning_summary.get("accessory_reference_strength")),
+        "accessory_reference_source": conditioning_summary.get("accessory_reference_source", "none"),
+        "accessory_reference_blocked": bool(conditioning_summary.get("accessory_reference_blocked", False)),
+        "accessory_reference_block_reasons": list(conditioning_summary.get("accessory_reference_block_reasons", [])) if isinstance(conditioning_summary.get("accessory_reference_block_reasons", []), list) else [],
         "memory_bundle_present": bool(conditioning_summary.get("memory_bundle_present", memory_bundle_trace.get("memory_bundle_present", False))),
         "memory_support_level": conditioning_summary.get("memory_support_level", memory_bundle_trace.get("memory_support_level", "none")),
         "alpha_semantics": "blend_probability_for_true_changed_region_with_seam_support",
@@ -1754,6 +1982,18 @@ def output_from_prediction(
             "identity_reference_blocked": bool(conditioning_summary.get("identity_reference_blocked", False)),
             "identity_reference_block_reasons": list(conditioning_summary.get("identity_reference_block_reasons", [])) if isinstance(conditioning_summary.get("identity_reference_block_reasons", []), list) else [],
             "identity_preservation_bias": _safe_float(conditioning_summary.get("identity_preservation_bias")),
+            "skin_reference_used": bool(conditioning_summary.get("skin_reference_used", False)),
+            "skin_reference_strength": _safe_float(conditioning_summary.get("skin_reference_strength")),
+            "skin_reference_blocked": bool(conditioning_summary.get("skin_reference_blocked", False)),
+            "body_shape_reference_used": bool(conditioning_summary.get("body_shape_reference_used", False)),
+            "body_shape_reference_strength": _safe_float(conditioning_summary.get("body_shape_reference_strength")),
+            "body_shape_reference_blocked": bool(conditioning_summary.get("body_shape_reference_blocked", False)),
+            "garment_reference_used": bool(conditioning_summary.get("garment_reference_used", False)),
+            "garment_reference_strength": _safe_float(conditioning_summary.get("garment_reference_strength")),
+            "garment_reference_blocked": bool(conditioning_summary.get("garment_reference_blocked", False)),
+            "accessory_reference_used": bool(conditioning_summary.get("accessory_reference_used", False)),
+            "accessory_reference_strength": _safe_float(conditioning_summary.get("accessory_reference_strength")),
+            "accessory_reference_blocked": bool(conditioning_summary.get("accessory_reference_blocked", False)),
             "memory_bundle_present": bool(conditioning_summary.get("memory_bundle_present", memory_bundle_trace.get("memory_bundle_present", False))),
             "memory_support_level": conditioning_summary.get("memory_support_level", memory_bundle_trace.get("memory_support_level", "none")),
             "blend_hint_mean": float(np.mean(batch.blend_hint)) if batch is not None else 0.0,

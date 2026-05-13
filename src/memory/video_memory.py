@@ -22,9 +22,22 @@ from utils_tensor import crop, mean_color, shape
 
 
 class MemoryManager:
-    IDENTITY_SENSITIVE_REGIONS = {"face", "hair", "head"}
-    APPEARANCE_SENSITIVE_REGIONS = {"face", "hair", "head", "torso", "upper_garment", "outer_garment", "inner_garment"}
-    GARMENT_SENSITIVE_REGIONS = {"upper_garment", "outer_garment", "inner_garment", "lower_garment"}
+    CORE_IDENTITY_REGIONS = {"face", "head", "hair"}
+    IDENTITY_SENSITIVE_REGIONS = CORE_IDENTITY_REGIONS
+    SKIN_REFERENCE_REGIONS = {"face", "neck", "left_hand", "right_hand", "hands", "left_arm", "right_arm"}
+    BODY_SHAPE_REGIONS = {"torso", "upper_body", "lower_body", "pelvis", "left_arm", "right_arm", "left_hand", "right_hand", "left_leg", "right_leg", "legs"}
+    GARMENT_REFERENCE_REGIONS = {"upper_garment", "lower_garment", "outer_garment", "inner_garment", "garments", "sleeves"}
+    ACCESSORY_REFERENCE_REGIONS = {"accessories"}
+    APPEARANCE_SENSITIVE_REGIONS = CORE_IDENTITY_REGIONS | BODY_SHAPE_REGIONS | SKIN_REFERENCE_REGIONS | GARMENT_REFERENCE_REGIONS | ACCESSORY_REFERENCE_REGIONS
+    GARMENT_SENSITIVE_REGIONS = GARMENT_REFERENCE_REGIONS
+    REFERENCE_THRESHOLDS = {
+        "identity_reference": (0.70, 0.65),
+        "skin_reference": (0.66, 0.62),
+        "body_shape_reference": (0.62, 0.60),
+        "garment_reference": (0.60, 0.58),
+        "accessory_reference": (0.62, 0.60),
+        "appearance_reference": (0.58, 0.56),
+    }
 
     _CANONICAL_MEMORY_REGIONS = (
         "face",
@@ -64,9 +77,28 @@ class MemoryManager:
     def __init__(self) -> None:
         self.roi = SemanticROIHelper()
 
-    def _is_identity_sensitive_region(self, region_type: str) -> bool:
+    def _is_core_identity_region(self, region_type: str) -> bool:
         canonical = self._canonical_from_region_type(region_type) or region_type
-        return canonical in self.IDENTITY_SENSITIVE_REGIONS
+        return canonical in self.CORE_IDENTITY_REGIONS
+
+    def _is_identity_sensitive_region(self, region_type: str) -> bool:
+        return self._is_core_identity_region(region_type)
+
+    def _is_skin_reference_region(self, region_type: str) -> bool:
+        canonical = self._canonical_from_region_type(region_type) or region_type
+        return canonical in self.SKIN_REFERENCE_REGIONS and canonical not in self.CORE_IDENTITY_REGIONS
+
+    def _is_body_shape_region(self, region_type: str) -> bool:
+        canonical = self._canonical_from_region_type(region_type) or region_type
+        return canonical in self.BODY_SHAPE_REGIONS
+
+    def _is_garment_reference_region(self, region_type: str) -> bool:
+        canonical = self._canonical_from_region_type(region_type) or region_type
+        return canonical in self.GARMENT_REFERENCE_REGIONS
+
+    def _is_accessory_reference_region(self, region_type: str) -> bool:
+        canonical = self._canonical_from_region_type(region_type) or region_type
+        return canonical in self.ACCESSORY_REFERENCE_REGIONS
 
     def _source_indicates_generated(self, *values: object) -> bool:
         generated_markers = ("generated", "synthetic", "renderer", "rendered", "model_output")
@@ -108,8 +140,10 @@ class MemoryManager:
         confidence: float,
         reveal_lifecycle: str = "unknown",
     ) -> bool:
-        if not self._is_identity_sensitive_region(region_type):
-            return True
+        if not self._is_core_identity_region(region_type):
+            return False
+        if reveal_lifecycle in {"newly_occluded", "currently_hidden", "expected_unknown"}:
+            return False
         if reveal_lifecycle == "newly_revealed" and evidence_score < 0.7:
             return False
         return self._evidence_source_rank(
@@ -122,13 +156,66 @@ class MemoryManager:
 
     def _reference_kind_for_region(self, region_type: str) -> str:
         canonical = self._canonical_from_region_type(region_type) or region_type
-        if canonical in self.IDENTITY_SENSITIVE_REGIONS:
+        if self._is_core_identity_region(canonical):
             return "identity_reference"
-        if canonical in self.GARMENT_SENSITIVE_REGIONS:
+        if self._is_skin_reference_region(canonical):
+            return "skin_reference"
+        if self._is_body_shape_region(canonical):
+            return "body_shape_reference"
+        if self._is_garment_reference_region(canonical):
             return "garment_reference"
+        if self._is_accessory_reference_region(canonical):
+            return "accessory_reference"
         if canonical in self.APPEARANCE_SENSITIVE_REGIONS:
             return "appearance_reference"
         return "none"
+
+    def _reference_thresholds(self, reference_kind: str) -> tuple[float, float]:
+        return self.REFERENCE_THRESHOLDS.get(reference_kind, self.REFERENCE_THRESHOLDS["appearance_reference"])
+
+    def _hidden_or_occluded_reference_state(self, entry: CanonicalRegionMemoryEntry) -> bool:
+        return str(entry.visibility_state) in {
+            "hidden",
+            "hidden_by_self",
+            "hidden_by_garment",
+            "hidden_by_object",
+            "out_of_frame",
+        } or entry.reveal_lifecycle in {"newly_occluded", "currently_hidden", "expected_unknown"}
+
+    def _can_update_strong_reference(self, entry: CanonicalRegionMemoryEntry, reference_kind: str) -> bool:
+        if reference_kind == "none":
+            return False
+        evidence_threshold, confidence_threshold = self._reference_thresholds(reference_kind)
+        if self._hidden_or_occluded_reference_state(entry):
+            return False
+        if entry.reveal_lifecycle == "newly_revealed" and entry.evidence_score < evidence_threshold:
+            return False
+        return bool(
+            entry.observed_directly
+            and not entry.generated
+            and not entry.inferred
+            and entry.evidence_score >= evidence_threshold
+            and entry.confidence >= confidence_threshold
+        )
+
+    def _reference_block_reasons(self, entry: CanonicalRegionMemoryEntry, reference_family: str) -> list[str]:
+        reasons: list[str] = []
+        reference_kind = f"{reference_family}_reference" if not reference_family.endswith("_reference") else reference_family
+        evidence_threshold, confidence_threshold = self._reference_thresholds(reference_kind)
+        prefix = reference_kind
+        if entry.generated:
+            reasons.append(f"{prefix}_blocked_generated")
+        if entry.inferred or not entry.observed_directly:
+            reasons.append(f"{prefix}_blocked_inferred")
+        low_evidence = (
+            entry.evidence_score < evidence_threshold
+            or entry.confidence < confidence_threshold
+            or (entry.reveal_lifecycle == "newly_revealed" and entry.evidence_score < evidence_threshold)
+            or self._hidden_or_occluded_reference_state(entry)
+        )
+        if low_evidence:
+            reasons.append(f"{prefix}_blocked_low_evidence")
+        return reasons
 
     def _is_body_like_region(self, region_type: str) -> bool:
         return region_type in {
@@ -401,17 +488,15 @@ class MemoryManager:
                 identity = memory.identity_memory.get(person.person_id)
                 can_update_identity_embedding = (
                     identity is not None
-                    and (
-                        not self._is_identity_sensitive_region(region_type)
-                        or self._can_update_identity_reference(
-                            region_type=region_type,
-                            observed_directly=observed_from_frame,
-                            generated=frame_generated,
-                            inferred=not observed_from_frame,
-                            evidence_score=patch_evidence,
-                            confidence=patch_confidence,
-                            reveal_lifecycle="currently_visible",
-                        )
+                    and self._is_core_identity_region(region_type)
+                    and self._can_update_identity_reference(
+                        region_type=region_type,
+                        observed_directly=observed_from_frame,
+                        generated=frame_generated,
+                        inferred=not observed_from_frame,
+                        evidence_score=patch_evidence,
+                        confidence=patch_confidence,
+                        reveal_lifecycle="currently_visible",
                     )
                 )
                 if can_update_identity_embedding:
@@ -591,21 +676,12 @@ class MemoryManager:
         hidden_slot = memory.hidden_region_slots.get(region_id)
 
         current_reuse = entry if entry and entry.reliable_for_reuse else None
-        identity_reference = (
-            entry
-            if entry and entry.reliable_as_reference and entry.reference_kind == "identity_reference"
-            else None
-        )
-        appearance_reference = (
-            entry
-            if entry and entry.reliable_as_reference and entry.reference_kind == "appearance_reference"
-            else None
-        )
-        garment_reference = (
-            entry
-            if entry and entry.reliable_as_reference and entry.reference_kind == "garment_reference"
-            else None
-        )
+        identity_reference = entry if entry and entry.reliable_as_reference and entry.reference_kind == "identity_reference" else None
+        skin_reference = entry if entry and entry.reliable_as_reference and entry.reference_kind == "skin_reference" else None
+        body_shape_reference = entry if entry and entry.reliable_as_reference and entry.reference_kind == "body_shape_reference" else None
+        appearance_reference = entry if entry and entry.reliable_as_reference and entry.reference_kind == "appearance_reference" else None
+        garment_reference = entry if entry and entry.reliable_as_reference and entry.reference_kind == "garment_reference" else None
+        accessory_reference = entry if entry and entry.reliable_as_reference and entry.reference_kind == "accessory_reference" else None
         reasons: list[str] = []
         if current_reuse is not None:
             reasons.append("current_reuse_reliable")
@@ -621,10 +697,24 @@ class MemoryManager:
                 reveal_lifecycle=entry.reveal_lifecycle,
             ):
                 reasons.append("identity_reference_observed_strong")
+        if skin_reference is not None:
+            reasons.append("skin_reference_available")
+            if self._can_update_strong_reference(skin_reference, "skin_reference"):
+                reasons.append("skin_reference_observed_strong")
+        if body_shape_reference is not None:
+            reasons.append("body_shape_reference_available")
+            if self._can_update_strong_reference(body_shape_reference, "body_shape_reference"):
+                reasons.append("body_shape_reference_observed_strong")
         if appearance_reference is not None:
             reasons.append("appearance_reference_available")
         if garment_reference is not None:
             reasons.append("garment_reference_available")
+            if self._can_update_strong_reference(garment_reference, "garment_reference"):
+                reasons.append("garment_reference_observed_strong")
+        if accessory_reference is not None:
+            reasons.append("accessory_reference_available")
+            if self._can_update_strong_reference(accessory_reference, "accessory_reference"):
+                reasons.append("accessory_reference_observed_strong")
 
         hidden_slot_is_trace_history = bool(hidden_slot and hidden_slot.hidden_type in {"revealed", "revealed_history"})
         active_hidden_support = bool(
@@ -639,21 +729,17 @@ class MemoryManager:
             elif active_hidden_support:
                 reasons.append("active_hidden_slot_candidates")
         if entry is not None:
-            if self._is_identity_sensitive_region(entry.canonical_region) and identity_reference is None:
-                if entry.generated:
-                    reasons.append("identity_reference_blocked_generated")
-                if entry.inferred:
-                    reasons.append("identity_reference_blocked_inferred")
-                if (
-                    not entry.generated
-                    and not entry.inferred
-                    and (
-                        entry.evidence_score < 0.7
-                        or entry.confidence < 0.65
-                        or (entry.reveal_lifecycle == "newly_revealed" and entry.evidence_score < 0.7)
-                    )
-                ):
-                    reasons.append("identity_reference_blocked_low_evidence")
+            if self._is_core_identity_region(entry.canonical_region) and identity_reference is None:
+                reasons.extend(self._reference_block_reasons(entry, "identity"))
+            for family, present in (
+                ("skin", skin_reference is not None),
+                ("body_shape", body_shape_reference is not None),
+                ("garment", garment_reference is not None),
+                ("accessory", accessory_reference is not None),
+            ):
+                expected_kind = f"{family}_reference"
+                if entry.reference_kind == expected_kind and not present:
+                    reasons.extend(self._reference_block_reasons(entry, family))
             reasons.append(f"lifecycle:{entry.reveal_lifecycle}")
             if entry.reveal_lifecycle == "newly_occluded":
                 reasons.append("occluded_state")
@@ -664,12 +750,20 @@ class MemoryManager:
             if not entry.reliable_for_reuse:
                 reasons.append("reuse_unreliable")
 
+        all_references = (
+            identity_reference,
+            skin_reference,
+            body_shape_reference,
+            appearance_reference,
+            garment_reference,
+            accessory_reference,
+        )
         strong_reference = next(
             (
                 ref
-                for ref in (identity_reference, appearance_reference, garment_reference)
+                for ref in all_references
                 if ref is not None
-                and ref.evidence_score >= 0.7
+                and ref.evidence_score >= self._reference_thresholds(ref.reference_kind)[0]
                 and not ref.generated
                 and not ref.inferred
             ),
@@ -677,11 +771,11 @@ class MemoryManager:
         )
         strong_current_reuse = current_reuse is not None and current_reuse.evidence_score >= 0.7
         low_evidence_newly_revealed = bool(
-            entry and entry.reveal_lifecycle == "newly_revealed" and entry.evidence_score < 0.7
+            entry and entry.reveal_lifecycle == "newly_revealed" and entry.evidence_score < self._reference_thresholds(entry.reference_kind)[0]
         )
         strong = bool((strong_current_reuse or strong_reference is not None) and not low_evidence_newly_revealed)
 
-        any_reliable_reference = any(ref is not None for ref in (identity_reference, appearance_reference, garment_reference))
+        any_reliable_reference = any(ref is not None for ref in all_references)
         medium = bool(any_reliable_reference or current_reuse is not None or active_hidden_support)
         weak = bool(
             (entry is not None and not entry.reliable_for_reuse and not any_reliable_reference)
@@ -703,7 +797,10 @@ class MemoryManager:
             current_reuse=current_reuse,
             identity_reference=identity_reference,
             appearance_reference=appearance_reference,
+            skin_reference=skin_reference,
+            body_shape_reference=body_shape_reference,
             garment_reference=garment_reference,
+            accessory_reference=accessory_reference,
             hidden_slot=hidden_slot,
             reveal_lifecycle=entry.reveal_lifecycle if entry else "unknown",
             memory_support_level=support_level,
@@ -711,7 +808,10 @@ class MemoryManager:
             has_current_reuse=current_reuse is not None,
             has_identity_reference=identity_reference is not None,
             has_appearance_reference=appearance_reference is not None,
+            has_skin_reference=skin_reference is not None,
+            has_body_shape_reference=body_shape_reference is not None,
             has_garment_reference=garment_reference is not None,
+            has_accessory_reference=accessory_reference is not None,
             has_hidden_slot=hidden_slot is not None,
         )
 
@@ -1128,35 +1228,8 @@ class MemoryManager:
             and entry.reveal_lifecycle not in {"newly_occluded", "currently_hidden"}
         )
         reference_kind = self._reference_kind_for_region(entry.canonical_region)
-        if reference_kind == "identity_reference" and not self._can_update_identity_reference(
-            region_type=entry.canonical_region,
-            observed_directly=entry.observed_directly,
-            generated=entry.generated,
-            inferred=entry.inferred,
-            evidence_score=entry.evidence_score,
-            confidence=entry.confidence,
-            reveal_lifecycle=entry.reveal_lifecycle,
-        ):
-            reference_kind = "none"
-        entry.reference_kind = reference_kind
-        hidden_or_occluded = str(entry.visibility_state) in {
-            "hidden",
-            "hidden_by_self",
-            "hidden_by_garment",
-            "hidden_by_object",
-            "out_of_frame",
-        } or entry.reveal_lifecycle in {"newly_occluded", "currently_hidden", "expected_unknown"}
-        strong_direct_reference = bool(
-            entry.observed_directly
-            and not entry.generated
-            and not entry.inferred
-            and entry.evidence_quality in {"strong", "medium"}
-            and entry.evidence_score >= 0.56
-            and entry.confidence >= 0.62
-        )
-        if entry.reveal_lifecycle == "newly_revealed" and entry.evidence_score < 0.62:
-            strong_direct_reference = False
-        if self._is_identity_sensitive_region(entry.canonical_region):
+        strong_direct_reference = False
+        if reference_kind == "identity_reference":
             strong_direct_reference = self._can_update_identity_reference(
                 region_type=entry.canonical_region,
                 observed_directly=entry.observed_directly,
@@ -1166,14 +1239,12 @@ class MemoryManager:
                 confidence=entry.confidence,
                 reveal_lifecycle=entry.reveal_lifecycle,
             )
-        elif entry.generated:
-            strong_direct_reference = False
-        entry.reliable_as_reference = bool(
-            reference_kind != "none"
-            and strong_direct_reference
-            and entry.evidence_score >= 0.45
-            and (not hidden_or_occluded or reference_kind == "identity_reference")
-        )
+            if not strong_direct_reference:
+                reference_kind = "none"
+        elif reference_kind != "none":
+            strong_direct_reference = self._can_update_strong_reference(entry, reference_kind)
+        entry.reference_kind = reference_kind
+        entry.reliable_as_reference = bool(reference_kind != "none" and strong_direct_reference)
         entry.suitable_for_reveal = bool(
             entry.reliable_for_reuse
             and entry.evidence_score >= 0.52

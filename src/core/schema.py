@@ -389,7 +389,10 @@ class RegionMemoryBundle:
     current_reuse: CanonicalRegionMemoryEntry | None = None
     identity_reference: CanonicalRegionMemoryEntry | None = None
     appearance_reference: CanonicalRegionMemoryEntry | None = None
+    skin_reference: CanonicalRegionMemoryEntry | None = None
+    body_shape_reference: CanonicalRegionMemoryEntry | None = None
     garment_reference: CanonicalRegionMemoryEntry | None = None
+    accessory_reference: CanonicalRegionMemoryEntry | None = None
     hidden_slot: HiddenRegionSlot | None = None
     reveal_lifecycle: str = "unknown"
     memory_support_level: MemorySupportLevel = "none"
@@ -397,7 +400,10 @@ class RegionMemoryBundle:
     has_current_reuse: bool = False
     has_identity_reference: bool = False
     has_appearance_reference: bool = False
+    has_skin_reference: bool = False
+    has_body_shape_reference: bool = False
     has_garment_reference: bool = False
+    has_accessory_reference: bool = False
     has_hidden_slot: bool = False
 
 @dataclass(slots=True)
