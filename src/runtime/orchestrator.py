@@ -158,6 +158,245 @@ class GennadyEngine:
         keep = ("identity", "body_regions", "hidden_regions")
         return {k: memory_channels.get(k, {}) for k in keep}
 
+    @staticmethod
+    def _reference_family_expected_for_region(region_id: str) -> str:
+        if not isinstance(region_id, str) or ":" not in region_id:
+            return "unknown"
+        try:
+            _, region_type = parse_region_id(region_id)
+        except ValueError:
+            return "unknown"
+        region_type = str(region_type or "").strip()
+        if not region_type or region_type == "unknown":
+            return "unknown"
+
+        identity_regions = {"face", "head", "hair"}
+        skin_regions = {"neck", "left_hand", "right_hand", "hands"}
+        body_shape_regions = {
+            "torso",
+            "upper_body",
+            "lower_body",
+            "pelvis",
+            "left_arm",
+            "right_arm",
+            "left_leg",
+            "right_leg",
+            "legs",
+        }
+        garment_regions = {
+            "upper_garment",
+            "lower_garment",
+            "outer_garment",
+            "inner_garment",
+            "garments",
+            "sleeves",
+        }
+        accessory_regions = {"accessories"}
+
+        if region_type in identity_regions:
+            return "identity"
+        if region_type in skin_regions:
+            return "skin"
+        if region_type in body_shape_regions:
+            return "body_shape"
+        if region_type in garment_regions:
+            return "garment"
+        if region_type in accessory_regions:
+            return "accessory"
+        return "unknown"
+
+    @staticmethod
+    def _extract_patch_reference_usage(patch_debug: dict[str, object]) -> dict[str, object]:
+        patch_output = patch_debug.get("patch_output") if isinstance(patch_debug, dict) else None
+        trace = patch_debug.get("execution_trace", {}) if isinstance(patch_debug, dict) else {}
+        if (not isinstance(trace, dict) or not trace) and patch_output is not None:
+            trace = getattr(patch_output, "execution_trace", {})
+        if not isinstance(trace, dict):
+            trace = {}
+
+        def _get_value(key: str, default: object = None) -> object:
+            if key in trace:
+                return trace.get(key, default)
+            return patch_debug.get(key, default)
+
+        def _as_bool(value: object) -> bool:
+            return bool(value) if value is not None else False
+
+        def _as_float(value: object) -> float:
+            try:
+                return float(value or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _as_reasons(value: object) -> list[str]:
+            if isinstance(value, list):
+                return [str(v) for v in value]
+            if isinstance(value, tuple):
+                return [str(v) for v in value]
+            if value:
+                return [str(value)]
+            return []
+
+        region_id = str(patch_debug.get("region_id") or trace.get("region_id") or "")
+        if not region_id and patch_output is not None:
+            region = getattr(patch_output, "region", None)
+            region_id = str(getattr(region, "region_id", "") or "")
+        if ":" in region_id:
+            try:
+                _, region_type = parse_region_id(region_id)
+            except ValueError:
+                region_type = "unknown"
+        else:
+            region_type = "unknown"
+        expected_family = GennadyEngine._reference_family_expected_for_region(region_id)
+
+        usage: dict[str, object] = {
+            "region_id": region_id,
+            "region_type": region_type,
+            "expected_reference_family": expected_family,
+            "memory_bundle_present": _as_bool(_get_value("memory_bundle_present", False)),
+            "memory_support_level": str(_get_value("memory_support_level", "unknown") or "unknown"),
+        }
+        for family in ("identity", "skin", "body_shape", "garment", "accessory"):
+            prefix = f"{family}_reference"
+            usage[f"{prefix}_used"] = _as_bool(_get_value(f"{prefix}_used", False))
+            usage[f"{prefix}_strength"] = _as_float(_get_value(f"{prefix}_strength", 0.0))
+            usage[f"{prefix}_blocked"] = _as_bool(_get_value(f"{prefix}_blocked", False))
+            usage[f"{prefix}_source"] = str(_get_value(f"{prefix}_source", "unknown") or "unknown")
+            usage[f"{prefix}_block_reasons"] = _as_reasons(_get_value(f"{prefix}_block_reasons", []))
+
+        expected_prefix = f"{expected_family}_reference" if expected_family != "unknown" else ""
+        expected_used = bool(usage.get(f"{expected_prefix}_used", False)) if expected_prefix else False
+        expected_strength = float(usage.get(f"{expected_prefix}_strength", 0.0) or 0.0) if expected_prefix else 0.0
+        expected_blocked = bool(usage.get(f"{expected_prefix}_blocked", False)) if expected_prefix else False
+        rendered = _as_bool(patch_debug.get("rendered", True))
+        usage["expected_reference_used"] = expected_used
+        usage["expected_reference_strength"] = expected_strength
+        usage["expected_reference_blocked"] = expected_family != "unknown" and expected_blocked
+        usage["expected_reference_missing"] = expected_family != "unknown" and rendered and not expected_used and expected_strength == 0.0 and not expected_blocked
+        return usage
+
+    @staticmethod
+    def _summarize_step_reference_coverage(patch_step_debug: list[dict[str, object]]) -> dict[str, object]:
+        families = ("identity", "skin", "body_shape", "garment", "accessory")
+        expected_families = (*families, "unknown")
+        expected_family_counts = {family: 0 for family in expected_families}
+        used_counts = {family: 0 for family in families}
+        blocked_counts = {family: 0 for family in families}
+        missing_counts = {family: 0 for family in families}
+        strong_counts = {family: 0 for family in families}
+        medium_counts = {family: 0 for family in families}
+        critical_warnings: list[str] = []
+        patches: list[dict[str, object]] = []
+        memory_bundle_present_count = 0
+        memory_bundle_absent_count = 0
+        warning_prefix = {
+            "identity": "identity_region",
+            "skin": "skin_region",
+            "body_shape": "body_region",
+            "garment": "garment_region",
+            "accessory": "accessory_region",
+        }
+
+        for patch_debug in patch_step_debug:
+            usage = GennadyEngine._extract_patch_reference_usage(patch_debug)
+            patches.append(usage)
+            family = str(usage.get("expected_reference_family", "unknown"))
+            if family not in expected_family_counts:
+                family = "unknown"
+            expected_family_counts[family] += 1
+            if usage.get("memory_bundle_present"):
+                memory_bundle_present_count += 1
+            else:
+                memory_bundle_absent_count += 1
+            if family in families:
+                if usage.get("expected_reference_used"):
+                    used_counts[family] += 1
+                if usage.get("expected_reference_blocked"):
+                    blocked_counts[family] += 1
+                    critical_warnings.append(f"{warning_prefix[family]}_reference_blocked:{usage.get('region_id', '')}")
+                if usage.get("expected_reference_missing"):
+                    missing_counts[family] += 1
+                    critical_warnings.append(f"{warning_prefix[family]}_without_{family}_reference:{usage.get('region_id', '')}")
+                strength = float(usage.get("expected_reference_strength", 0.0) or 0.0)
+                if usage.get("expected_reference_used") and strength >= 0.9:
+                    strong_counts[family] += 1
+                elif usage.get("expected_reference_used") and 0.0 < strength < 0.9:
+                    medium_counts[family] += 1
+
+        return {
+            "patch_count": len(patch_step_debug),
+            "expected_family_counts": expected_family_counts,
+            "used_counts": used_counts,
+            "blocked_counts": blocked_counts,
+            "missing_counts": missing_counts,
+            "strong_counts": strong_counts,
+            "medium_counts": medium_counts,
+            "memory_bundle_present_count": memory_bundle_present_count,
+            "memory_bundle_absent_count": memory_bundle_absent_count,
+            "critical_warnings": critical_warnings,
+            "patches": patches,
+        }
+
+    @staticmethod
+    def _aggregate_reference_coverage(step_coverages: list[dict[str, object]]) -> dict[str, object]:
+        families = ("identity", "skin", "body_shape", "garment", "accessory")
+        expected_families = (*families, "unknown")
+        expected_family_counts = {family: 0 for family in expected_families}
+        used_counts = {family: 0 for family in families}
+        blocked_counts = {family: 0 for family in families}
+        missing_counts = {family: 0 for family in families}
+        strong_counts = {family: 0 for family in families}
+        medium_counts = {family: 0 for family in families}
+        total_patch_count = 0
+        memory_bundle_present_count = 0
+        memory_bundle_absent_count = 0
+        critical_warnings: list[str] = []
+
+        def _add_counts(target: dict[str, int], source: object) -> None:
+            if not isinstance(source, dict):
+                return
+            for key in target:
+                target[key] += int(source.get(key, 0) or 0)
+
+        for coverage in step_coverages:
+            total_patch_count += int(coverage.get("patch_count", 0) or 0)
+            _add_counts(expected_family_counts, coverage.get("expected_family_counts", {}))
+            _add_counts(used_counts, coverage.get("used_counts", {}))
+            _add_counts(blocked_counts, coverage.get("blocked_counts", {}))
+            _add_counts(missing_counts, coverage.get("missing_counts", {}))
+            _add_counts(strong_counts, coverage.get("strong_counts", {}))
+            _add_counts(medium_counts, coverage.get("medium_counts", {}))
+            memory_bundle_present_count += int(coverage.get("memory_bundle_present_count", 0) or 0)
+            memory_bundle_absent_count += int(coverage.get("memory_bundle_absent_count", 0) or 0)
+            warnings = coverage.get("critical_warnings", [])
+            if isinstance(warnings, list):
+                critical_warnings.extend(str(w) for w in warnings)
+
+        def _ratio(family: str) -> float:
+            return used_counts[family] / max(1, expected_family_counts[family])
+
+        total_expected_known = sum(expected_family_counts[family] for family in families)
+        total_used_known = sum(used_counts.values())
+        return {
+            "total_patch_count": total_patch_count,
+            "expected_family_counts": expected_family_counts,
+            "used_counts": used_counts,
+            "blocked_counts": blocked_counts,
+            "missing_counts": missing_counts,
+            "strong_counts": strong_counts,
+            "medium_counts": medium_counts,
+            "memory_bundle_present_count": memory_bundle_present_count,
+            "memory_bundle_absent_count": memory_bundle_absent_count,
+            "critical_warning_count": len(critical_warnings),
+            "top_critical_warnings": critical_warnings[:20],
+            "identity_reference_coverage_ratio": _ratio("identity"),
+            "body_shape_reference_coverage_ratio": _ratio("body_shape"),
+            "garment_reference_coverage_ratio": _ratio("garment"),
+            "skin_reference_coverage_ratio": _ratio("skin"),
+            "overall_expected_reference_coverage_ratio": total_used_known / max(1, total_expected_known),
+        }
+
     def run(
         self,
         images: list[str],
@@ -233,6 +472,7 @@ class GennadyEngine:
         dynamics_metrics_log: list[str] = []
         channel_usage_log: list[dict[str, object]] = []
         step_debug: list[dict[str, object]] = []
+        step_reference_coverages: list[dict[str, object]] = []
         hidden_recon_stats = {"known_hidden": 0, "unknown_hidden": 0, "hidden_reveal": 0, "steps_with_hidden_reconstruction": 0}
         hidden_recon_quality = {
             "confidence_sum": 0.0,
@@ -466,6 +706,39 @@ class GennadyEngine:
                         },
                         "parity": patch_parity,
                         "contract_validation": patch_contract_validation,
+                        "execution_trace": {
+                            key: patch_out.execution_trace.get(key)
+                            for key in (
+                                "identity_reference_used",
+                                "identity_reference_strength",
+                                "identity_reference_source",
+                                "identity_reference_blocked",
+                                "identity_reference_block_reasons",
+                                "skin_reference_used",
+                                "skin_reference_strength",
+                                "skin_reference_source",
+                                "skin_reference_blocked",
+                                "skin_reference_block_reasons",
+                                "body_shape_reference_used",
+                                "body_shape_reference_strength",
+                                "body_shape_reference_source",
+                                "body_shape_reference_blocked",
+                                "body_shape_reference_block_reasons",
+                                "garment_reference_used",
+                                "garment_reference_strength",
+                                "garment_reference_source",
+                                "garment_reference_blocked",
+                                "garment_reference_block_reasons",
+                                "accessory_reference_used",
+                                "accessory_reference_strength",
+                                "accessory_reference_source",
+                                "accessory_reference_blocked",
+                                "accessory_reference_block_reasons",
+                                "memory_bundle_present",
+                                "memory_support_level",
+                            )
+                            if key in patch_out.execution_trace
+                        },
                     }
                 )
                 patches.append(
@@ -566,6 +839,8 @@ class GennadyEngine:
             current_frame = stable_frame
             graphs.append(scene_graph)
             overlay_log.append(f"step={planned_state.step_index}, regions={len(changed_regions)}")
+            step_reference_coverage = self._summarize_step_reference_coverage(patch_step_debug)
+            step_reference_coverages.append(step_reference_coverage)
             dynamics_metrics_log.append(
                 f"delta={transition_output.diagnostics.get('delta_magnitude', 0.0):.3f}, smooth={transition_output.diagnostics.get('temporal_smoothness_proxy', 0.0):.3f}, violations={transition_output.diagnostics.get('constraint_violations', 0.0):.0f}"
             )
@@ -587,6 +862,7 @@ class GennadyEngine:
                             },
                         },
                     "patch": patch_step_debug,
+                    "reference_coverage": step_reference_coverage,
                     "hidden_reconstruction": {
                         "step_has_hidden_reconstruction": step_hidden_reconstruction,
                         "step_hidden_reconstruction_case_count": step_hidden_cases,
@@ -631,6 +907,12 @@ class GennadyEngine:
                     "graph_embedding_dim": len(graph_encoding.graph_embedding),
                     "dynamics_backend_usage": transition_output.metadata.get("learned_ready_usage", {}),
                     "memory_update_provenance": memory_update_provenance,
+                    "reference_coverage": {
+                        "identity_ratio": step_reference_coverage["used_counts"]["identity"] / max(1, step_reference_coverage["expected_family_counts"]["identity"]),
+                        "body_shape_ratio": step_reference_coverage["used_counts"]["body_shape"] / max(1, step_reference_coverage["expected_family_counts"]["body_shape"]),
+                        "garment_ratio": step_reference_coverage["used_counts"]["garment"] / max(1, step_reference_coverage["expected_family_counts"]["garment"]),
+                        "critical_warning_count": len(step_reference_coverage["critical_warnings"]),
+                    },
                 }
             )
             if step_hidden_reconstruction:
@@ -646,6 +928,7 @@ class GennadyEngine:
                 renderer_manifest_export_error = f"{type(exc).__name__}: {exc}"
                 if renderer_manifest_export_strict:
                     raise
+        reference_coverage_summary = self._aggregate_reference_coverage(step_reference_coverages)
         renderer_manifest_export_debug = {
             "enabled": bool(export_renderer_manifest_path),
             "path": export_renderer_manifest_path,
@@ -673,6 +956,7 @@ class GennadyEngine:
                 },
                 "video_export": video_uri,
                 "renderer_manifest_export": renderer_manifest_export_debug,
+                "reference_coverage_summary": reference_coverage_summary,
                 "renderer_manifest_export_enabled": bool(export_renderer_manifest_path),
                 "renderer_manifest_export_path": export_renderer_manifest_path,
                 "renderer_manifest_export_record_count": len(renderer_manifest_records),
