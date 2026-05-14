@@ -99,7 +99,7 @@ def test_bundle_returns_current_reuse_and_identity_reference_for_visible_face() 
     assert bundle.memory_support_level == "strong"
 
 
-def test_bundle_occluded_face_has_identity_reference_but_no_current_reuse() -> None:
+def test_bundle_occluded_face_has_hidden_support_but_no_identity_reference_bypass() -> None:
     manager = MemoryManager()
     initial_graph = SceneGraph(
         frame_index=0,
@@ -145,8 +145,9 @@ def test_bundle_occluded_face_has_identity_reference_but_no_current_reuse() -> N
 
     bundle = manager.get_region_memory_bundle(memory, "p1", "face")
     assert bundle.current_reuse is None
-    assert bundle.identity_reference is not None
-    assert bundle.memory_support_level in {"medium", "strong"}
+    assert bundle.identity_reference is None
+    assert bundle.has_identity_reference is False
+    assert bundle.memory_support_level in {"weak", "medium"}
     assert any("occluded" in reason or "reference" in reason for reason in bundle.retrieval_reasons)
 
 

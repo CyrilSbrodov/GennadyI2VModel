@@ -7,6 +7,13 @@ from pathlib import Path
 import numpy as np
 
 from core.region_ids import parse_region_id
+from core.reference_families import (
+    ACCESSORY_REFERENCE_REGIONS,
+    BODY_SHAPE_REFERENCE_REGIONS,
+    CORE_IDENTITY_REGIONS,
+    GARMENT_REFERENCE_REGIONS,
+    SKIN_REFERENCE_REGIONS,
+)
 from rendering.patch_conditioning_contract import (
     APPEARANCE_DIM,
     BBOX_DIM,
@@ -36,7 +43,6 @@ class RendererInferenceError(RuntimeError):
 
 
 IDENTITY_SENSITIVE_REGIONS = {"face", "head", "hair", "mouth", "eyes", "cheek", "neck"}
-CORE_IDENTITY_REGIONS = {"face", "head", "hair"}
 IDENTITY_BLOCKED_REASONS = (
     "identity_reference_blocked_generated",
     "identity_reference_blocked_inferred",
@@ -51,10 +57,6 @@ REFERENCE_BLOCKED_REASONS = {
     )
     for family in REFERENCE_FAMILIES
 }
-SKIN_REFERENCE_REGIONS = {"face", "neck", "left_hand", "right_hand", "hands", "left_arm", "right_arm"}
-BODY_SHAPE_REFERENCE_REGIONS = {"torso", "upper_body", "lower_body", "pelvis", "left_arm", "right_arm", "left_hand", "right_hand", "left_leg", "right_leg", "legs"}
-GARMENT_REFERENCE_REGIONS = {"upper_garment", "lower_garment", "outer_garment", "inner_garment", "garments", "sleeves"}
-ACCESSORY_REFERENCE_REGIONS = {"accessories"}
 
 ROI_FAMILIES = {
     "face_expression": {"face", "head", "mouth", "eyes", "cheek", "neck", "hair"},
@@ -982,6 +984,86 @@ def _identity_preservation_bias(region_type: str, identity_reference_strength: f
     core_scale = 1.0 if region_type in CORE_IDENTITY_REGIONS else 0.55
     return float(np.clip(identity_reference_strength * core_scale, 0.0, 1.0))
 
+
+
+def _payload_untrusted_reason(payload: dict[str, object] | None) -> str:
+    if not isinstance(payload, dict):
+        return "missing"
+    kind = str(payload.get("reference_kind", ""))
+    confidence = _safe_float(payload.get("confidence"))
+    evidence_score = _safe_float(payload.get("evidence_score"))
+    min_conf, min_evidence = (0.65, 0.70) if kind == "identity_reference" else (0.58, 0.58)
+    if not bool(payload.get("observed_directly", False)):
+        return "not_observed_directly"
+    if bool(payload.get("generated", False)):
+        return "generated"
+    if bool(payload.get("inferred", False)):
+        return "inferred"
+    descriptor = payload.get("descriptor", {})
+    has_descriptor = isinstance(descriptor, dict) and bool(descriptor)
+    if not bool(payload.get("patch_id")) and not bool(payload.get("patch_ref")) and not has_descriptor:
+        return "missing_patch_cache"
+    if confidence < min_conf:
+        return "low_confidence"
+    if evidence_score < min_evidence:
+        return "low_evidence"
+    return ""
+
+
+def summarize_reference_payload_trace(transition_context: dict[str, object] | None) -> dict[str, object]:
+    ctx = transition_context if isinstance(transition_context, dict) else {}
+    payloads_raw = ctx.get("reference_patch_payloads", [])
+    payloads = payloads_raw if isinstance(payloads_raw, list) else []
+    payload_dicts = [payload for payload in payloads if isinstance(payload, dict)]
+    expected = ctx.get("expected_reference_payload")
+    expected_payload = expected if isinstance(expected, dict) else None
+    descriptor = expected_payload.get("descriptor", {}) if expected_payload else {}
+    descriptor_keys = sorted(str(key) for key in descriptor.keys()) if isinstance(descriptor, dict) else []
+    untrusted_reason = _payload_untrusted_reason(expected_payload)
+    trusted = bool(expected_payload is not None and untrusted_reason == "")
+    trace_reasons = ctx.get("reference_payload_trace_reasons", [])
+    return {
+        "reference_payload_present": bool(payload_dicts),
+        "expected_reference_payload_present": expected_payload is not None,
+        "expected_reference_payload_kind": str(expected_payload.get("reference_kind", "")) if expected_payload else "",
+        "expected_reference_payload_patch_id_present": bool(expected_payload.get("patch_id")) if expected_payload else False,
+        "expected_reference_payload_descriptor_present": bool(descriptor_keys),
+        "expected_reference_payload_descriptor_keys": descriptor_keys,
+        "expected_reference_payload_confidence": _safe_float(expected_payload.get("confidence")) if expected_payload else 0.0,
+        "expected_reference_payload_evidence_score": _safe_float(expected_payload.get("evidence_score")) if expected_payload else 0.0,
+        "expected_reference_payload_observed_directly": bool(expected_payload.get("observed_directly", False)) if expected_payload else False,
+        "expected_reference_payload_generated": bool(expected_payload.get("generated", False)) if expected_payload else False,
+        "expected_reference_payload_inferred": bool(expected_payload.get("inferred", False)) if expected_payload else False,
+        "reference_payload_trusted": trusted,
+        "reference_payload_untrusted_reason": "" if trusted else untrusted_reason,
+        "reference_payload_trace_reasons": list(trace_reasons) if isinstance(trace_reasons, list) else [],
+    }
+
+
+def extract_reference_payload_conditioning(transition_context: dict[str, object] | None) -> dict[str, object]:
+    return summarize_reference_payload_trace(transition_context)
+
+
+def _descriptor_numeric_signal(descriptor: object) -> float:
+    values: list[float] = []
+    def collect(value: object) -> None:
+        if len(values) >= 32:
+            return
+        if isinstance(value, bool):
+            return
+        if isinstance(value, (int, float)):
+            values.append(float(value))
+        elif isinstance(value, (list, tuple)):
+            for item in value[:16]:
+                collect(item)
+        elif isinstance(value, dict):
+            for item in list(value.values())[:16]:
+                collect(item)
+    collect(descriptor)
+    if not values:
+        return 0.0
+    return float(np.clip(abs(float(np.mean(values))), 0.0, 1.0))
+
 def extract_memory_bundle_conditioning_from_context(transition_context: dict[str, object] | None) -> dict[str, object]:
     trace = summarize_memory_bundle_trace(transition_context if isinstance(transition_context, dict) else {})
     support_map = {"none": 0.0, "weak": 0.33, "medium": 0.66, "strong": 1.0}
@@ -999,6 +1081,7 @@ def extract_memory_bundle_conditioning_from_context(transition_context: dict[str
     )
     if not low_evidence_newly_revealed and hidden_type == "newly_revealed":
         low_evidence_newly_revealed = support_level in {"none", "weak"} or reason_has_low_evidence
+    reference_payload_cond = extract_reference_payload_conditioning(transition_context)
     active_hidden_support = bool(trace.get("memory_bundle_hidden_support_active", False) and not reveal_like_hidden)
     has_identity_reference = bool(trace.get("memory_bundle_has_identity_reference", False))
     identity_strength, identity_blocked, identity_source, identity_block_reasons, identity_used = _identity_reference_strength(
@@ -1077,6 +1160,7 @@ def extract_memory_bundle_conditioning_from_context(transition_context: dict[str
         "memory_bundle_hidden_support_active": active_hidden_support,
         "memory_bundle_retrieval_reasons": retrieval_reasons,
         "memory_bundle_low_evidence_newly_revealed": low_evidence_newly_revealed,
+        **reference_payload_cond,
     }
 
 
@@ -1143,6 +1227,18 @@ def apply_memory_bundle_conditioning_to_vectors(
             appearance[7] = float(np.clip(max(0.0, appearance[7] - 0.08 * identity_bias), 0.0, 1.0))
     elif identity_blocked and appearance.size > 7:
         appearance[7] = float(np.clip(appearance[7] + 0.04, 0.0, 1.0))
+    payload_present = bool(bundle_cond.get("expected_reference_payload_present", False))
+    payload_trusted = bool(bundle_cond.get("reference_payload_trusted", False))
+    if payload_trusted:
+        payload_confidence = float(bundle_cond.get("expected_reference_payload_confidence", 0.0))
+        payload_evidence = float(bundle_cond.get("expected_reference_payload_evidence_score", 0.0))
+        if mem_vec.size > 8:
+            mem_vec[8] = float(np.clip(max(float(mem_vec[8]), 0.85), 0.0, 1.0))
+        if appearance.size > 7:
+            appearance[6] = float(np.clip(appearance[6] + 0.05 * payload_confidence, 0.0, 1.0))
+            appearance[7] = float(np.clip(max(0.0, appearance[7] - 0.03 * payload_evidence), 0.0, 1.0))
+    elif payload_present and appearance.size > 7:
+        appearance[7] = float(np.clip(appearance[7] + 0.035, 0.0, 1.0))
     skin_bias = _reference_family_region_bias(
         region_type,
         "skin",
@@ -1446,7 +1542,13 @@ def _memory_and_appearance_features(request: PatchSynthesisRequest, roi_before: 
         dtype=np.float32,
     )
     mem_vec, appearance = apply_region_metadata_conditioning_to_vectors(mem_vec, appearance, request.region_metadata)
-    return apply_memory_bundle_conditioning_to_vectors(mem_vec, appearance, bundle_cond, region_id=request.region.region_id)
+    mem_vec, appearance = apply_memory_bundle_conditioning_to_vectors(mem_vec, appearance, bundle_cond, region_id=request.region.region_id)
+    expected_payload = request.transition_context.get("expected_reference_payload") if isinstance(request.transition_context, dict) else None
+    if bool(bundle_cond.get("reference_payload_trusted", False)) and isinstance(expected_payload, dict) and appearance.size > 6:
+        descriptor_signal = _descriptor_numeric_signal(expected_payload.get("descriptor", {}))
+        if descriptor_signal > 0.0:
+            appearance[6] = float(np.clip(appearance[6] + 0.01 * descriptor_signal, 0.0, 1.0))
+    return mem_vec, appearance
 
 
 def _geometry_priors(h: int, w: int, region_type: str, profile: RenderConditioningProfile) -> dict[str, np.ndarray]:
@@ -1652,6 +1754,16 @@ def summarize_patch_batch(batch: PatchBatch) -> dict[str, object]:
         "memory_dependency": _safe_float(batch.conditioning_summary.get("memory_dependency")),
         "memory_bundle_present": bool(batch.conditioning_summary.get("memory_bundle_present", False)),
         "memory_support_level": batch.conditioning_summary.get("memory_support_level", "none"),
+        "reference_payload_present": bool(batch.conditioning_summary.get("reference_payload_present", False)),
+        "expected_reference_payload_present": bool(batch.conditioning_summary.get("expected_reference_payload_present", False)),
+        "expected_reference_payload_kind": batch.conditioning_summary.get("expected_reference_payload_kind", ""),
+        "expected_reference_payload_patch_id_present": bool(batch.conditioning_summary.get("expected_reference_payload_patch_id_present", False)),
+        "expected_reference_payload_descriptor_present": bool(batch.conditioning_summary.get("expected_reference_payload_descriptor_present", False)),
+        "expected_reference_payload_descriptor_keys": list(batch.conditioning_summary.get("expected_reference_payload_descriptor_keys", [])) if isinstance(batch.conditioning_summary.get("expected_reference_payload_descriptor_keys", []), list) else [],
+        "reference_payload_trusted": bool(batch.conditioning_summary.get("reference_payload_trusted", False)),
+        "reference_payload_untrusted_reason": batch.conditioning_summary.get("reference_payload_untrusted_reason", ""),
+        "expected_reference_payload_confidence": _safe_float(batch.conditioning_summary.get("expected_reference_payload_confidence")),
+        "expected_reference_payload_evidence_score": _safe_float(batch.conditioning_summary.get("expected_reference_payload_evidence_score")),
         "identity_reference_used": bool(batch.conditioning_summary.get("identity_reference_used", False)),
         "identity_reference_strength": _safe_float(batch.conditioning_summary.get("identity_reference_strength")),
         "identity_reference_source": batch.conditioning_summary.get("identity_reference_source", "none"),
@@ -1776,6 +1888,16 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
         "memory_bundle_reveal_lifecycle": bundle_cond["memory_bundle_reveal_lifecycle"],
         "memory_bundle_low_evidence_newly_revealed": bundle_cond["memory_bundle_low_evidence_newly_revealed"],
         "retrieval_reasons": bundle_cond["retrieval_reasons"],
+        "reference_payload_present": bundle_cond["reference_payload_present"],
+        "expected_reference_payload_present": bundle_cond["expected_reference_payload_present"],
+        "expected_reference_payload_kind": bundle_cond["expected_reference_payload_kind"],
+        "expected_reference_payload_patch_id_present": bundle_cond["expected_reference_payload_patch_id_present"],
+        "expected_reference_payload_descriptor_present": bundle_cond["expected_reference_payload_descriptor_present"],
+        "expected_reference_payload_descriptor_keys": bundle_cond["expected_reference_payload_descriptor_keys"],
+        "reference_payload_trusted": bundle_cond["reference_payload_trusted"],
+        "reference_payload_untrusted_reason": bundle_cond["reference_payload_untrusted_reason"],
+        "expected_reference_payload_confidence": bundle_cond["expected_reference_payload_confidence"],
+        "expected_reference_payload_evidence_score": bundle_cond["expected_reference_payload_evidence_score"],
         "identity_sensitive_region": region_type in IDENTITY_SENSITIVE_REGIONS,
         "core_identity_region": region_type in CORE_IDENTITY_REGIONS,
         "identity_reference_used": bundle_cond["identity_reference_used"],
@@ -1927,6 +2049,16 @@ def output_from_prediction(
         "accessory_reference_source": conditioning_summary.get("accessory_reference_source", "none"),
         "accessory_reference_blocked": bool(conditioning_summary.get("accessory_reference_blocked", False)),
         "accessory_reference_block_reasons": list(conditioning_summary.get("accessory_reference_block_reasons", [])) if isinstance(conditioning_summary.get("accessory_reference_block_reasons", []), list) else [],
+        "reference_payload_present": bool(conditioning_summary.get("reference_payload_present", False)),
+        "expected_reference_payload_present": bool(conditioning_summary.get("expected_reference_payload_present", False)),
+        "expected_reference_payload_kind": conditioning_summary.get("expected_reference_payload_kind", ""),
+        "expected_reference_payload_patch_id_present": bool(conditioning_summary.get("expected_reference_payload_patch_id_present", False)),
+        "expected_reference_payload_descriptor_present": bool(conditioning_summary.get("expected_reference_payload_descriptor_present", False)),
+        "expected_reference_payload_descriptor_keys": list(conditioning_summary.get("expected_reference_payload_descriptor_keys", [])) if isinstance(conditioning_summary.get("expected_reference_payload_descriptor_keys", []), list) else [],
+        "reference_payload_trusted": bool(conditioning_summary.get("reference_payload_trusted", False)),
+        "reference_payload_untrusted_reason": conditioning_summary.get("reference_payload_untrusted_reason", ""),
+        "expected_reference_payload_confidence": _safe_float(conditioning_summary.get("expected_reference_payload_confidence")),
+        "expected_reference_payload_evidence_score": _safe_float(conditioning_summary.get("expected_reference_payload_evidence_score")),
         "memory_bundle_present": bool(conditioning_summary.get("memory_bundle_present", memory_bundle_trace.get("memory_bundle_present", False))),
         "memory_support_level": conditioning_summary.get("memory_support_level", memory_bundle_trace.get("memory_support_level", "none")),
         "alpha_semantics": "blend_probability_for_true_changed_region_with_seam_support",
@@ -1996,6 +2128,15 @@ def output_from_prediction(
             "accessory_reference_blocked": bool(conditioning_summary.get("accessory_reference_blocked", False)),
             "memory_bundle_present": bool(conditioning_summary.get("memory_bundle_present", memory_bundle_trace.get("memory_bundle_present", False))),
             "memory_support_level": conditioning_summary.get("memory_support_level", memory_bundle_trace.get("memory_support_level", "none")),
+            "reference_payload_present": bool(conditioning_summary.get("reference_payload_present", False)),
+            "expected_reference_payload_present": bool(conditioning_summary.get("expected_reference_payload_present", False)),
+            "expected_reference_payload_kind": conditioning_summary.get("expected_reference_payload_kind", ""),
+            "expected_reference_payload_patch_id_present": bool(conditioning_summary.get("expected_reference_payload_patch_id_present", False)),
+            "expected_reference_payload_descriptor_present": bool(conditioning_summary.get("expected_reference_payload_descriptor_present", False)),
+            "reference_payload_trusted": bool(conditioning_summary.get("reference_payload_trusted", False)),
+            "reference_payload_untrusted_reason": conditioning_summary.get("reference_payload_untrusted_reason", ""),
+            "expected_reference_payload_confidence": _safe_float(conditioning_summary.get("expected_reference_payload_confidence")),
+            "expected_reference_payload_evidence_score": _safe_float(conditioning_summary.get("expected_reference_payload_evidence_score")),
             "blend_hint_mean": float(np.mean(batch.blend_hint)) if batch is not None else 0.0,
             "changed_mask_mean": float(np.mean(batch.changed_mask)) if batch is not None else 0.0,
             "alpha_mean": float(np.mean(alpha)),
