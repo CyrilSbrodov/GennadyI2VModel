@@ -90,6 +90,21 @@ def test_hand_and_neck_become_skin_reference_not_identity_reference() -> None:
         assert "identity_reference_available" not in bundle.retrieval_reasons
 
 
+def test_left_arm_becomes_body_shape_reference_not_skin_reference() -> None:
+    manager = MemoryManager()
+    arm = _entry("left_arm", observed_directly=True, generated=False, inferred=False, evidence_score=0.75, confidence=0.75)
+    manager._refresh_reuse_policy(arm)
+
+    bundle = manager.get_region_memory_bundle(_memory_with(arm), "p1", "left_arm")
+
+    assert arm.reliable_as_reference is True
+    assert arm.reference_kind == "body_shape_reference"
+    assert bundle.has_body_shape_reference is True
+    assert bundle.has_skin_reference is False
+    assert "body_shape_reference_observed_strong" in bundle.retrieval_reasons
+    assert "skin_reference_available" not in bundle.retrieval_reasons
+
+
 def test_outer_garment_remains_garment_reference_not_identity_reference() -> None:
     manager = MemoryManager()
     outer = _entry("outer_garment", observed_directly=True, generated=False, inferred=False, evidence_score=0.78, confidence=0.82)

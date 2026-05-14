@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from core.input_layer import InputAssetLayer
-from core.schema import GraphDelta, SceneGraph
+from core.schema import GraphDelta, ReferencePatchPayload, RegionMemoryBundle, SceneGraph
 from dynamics.state_update import apply_delta
 from learned.factory import BackendBundle, BackendConfig, LearnedBackendFactory
 from learned.interfaces import DynamicsTransitionRequest, PatchSynthesisRequest, TemporalRefinementRequest
@@ -32,6 +32,84 @@ from runtime.region_routing import CanonicalRegionRouter
 from text.intent_parser import IntentParser
 from utils_tensor import shape, zeros
 from core.region_ids import make_region_id, parse_region_id
+from core.reference_families import reference_family_for_region, reference_kind_for_region
+
+
+def _payload_to_dict(payload: ReferencePatchPayload | None) -> dict[str, object] | None:
+    return asdict(payload) if payload is not None else None
+
+
+def _region_type_from_region_id(region_id: str) -> str:
+    try:
+        _, region_type = parse_region_id(region_id)
+    except ValueError:
+        region_type = region_id
+    return str(region_type or "").strip()
+
+
+def _expected_reference_payload_for_region(region_id: str, region_memory_bundle: RegionMemoryBundle) -> ReferencePatchPayload | None:
+    region_type = _region_type_from_region_id(region_id)
+    family = reference_family_for_region(region_type)
+    if family == "identity":
+        return region_memory_bundle.identity_reference_payload
+    if family == "skin":
+        return region_memory_bundle.skin_reference_payload
+    if family == "body_shape":
+        return region_memory_bundle.body_shape_reference_payload
+    if family == "garment":
+        return region_memory_bundle.garment_reference_payload
+    if family == "accessory":
+        return region_memory_bundle.accessory_reference_payload
+    return region_memory_bundle.appearance_reference_payload
+
+
+def _payload_trusted_for_runtime_selection(payload: ReferencePatchPayload) -> bool:
+    min_confidence, min_evidence = (0.65, 0.70) if payload.reference_kind == "identity_reference" else (0.58, 0.58)
+    return bool(
+        payload.observed_directly
+        and not payload.generated
+        and not payload.inferred
+        and payload.confidence >= min_confidence
+        and payload.evidence_score >= min_evidence
+    )
+
+
+def _trusted_matching_payloads(region_id: str, region_memory_bundle: RegionMemoryBundle) -> list[ReferencePatchPayload]:
+    region_type = _region_type_from_region_id(region_id)
+    expected_kind = reference_kind_for_region(region_type)
+    matches: list[ReferencePatchPayload] = []
+    for payload in getattr(region_memory_bundle, "reference_payloads", []):
+        if not isinstance(payload, ReferencePatchPayload):
+            continue
+        same_region = payload.region_id == region_id or (payload.entity_id == region_memory_bundle.entity_id and payload.canonical_region == region_type)
+        if (
+            same_region
+            and payload.reference_kind == expected_kind
+            and payload.canonical_region == region_type
+            and _payload_trusted_for_runtime_selection(payload)
+        ):
+            matches.append(payload)
+    return matches
+
+
+def _serialize_reference_payload_context(region_id: str, region_memory_bundle: RegionMemoryBundle) -> dict[str, object]:
+    payloads = [_payload_to_dict(payload) for payload in getattr(region_memory_bundle, "reference_payloads", [])]
+    payload_dicts = [payload for payload in payloads if payload is not None]
+    expected_payload = _expected_reference_payload_for_region(region_id, region_memory_bundle)
+    reasons: list[str] = []
+    if expected_payload is None:
+        matches = _trusted_matching_payloads(region_id, region_memory_bundle)
+        if len(matches) == 1:
+            expected_payload = matches[0]
+            reasons.append("expected_reference_payload_resolved_from_matching_payload")
+    expected_payload_dict = _payload_to_dict(expected_payload)
+    if expected_payload_dict is None:
+        reasons.append("expected_reference_payload_missing")
+    return {
+        "reference_patch_payloads": payload_dicts,
+        "expected_reference_payload": expected_payload_dict,
+        "reference_payload_trace_reasons": reasons,
+    }
 
 
 PATCH_PARITY_REQUIRED_FIELDS = ["roi_before", "roi_after", "region_metadata", "selected_render_strategy", "transition_context"]
@@ -162,48 +240,10 @@ class GennadyEngine:
     def _reference_family_expected_for_region(region_id: str) -> str:
         if not isinstance(region_id, str) or ":" not in region_id:
             return "unknown"
-        try:
-            _, region_type = parse_region_id(region_id)
-        except ValueError:
-            return "unknown"
-        region_type = str(region_type or "").strip()
+        region_type = _region_type_from_region_id(region_id)
         if not region_type or region_type == "unknown":
             return "unknown"
-
-        identity_regions = {"face", "head", "hair"}
-        skin_regions = {"neck", "left_hand", "right_hand", "hands"}
-        body_shape_regions = {
-            "torso",
-            "upper_body",
-            "lower_body",
-            "pelvis",
-            "left_arm",
-            "right_arm",
-            "left_leg",
-            "right_leg",
-            "legs",
-        }
-        garment_regions = {
-            "upper_garment",
-            "lower_garment",
-            "outer_garment",
-            "inner_garment",
-            "garments",
-            "sleeves",
-        }
-        accessory_regions = {"accessories"}
-
-        if region_type in identity_regions:
-            return "identity"
-        if region_type in skin_regions:
-            return "skin"
-        if region_type in body_shape_regions:
-            return "body_shape"
-        if region_type in garment_regions:
-            return "garment"
-        if region_type in accessory_regions:
-            return "accessory"
-        return "unknown"
+        return reference_family_for_region(region_type)
 
     @staticmethod
     def _extract_patch_reference_usage(patch_debug: dict[str, object]) -> dict[str, object]:
@@ -570,6 +610,7 @@ class GennadyEngine:
                     learned_target_profile = learned_human_state_contract.get("target_profile", {}) if isinstance(learned_human_state_contract.get("target_profile", {}), dict) else {}
                 if not learned_target_profile and isinstance(learned_temporal_contract, dict):
                     learned_target_profile = learned_temporal_contract.get("target_profile", {}) if isinstance(learned_temporal_contract.get("target_profile", {}), dict) else {}
+                reference_payload_context = _serialize_reference_payload_context(region.region_id, region_memory_bundle)
                 patch_request = PatchSynthesisRequest(
                     region=region,
                     scene_state=scene_graph,
@@ -594,6 +635,7 @@ class GennadyEngine:
                         "region_memory_bundle_serialized": asdict(region_memory_bundle),
                         "region_memory_support_level": region_memory_bundle.memory_support_level,
                         "region_memory_retrieval_reasons": list(region_memory_bundle.retrieval_reasons),
+                        **reference_payload_context,
                     },
                     retrieval_summary={
                         "backend": "learned_primary",

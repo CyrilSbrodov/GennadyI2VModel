@@ -6,6 +6,14 @@ import random
 
 from core.semantic_roi import SemanticROIHelper
 from core.region_ids import make_region_id, parse_region_id
+from core.reference_families import (
+    ACCESSORY_REFERENCE_REGIONS as SHARED_ACCESSORY_REFERENCE_REGIONS,
+    BODY_SHAPE_REFERENCE_REGIONS as SHARED_BODY_SHAPE_REFERENCE_REGIONS,
+    CORE_IDENTITY_REGIONS as SHARED_CORE_IDENTITY_REGIONS,
+    GARMENT_REFERENCE_REGIONS as SHARED_GARMENT_REFERENCE_REGIONS,
+    SKIN_REFERENCE_REGIONS as SHARED_SKIN_REFERENCE_REGIONS,
+    reference_kind_for_region,
+)
 from core.schema import (
     BBox,
     CanonicalRegionMemoryEntry,
@@ -13,6 +21,7 @@ from core.schema import (
     HiddenRegionSlot,
     MemoryEntry,
     RegionDescriptor,
+    ReferencePatchPayload,
     SceneGraph,
     TexturePatchMemory,
     VideoMemory,
@@ -22,14 +31,20 @@ from utils_tensor import crop, mean_color, shape
 
 
 class MemoryManager:
-    CORE_IDENTITY_REGIONS = {"face", "head", "hair"}
-    IDENTITY_SENSITIVE_REGIONS = CORE_IDENTITY_REGIONS
-    SKIN_REFERENCE_REGIONS = {"face", "neck", "left_hand", "right_hand", "hands", "left_arm", "right_arm"}
-    BODY_SHAPE_REGIONS = {"torso", "upper_body", "lower_body", "pelvis", "left_arm", "right_arm", "left_hand", "right_hand", "left_leg", "right_leg", "legs"}
-    GARMENT_REFERENCE_REGIONS = {"upper_garment", "lower_garment", "outer_garment", "inner_garment", "garments", "sleeves"}
-    ACCESSORY_REFERENCE_REGIONS = {"accessories"}
-    APPEARANCE_SENSITIVE_REGIONS = CORE_IDENTITY_REGIONS | BODY_SHAPE_REGIONS | SKIN_REFERENCE_REGIONS | GARMENT_REFERENCE_REGIONS | ACCESSORY_REFERENCE_REGIONS
-    GARMENT_SENSITIVE_REGIONS = GARMENT_REFERENCE_REGIONS
+    CORE_IDENTITY_REGIONS = SHARED_CORE_IDENTITY_REGIONS
+    IDENTITY_SENSITIVE_REGIONS = SHARED_CORE_IDENTITY_REGIONS
+    SKIN_REFERENCE_REGIONS = SHARED_SKIN_REFERENCE_REGIONS
+    BODY_SHAPE_REGIONS = SHARED_BODY_SHAPE_REFERENCE_REGIONS
+    GARMENT_REFERENCE_REGIONS = SHARED_GARMENT_REFERENCE_REGIONS
+    ACCESSORY_REFERENCE_REGIONS = SHARED_ACCESSORY_REFERENCE_REGIONS
+    APPEARANCE_SENSITIVE_REGIONS = (
+        SHARED_CORE_IDENTITY_REGIONS
+        | SHARED_BODY_SHAPE_REFERENCE_REGIONS
+        | SHARED_SKIN_REFERENCE_REGIONS
+        | SHARED_GARMENT_REFERENCE_REGIONS
+        | SHARED_ACCESSORY_REFERENCE_REGIONS
+    )
+    GARMENT_SENSITIVE_REGIONS = SHARED_GARMENT_REFERENCE_REGIONS
     REFERENCE_THRESHOLDS = {
         "identity_reference": (0.70, 0.65),
         "skin_reference": (0.66, 0.62),
@@ -156,16 +171,9 @@ class MemoryManager:
 
     def _reference_kind_for_region(self, region_type: str) -> str:
         canonical = self._canonical_from_region_type(region_type) or region_type
-        if self._is_core_identity_region(canonical):
-            return "identity_reference"
-        if self._is_skin_reference_region(canonical):
-            return "skin_reference"
-        if self._is_body_shape_region(canonical):
-            return "body_shape_reference"
-        if self._is_garment_reference_region(canonical):
-            return "garment_reference"
-        if self._is_accessory_reference_region(canonical):
-            return "accessory_reference"
+        kind = reference_kind_for_region(canonical)
+        if kind != "none":
+            return kind
         if canonical in self.APPEARANCE_SENSITIVE_REGIONS:
             return "appearance_reference"
         return "none"
@@ -790,6 +798,32 @@ class MemoryManager:
         elif weak:
             support_level = "weak"
 
+        identity_payload = self._build_reference_patch_payload(memory, identity_reference, "identity_reference", reasons, support_level)
+        skin_payload = self._build_reference_patch_payload(memory, skin_reference, "skin_reference", reasons, support_level)
+        body_shape_payload = self._build_reference_patch_payload(memory, body_shape_reference, "body_shape_reference", reasons, support_level)
+        garment_payload = self._build_reference_patch_payload(memory, garment_reference, "garment_reference", reasons, support_level)
+        accessory_payload = self._build_reference_patch_payload(memory, accessory_reference, "accessory_reference", reasons, support_level)
+        appearance_payload = self._build_reference_patch_payload(memory, appearance_reference, "appearance_reference", reasons, support_level)
+        for kind, payload in (
+            ("identity_reference", identity_payload),
+            ("skin_reference", skin_payload),
+            ("body_shape_reference", body_shape_payload),
+            ("garment_reference", garment_payload),
+            ("accessory_reference", accessory_payload),
+            ("appearance_reference", appearance_payload),
+        ):
+            if payload is not None:
+                reasons.append(f"{kind}_payload_available")
+                payload.retrieval_reasons.append(f"{kind}_payload_available")
+                if payload.patch_id is None:
+                    reasons.append(f"{kind}_payload_without_patch_cache")
+                    payload.retrieval_reasons.append(f"{kind}_payload_without_patch_cache")
+        reference_payloads = [
+            payload
+            for payload in (identity_payload, skin_payload, body_shape_payload, garment_payload, accessory_payload, appearance_payload)
+            if payload is not None
+        ]
+
         return RegionMemoryBundle(
             entity_id=entity_id,
             canonical_region=canonical_region,
@@ -801,6 +835,13 @@ class MemoryManager:
             body_shape_reference=body_shape_reference,
             garment_reference=garment_reference,
             accessory_reference=accessory_reference,
+            identity_reference_payload=identity_payload,
+            skin_reference_payload=skin_payload,
+            body_shape_reference_payload=body_shape_payload,
+            garment_reference_payload=garment_payload,
+            accessory_reference_payload=accessory_payload,
+            appearance_reference_payload=appearance_payload,
+            reference_payloads=reference_payloads,
             hidden_slot=hidden_slot,
             reveal_lifecycle=entry.reveal_lifecycle if entry else "unknown",
             memory_support_level=support_level,
@@ -813,6 +854,112 @@ class MemoryManager:
             has_garment_reference=garment_reference is not None,
             has_accessory_reference=accessory_reference is not None,
             has_hidden_slot=hidden_slot is not None,
+        )
+
+
+    def _compact_patch_descriptor(self, descriptor: dict[str, object] | None) -> dict[str, object]:
+        compact: dict[str, object] = {}
+        if not isinstance(descriptor, dict):
+            return compact
+        for key, value in descriptor.items():
+            if len(compact) >= 16:
+                break
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                compact[str(key)] = float(value)
+            elif isinstance(value, (list, tuple)):
+                numeric = [float(v) for v in value[:16] if isinstance(v, (int, float)) and not isinstance(v, bool)]
+                if numeric:
+                    compact[str(key)] = numeric
+            elif isinstance(value, dict):
+                nested = self._compact_patch_descriptor(value)
+                if nested:
+                    compact[str(key)] = nested
+        return compact
+
+    def _find_reference_texture_patch(
+        self,
+        memory: VideoMemory,
+        entry: CanonicalRegionMemoryEntry,
+    ) -> TexturePatchMemory | None:
+        candidates: list[TexturePatchMemory] = []
+        for patch in memory.texture_patches.values():
+            if patch.entity_id != entry.entity_id:
+                continue
+            patch_region = self._canonical_from_region_type(patch.region_type) or patch.region_type
+            entry_region = self._canonical_from_region_type(entry.canonical_region) or entry.canonical_region
+            if patch_region != entry_region:
+                continue
+            candidates.append(patch)
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda patch: (
+                -abs(int(patch.source_frame) - int(entry.source_frame)),
+                float(patch.evidence_score),
+                float(patch.confidence),
+            ),
+        )
+
+    def _build_reference_patch_payload(
+        self,
+        memory: VideoMemory,
+        entry: CanonicalRegionMemoryEntry | None,
+        reference_kind: str,
+        retrieval_reasons: list[str],
+        memory_support_level: str,
+    ) -> ReferencePatchPayload | None:
+        if entry is None:
+            return None
+        evidence_threshold, confidence_threshold = self._reference_thresholds(reference_kind)
+        if not (
+            entry.reliable_as_reference
+            and entry.reference_kind == reference_kind
+            and entry.observed_directly
+            and not entry.generated
+            and not entry.inferred
+            and entry.evidence_score >= evidence_threshold
+            and entry.confidence >= confidence_threshold
+        ):
+            return None
+
+        patch = self._find_reference_texture_patch(memory, entry)
+        reasons = list(retrieval_reasons)
+        patch_id: str | None = None
+        patch_ref: str | None = None
+        descriptor: dict[str, object] = {}
+        confidence = float(entry.confidence)
+        evidence_score = float(entry.evidence_score)
+        if patch is not None:
+            patch_id = patch.patch_id
+            patch_ref = patch.patch_ref
+            descriptor = self._compact_patch_descriptor(patch.descriptor)
+            confidence = min(confidence, max(0.0, float(patch.confidence)))
+            evidence_score = min(evidence_score, max(0.0, float(patch.evidence_score))) if patch.evidence_score > 0 else evidence_score
+        else:
+            reasons.append("reference_payload_without_patch_cache")
+            reasons.append(f"{reference_kind}_payload_without_patch_cache")
+
+        return ReferencePatchPayload(
+            reference_kind=reference_kind,
+            region_id=make_region_id(entry.entity_id, entry.canonical_region),
+            canonical_region=entry.canonical_region,
+            entity_id=entry.entity_id,
+            patch_id=patch_id,
+            patch_ref=patch_ref,
+            source_frame=int(entry.source_frame),
+            confidence=confidence,
+            evidence_score=evidence_score,
+            evidence_quality=entry.evidence_quality,
+            observed_directly=bool(entry.observed_directly),
+            generated=bool(entry.generated),
+            inferred=bool(entry.inferred),
+            provenance=entry.provenance,
+            memory_support_level=memory_support_level,
+            descriptor=descriptor,
+            retrieval_reasons=reasons,
         )
 
     def debug_canonical_memory(self, memory: VideoMemory, entity_id: str | None = None) -> dict[str, object]:

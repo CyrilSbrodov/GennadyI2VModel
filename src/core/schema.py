@@ -382,6 +382,27 @@ class CanonicalRegionMemoryEntry:
 
 
 @dataclass(slots=True)
+class ReferencePatchPayload:
+    reference_kind: str
+    region_id: str
+    canonical_region: str
+    entity_id: str
+    patch_id: str | None = None
+    patch_ref: str | None = None
+    source_frame: int = 0
+    confidence: float = 0.0
+    evidence_score: float = 0.0
+    evidence_quality: str = "weak"
+    observed_directly: bool = False
+    generated: bool = False
+    inferred: bool = False
+    provenance: str = "unknown"
+    memory_support_level: str = "none"
+    descriptor: dict[str, object] = field(default_factory=dict)
+    retrieval_reasons: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class RegionMemoryBundle:
     entity_id: str
     canonical_region: str
@@ -393,6 +414,13 @@ class RegionMemoryBundle:
     body_shape_reference: CanonicalRegionMemoryEntry | None = None
     garment_reference: CanonicalRegionMemoryEntry | None = None
     accessory_reference: CanonicalRegionMemoryEntry | None = None
+    identity_reference_payload: ReferencePatchPayload | None = None
+    skin_reference_payload: ReferencePatchPayload | None = None
+    body_shape_reference_payload: ReferencePatchPayload | None = None
+    garment_reference_payload: ReferencePatchPayload | None = None
+    accessory_reference_payload: ReferencePatchPayload | None = None
+    appearance_reference_payload: ReferencePatchPayload | None = None
+    reference_payloads: list[ReferencePatchPayload] = field(default_factory=list)
     hidden_slot: HiddenRegionSlot | None = None
     reveal_lifecycle: str = "unknown"
     memory_support_level: MemorySupportLevel = "none"
