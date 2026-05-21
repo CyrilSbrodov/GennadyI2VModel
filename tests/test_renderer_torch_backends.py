@@ -130,3 +130,73 @@ def test_renderer_can_load_saved_torch_checkpoints_when_available(tmp_path: Path
     assert backend_trace["checkpoint_trace"]["loaded"]
     assert backend_trace["checkpoint_status"] in {"checkpoint_loaded", "checkpoint_file_missing"}
     assert patch.execution_trace["module_trace"]["backend_selection"] in {"torch_learned_primary", "torch_learned_unusable_fallback", "bootstrap_fallback"}
+
+
+def test_torch_local_patch_generator_upgrades_legacy_9_channel_checkpoint(tmp_path: Path) -> None:
+    import pytest
+
+    torch = pytest.importorskip("torch")
+    from rendering.patch_conditioning_contract import GLOBAL_COND_DIM
+    from rendering.torch_local_patch_generator import BASE_LOCAL_INPUT_CHANNELS, LOCAL_INPUT_CHANNELS, TorchLocalPatchGenerator, TorchLocalPatchGeneratorNet
+
+    legacy = TorchLocalPatchGeneratorNet(global_dim=GLOBAL_COND_DIM, input_channels=BASE_LOCAL_INPUT_CHANNELS)
+    with torch.no_grad():
+        legacy.encoder[0].weight.fill_(0.25)
+    checkpoint = tmp_path / "legacy_9_channel.pt"
+    torch.save({"state_dict": legacy.state_dict(), "local_input_channels": BASE_LOCAL_INPUT_CHANNELS}, str(checkpoint))
+
+    loaded = TorchLocalPatchGenerator.load(str(checkpoint))
+    weight = loaded.net.encoder[0].weight.detach().cpu()
+
+    assert loaded.net.input_channels == LOCAL_INPUT_CHANNELS
+    assert torch.allclose(weight[:, :BASE_LOCAL_INPUT_CHANNELS], legacy.encoder[0].weight.detach().cpu())
+    assert torch.count_nonzero(weight[:, BASE_LOCAL_INPUT_CHANNELS:]) == 0
+    assert loaded.checkpoint_compatibility["checkpoint_reference_channel_upgrade"] is True
+
+
+def test_torch_local_patch_generator_rejects_incomplete_checkpoint(tmp_path: Path) -> None:
+    import pytest
+
+    torch = pytest.importorskip("torch")
+    from rendering.torch_local_patch_generator import TorchLocalPatchGenerator
+
+    model = TorchLocalPatchGenerator()
+    state = model.net.state_dict()
+    state.pop("encoder.2.weight")
+    checkpoint = tmp_path / "missing_key.pt"
+    torch.save({"state_dict": state}, str(checkpoint))
+
+    with pytest.raises(ValueError, match="key mismatch"):
+        TorchLocalPatchGenerator.load(str(checkpoint))
+
+
+def test_torch_local_patch_generator_rejects_unexpected_checkpoint_key(tmp_path: Path) -> None:
+    import pytest
+
+    torch = pytest.importorskip("torch")
+    from rendering.torch_local_patch_generator import TorchLocalPatchGenerator
+
+    model = TorchLocalPatchGenerator()
+    state = model.net.state_dict()
+    state["unexpected.weight"] = torch.zeros(1)
+    checkpoint = tmp_path / "unexpected_key.pt"
+    torch.save({"state_dict": state}, str(checkpoint))
+
+    with pytest.raises(ValueError, match="key mismatch"):
+        TorchLocalPatchGenerator.load(str(checkpoint))
+
+
+def test_torch_local_patch_generator_rejects_unsupported_shape_mismatch(tmp_path: Path) -> None:
+    import pytest
+
+    torch = pytest.importorskip("torch")
+    from rendering.torch_local_patch_generator import TorchLocalPatchGenerator
+
+    model = TorchLocalPatchGenerator()
+    state = model.net.state_dict()
+    state["encoder.2.weight"] = state["encoder.2.weight"][:, :1, :, :]
+    checkpoint = tmp_path / "bad_shape.pt"
+    torch.save({"state_dict": state}, str(checkpoint))
+
+    with pytest.raises(ValueError, match="tensor shape mismatch"):
+        TorchLocalPatchGenerator.load(str(checkpoint))

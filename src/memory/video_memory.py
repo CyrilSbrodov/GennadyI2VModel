@@ -4,6 +4,8 @@ from dataclasses import asdict
 import math
 import random
 
+import numpy as np
+
 from core.semantic_roi import SemanticROIHelper
 from core.region_ids import make_region_id, parse_region_id
 from core.reference_families import (
@@ -21,6 +23,7 @@ from core.schema import (
     HiddenRegionSlot,
     MemoryEntry,
     RegionDescriptor,
+    ReferencePatchMaterial,
     ReferencePatchPayload,
     SceneGraph,
     TexturePatchMemory,
@@ -472,6 +475,7 @@ class MemoryManager:
                     coverage_targets=self._default_coverage_targets(region_type),
                     attachment_targets=self._default_attachment_targets(region_type),
                     suitable_for_reveal=region_type in {"torso", "sleeves", "garments", "pelvis"},
+                    rgb_patch=self._bounded_rgb_patch(patch),
                 )
                 memory.patch_cache[patch_id] = patch
 
@@ -961,6 +965,117 @@ class MemoryManager:
             descriptor=descriptor,
             retrieval_reasons=reasons,
         )
+
+
+    def _bounded_rgb_patch(self, patch: object, target_shape: tuple[int, int] | None = None, max_size: int = 64) -> list | None:
+        arr = np.asarray(patch, dtype=np.float32)
+        if arr.ndim != 3 or arr.shape[2] != 3 or arr.shape[0] <= 0 or arr.shape[1] <= 0:
+            return None
+        arr = np.clip(arr, 0.0, 1.0)
+        h, w, _ = arr.shape
+        if target_shape is not None:
+            th, tw = int(target_shape[0]), int(target_shape[1])
+        else:
+            scale = min(1.0, float(max_size) / float(max(h, w)))
+            th = max(1, int(round(h * scale)))
+            tw = max(1, int(round(w * scale)))
+        th = max(1, min(max_size, th))
+        tw = max(1, min(max_size, tw))
+        if (th, tw) != (h, w):
+            ys = np.linspace(0, h - 1, th).round().astype(int)
+            xs = np.linspace(0, w - 1, tw).round().astype(int)
+            arr = arr[ys][:, xs]
+        return arr.astype(np.float32).tolist()
+
+    def _material_from_payload(
+        self,
+        payload: ReferencePatchPayload,
+        *,
+        reason: str,
+        rgb_patch: list | None = None,
+        material_source: str = "unknown",
+        material_trusted: bool = False,
+    ) -> ReferencePatchMaterial:
+        return ReferencePatchMaterial(
+            reference_kind=payload.reference_kind,
+            region_id=payload.region_id,
+            canonical_region=payload.canonical_region,
+            entity_id=payload.entity_id,
+            source_patch_id=payload.patch_id,
+            source_patch_ref=payload.patch_ref,
+            rgb_patch=rgb_patch,
+            alpha_or_mask=None,
+            descriptor=dict(payload.descriptor or {}),
+            confidence=float(payload.confidence),
+            evidence_score=float(payload.evidence_score),
+            observed_directly=bool(payload.observed_directly),
+            generated=bool(payload.generated),
+            inferred=bool(payload.inferred),
+            provenance=payload.provenance,
+            material_source=material_source,
+            material_trusted=bool(material_trusted),
+            material_missing_reason=reason,
+        )
+
+    def build_reference_patch_material(
+        self,
+        memory: VideoMemory,
+        payload: ReferencePatchPayload | None,
+        target_shape: tuple[int, int] | None = None,
+    ) -> ReferencePatchMaterial | None:
+        if payload is None:
+            return None
+        expected_kind = reference_kind_for_region(payload.canonical_region)
+        if expected_kind != "none" and payload.reference_kind != expected_kind:
+            return self._material_from_payload(payload, reason="region_mismatch")
+        min_evidence, min_confidence = self._reference_thresholds(payload.reference_kind)
+        if payload.generated or payload.inferred:
+            return self._material_from_payload(payload, reason="generated_or_inferred")
+        if not payload.observed_directly:
+            return self._material_from_payload(payload, reason="payload_untrusted")
+        if payload.confidence < min_confidence:
+            return self._material_from_payload(payload, reason="low_confidence")
+        if payload.evidence_score < min_evidence:
+            return self._material_from_payload(payload, reason="low_evidence")
+        if not payload.patch_id:
+            return self._material_from_payload(payload, reason="patch_id_missing")
+
+        patch = memory.texture_patches.get(payload.patch_id)
+        if patch is None:
+            return self._material_from_payload(payload, reason="patch_not_found")
+        if patch.entity_id != payload.entity_id:
+            return self._material_from_payload(payload, reason="entity_mismatch")
+        patch_region = self._canonical_from_region_type(patch.region_type) or patch.region_type
+        payload_region = self._canonical_from_region_type(payload.canonical_region) or payload.canonical_region
+        if patch_region != payload_region:
+            return self._material_from_payload(payload, reason="region_mismatch")
+        patch_kind = reference_kind_for_region(patch_region)
+        if patch_kind != "none" and patch_kind != payload.reference_kind:
+            return self._material_from_payload(payload, reason="region_mismatch")
+
+        source = "texture_patch.rgb_patch"
+        raw_patch = getattr(patch, "rgb_patch", None)
+        if raw_patch is None:
+            raw_patch = memory.patch_cache.get(payload.patch_id)
+            source = "memory.patch_cache" if raw_patch is not None else source
+        bounded = self._bounded_rgb_patch(raw_patch, target_shape=target_shape) if raw_patch is not None else None
+        if bounded is None:
+            return self._material_from_payload(payload, reason="patch_tensor_missing", material_source=source)
+        descriptor = dict(payload.descriptor or {})
+        descriptor.setdefault("source_patch_region", patch.region_type)
+        descriptor.setdefault("source_patch_semantic_family", patch.semantic_family)
+        material = self._material_from_payload(
+            payload,
+            reason="",
+            rgb_patch=bounded,
+            material_source=source,
+            material_trusted=True,
+        )
+        material.descriptor = descriptor
+        material.source_patch_ref = payload.patch_ref or patch.patch_ref
+        material.confidence = min(float(payload.confidence), float(patch.confidence))
+        material.evidence_score = min(float(payload.evidence_score), float(patch.evidence_score)) if patch.evidence_score > 0 else float(payload.evidence_score)
+        return material
 
     def debug_canonical_memory(self, memory: VideoMemory, entity_id: str | None = None) -> dict[str, object]:
         entries = self.get_region_memory_entries(memory, entity_id=entity_id)

@@ -13,6 +13,7 @@ from core.reference_families import (
     CORE_IDENTITY_REGIONS,
     GARMENT_REFERENCE_REGIONS,
     SKIN_REFERENCE_REGIONS,
+    reference_kind_for_region,
 )
 from rendering.patch_conditioning_contract import (
     APPEARANCE_DIM,
@@ -112,6 +113,9 @@ class PatchBatch:
     memory_cond: np.ndarray
     appearance_cond: np.ndarray
     bbox_cond: np.ndarray
+    reference_rgb: np.ndarray | None = None
+    reference_mask: np.ndarray | None = None
+    reference_validity: np.ndarray | None = None
     mode_cond: np.ndarray | None = None
     role_cond: np.ndarray | None = None
     preservation_mask: np.ndarray | None = None
@@ -1044,6 +1048,174 @@ def extract_reference_payload_conditioning(transition_context: dict[str, object]
     return summarize_reference_payload_trace(transition_context)
 
 
+def _reference_material_shape(material: dict[str, object] | None) -> list[int]:
+    if not isinstance(material, dict):
+        return []
+    rgb = material.get("rgb_patch")
+    try:
+        arr = np.asarray(rgb, dtype=np.float32)
+    except (TypeError, ValueError):
+        return []
+    return [int(x) for x in arr.shape] if arr.ndim > 0 else []
+
+
+def validate_reference_material_for_request(request: PatchSynthesisRequest, material_dict: object) -> dict[str, object]:
+    if not isinstance(material_dict, dict):
+        return {"valid": False, "reason": "material_missing", "shape": []}
+    shape_value = _reference_material_shape(material_dict)
+    try:
+        entity_id, region_type = parse_region_id(request.region.region_id)
+    except Exception:
+        entity_id, region_type = "", str(getattr(request.region, "region_id", ""))
+    expected_kind = reference_kind_for_region(region_type)
+    material_kind = str(material_dict.get("reference_kind", ""))
+    material_region = str(material_dict.get("canonical_region", ""))
+    identity_subregion_compatible = (
+        region_type in {"eyes", "mouth", "cheek"}
+        and material_kind == "identity_reference"
+        and material_region in CORE_IDENTITY_REGIONS
+    )
+    if expected_kind != "none" and material_kind != expected_kind and not identity_subregion_compatible:
+        return {"valid": False, "reason": "kind_mismatch", "shape": shape_value}
+    if material_region != str(region_type) and not identity_subregion_compatible:
+        return {"valid": False, "reason": "region_mismatch", "shape": shape_value}
+    if str(material_dict.get("entity_id", "")) != str(entity_id):
+        return {"valid": False, "reason": "entity_mismatch", "shape": shape_value}
+    ctx = request.transition_context if isinstance(request.transition_context, dict) else {}
+    expected_payload = ctx.get("expected_reference_payload")
+    if isinstance(expected_payload, dict):
+        payload_pairs = (
+            ("source_patch_id", "patch_id"),
+            ("reference_kind", "reference_kind"),
+            ("entity_id", "entity_id"),
+            ("canonical_region", "canonical_region"),
+        )
+        for material_key, payload_key in payload_pairs:
+            payload_value = expected_payload.get(payload_key)
+            if payload_value is not None and str(material_dict.get(material_key, "")) != str(payload_value):
+                return {"valid": False, "reason": "payload_material_mismatch", "shape": shape_value}
+    if bool(material_dict.get("generated", False)) or bool(material_dict.get("inferred", False)):
+        return {"valid": False, "reason": "generated_or_inferred", "shape": shape_value}
+    if not bool(material_dict.get("observed_directly", False)):
+        return {"valid": False, "reason": "not_observed_directly", "shape": shape_value}
+    min_confidence, min_evidence = (0.65, 0.70) if material_kind == "identity_reference" else (0.58, 0.58)
+    if _safe_float(material_dict.get("confidence")) < min_confidence:
+        return {"valid": False, "reason": "low_confidence", "shape": shape_value}
+    if _safe_float(material_dict.get("evidence_score")) < min_evidence:
+        return {"valid": False, "reason": "low_evidence", "shape": shape_value}
+    if not (len(shape_value) == 3 and shape_value[2] == 3 and shape_value[0] > 0 and shape_value[1] > 0):
+        return {"valid": False, "reason": "invalid_rgb_shape", "shape": shape_value}
+    if not bool(material_dict.get("material_trusted", False)):
+        return {"valid": False, "reason": "material_untrusted", "shape": shape_value}
+    return {"valid": True, "reason": "", "shape": shape_value}
+
+
+def summarize_reference_material_trace(transition_context: dict[str, object] | None, request: PatchSynthesisRequest | None = None) -> dict[str, object]:
+    ctx = transition_context if isinstance(transition_context, dict) else {}
+    material = ctx.get("expected_reference_patch_material")
+    material_dict = material if isinstance(material, dict) else None
+    payload_trace = summarize_reference_payload_trace(ctx)
+    trace_reasons = ctx.get("reference_patch_material_trace_reasons", [])
+    if request is not None:
+        validation = validate_reference_material_for_request(request, material_dict)
+        shape_value = list(validation.get("shape", [])) if isinstance(validation.get("shape", []), list) else []
+        validation_valid = bool(validation.get("valid", False))
+        material_validated = validation_valid
+        payload_trusted = bool(payload_trace.get("reference_payload_trusted", False))
+        used = bool(validation_valid and payload_trusted)
+        material_trusted = bool(validation_valid and payload_trusted)
+        if used:
+            missing_reason = ""
+        elif not validation_valid:
+            missing_reason = str(validation.get("reason", "material_invalid") or "material_invalid")
+        elif not payload_trusted:
+            payload_reason = str(payload_trace.get("reference_payload_untrusted_reason", "") or "expected_reference_payload_missing")
+            missing_reason = "expected_reference_payload_missing" if payload_reason == "missing" else payload_reason
+        else:
+            missing_reason = "material_missing"
+    else:
+        shape_value = _reference_material_shape(material_dict)
+        arr_valid = len(shape_value) == 3 and shape_value[2] == 3 and shape_value[0] > 0 and shape_value[1] > 0
+        material_validated = bool(material_dict and material_dict.get("material_trusted", False) and arr_valid)
+        payload_trusted = bool(payload_trace.get("reference_payload_trusted", False))
+        material_trusted = bool(material_validated and payload_trusted)
+        used = bool(material_trusted)
+        if used:
+            missing_reason = ""
+        elif material_dict is None:
+            missing_reason = "material_missing"
+        elif not material_validated:
+            missing_reason = str(material_dict.get("material_missing_reason", "material_untrusted") or "material_untrusted")
+        elif not payload_trusted:
+            payload_reason = str(payload_trace.get("reference_payload_untrusted_reason", "") or "expected_reference_payload_missing")
+            missing_reason = "expected_reference_payload_missing" if payload_reason == "missing" else payload_reason
+        else:
+            missing_reason = "material_untrusted"
+    return {
+        **payload_trace,
+        "reference_patch_material_present": material_dict is not None,
+        "reference_patch_material_validated": material_validated,
+        "reference_patch_material_trusted": material_trusted,
+        "reference_patch_material_used": used,
+        "reference_patch_material_source": str(material_dict.get("material_source", "unknown")) if material_dict else "none",
+        "reference_patch_material_missing_reason": missing_reason,
+        "reference_patch_material_shape": shape_value,
+        "reference_patch_material_kind": str(material_dict.get("reference_kind", "")) if material_dict else "",
+        "reference_patch_material_confidence": _safe_float(material_dict.get("confidence")) if material_dict else 0.0,
+        "reference_patch_material_evidence_score": _safe_float(material_dict.get("evidence_score")) if material_dict else 0.0,
+        "reference_patch_material_trace_reasons": list(trace_reasons) if isinstance(trace_reasons, list) else [],
+    }
+
+
+def extract_reference_material_conditioning(transition_context: dict[str, object] | None, request: PatchSynthesisRequest | None = None) -> dict[str, object]:
+    return summarize_reference_material_trace(transition_context, request=request)
+
+
+def _resize_hw3_nearest(arr: np.ndarray, shape_hw: tuple[int, int]) -> np.ndarray:
+    h, w = shape_hw
+    if arr.ndim != 3 or arr.shape[2] != 3 or h <= 0 or w <= 0:
+        return np.zeros((h, w, 3), dtype=np.float32)
+    ys = np.linspace(0, arr.shape[0] - 1, h).round().astype(int)
+    xs = np.linspace(0, arr.shape[1] - 1, w).round().astype(int)
+    return np.clip(arr[ys][:, xs], 0.0, 1.0).astype(np.float32)
+
+
+def _reference_material_tensors(request: PatchSynthesisRequest, roi_before: np.ndarray, material_cond: dict[str, object]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    h, w, _ = roi_before.shape
+    zeros_rgb = np.zeros_like(roi_before, dtype=np.float32)
+    zeros_mask = np.zeros((h, w, 1), dtype=np.float32)
+    if not bool(material_cond.get("reference_patch_material_used", False)):
+        return zeros_rgb, zeros_mask, zeros_mask.copy()
+    ctx = request.transition_context if isinstance(request.transition_context, dict) else {}
+    material = ctx.get("expected_reference_patch_material")
+    if not isinstance(material, dict):
+        return zeros_rgb, zeros_mask, zeros_mask.copy()
+    try:
+        raw_rgb = np.asarray(material.get("rgb_patch"), dtype=np.float32)
+    except (TypeError, ValueError):
+        return zeros_rgb, zeros_mask, zeros_mask.copy()
+    if raw_rgb.ndim != 3 or raw_rgb.shape[2] != 3 or raw_rgb.shape[0] <= 0 or raw_rgb.shape[1] <= 0:
+        return zeros_rgb, zeros_mask, zeros_mask.copy()
+    rgb = _resize_hw3_nearest(raw_rgb, (h, w))
+    raw_mask = material.get("alpha_or_mask")
+    mask = None
+    if raw_mask is not None:
+        try:
+            mask_arr = np.asarray(raw_mask, dtype=np.float32)
+            if mask_arr.ndim == 2:
+                mask_arr = mask_arr[..., None]
+            if mask_arr.ndim == 3:
+                if mask_arr.shape[2] != 1:
+                    mask_arr = np.mean(mask_arr, axis=2, keepdims=True)
+                mask = _resize_hw3_nearest(np.repeat(mask_arr, 3, axis=2), (h, w))[..., :1]
+        except (TypeError, ValueError):
+            mask = None
+    if mask is None:
+        mask = np.ones((h, w, 1), dtype=np.float32)
+    validity = np.ones((h, w, 1), dtype=np.float32)
+    return rgb.astype(np.float32), np.clip(mask, 0.0, 1.0).astype(np.float32), validity
+
+
 def _descriptor_numeric_signal(descriptor: object) -> float:
     values: list[float] = []
     def collect(value: object) -> None:
@@ -1082,6 +1254,7 @@ def extract_memory_bundle_conditioning_from_context(transition_context: dict[str
     if not low_evidence_newly_revealed and hidden_type == "newly_revealed":
         low_evidence_newly_revealed = support_level in {"none", "weak"} or reason_has_low_evidence
     reference_payload_cond = extract_reference_payload_conditioning(transition_context)
+    reference_material_cond = extract_reference_material_conditioning(transition_context)
     active_hidden_support = bool(trace.get("memory_bundle_hidden_support_active", False) and not reveal_like_hidden)
     has_identity_reference = bool(trace.get("memory_bundle_has_identity_reference", False))
     identity_strength, identity_blocked, identity_source, identity_block_reasons, identity_used = _identity_reference_strength(
@@ -1161,11 +1334,15 @@ def extract_memory_bundle_conditioning_from_context(transition_context: dict[str
         "memory_bundle_retrieval_reasons": retrieval_reasons,
         "memory_bundle_low_evidence_newly_revealed": low_evidence_newly_revealed,
         **reference_payload_cond,
+        **reference_material_cond,
     }
 
 
 def extract_memory_bundle_conditioning(request: PatchSynthesisRequest) -> dict[str, object]:
-    return extract_memory_bundle_conditioning_from_context(request.transition_context if isinstance(request.transition_context, dict) else {})
+    ctx = request.transition_context if isinstance(request.transition_context, dict) else {}
+    cond = extract_memory_bundle_conditioning_from_context(ctx)
+    cond.update(extract_reference_material_conditioning(ctx, request=request))
+    return cond
 
 
 def apply_memory_bundle_conditioning_to_vectors(
@@ -1203,7 +1380,7 @@ def apply_memory_bundle_conditioning_to_vectors(
             or garment_usable
             or accessory_usable
         )
-        mem_vec[8] = float(np.clip(max(float(mem_vec[8]), 1.0 if usable_reference_present else 0.0), 0.0, 1.0))
+        mem_vec[8] = float(np.clip(max(float(mem_vec[8]), 0.35 if usable_reference_present else 0.0), 0.0, 1.0))
     if mem_vec.size > 9:
         mem_vec[9] = float(np.clip(max(float(mem_vec[9]), 1.0 if has_active_hidden else 0.0) - (0.35 if is_revealed_history else 0.0), 0.0, 1.0))
     try:
@@ -1219,7 +1396,7 @@ def apply_memory_bundle_conditioning_to_vectors(
         if mem_vec.size > 2:
             mem_vec[2] = float(np.clip(max(float(mem_vec[2]), 0.35 + 0.55 * identity_bias), 0.0, 1.0))
         if mem_vec.size > 8:
-            mem_vec[8] = float(np.clip(max(float(mem_vec[8]), 0.72 + 0.28 * identity_bias), 0.0, 1.0))
+            mem_vec[8] = float(np.clip(max(float(mem_vec[8]), 0.40 + 0.18 * identity_bias), 0.0, 1.0))
         if mem_vec.size > 9:
             mem_vec[9] = float(np.clip(float(mem_vec[9]) + 0.16 * identity_bias, 0.0, 1.0))
         if appearance.size > 7:
@@ -1233,12 +1410,16 @@ def apply_memory_bundle_conditioning_to_vectors(
         payload_confidence = float(bundle_cond.get("expected_reference_payload_confidence", 0.0))
         payload_evidence = float(bundle_cond.get("expected_reference_payload_evidence_score", 0.0))
         if mem_vec.size > 8:
-            mem_vec[8] = float(np.clip(max(float(mem_vec[8]), 0.85), 0.0, 1.0))
+            mem_vec[8] = float(np.clip(max(float(mem_vec[8]), 0.45), 0.0, 1.0))
         if appearance.size > 7:
             appearance[6] = float(np.clip(appearance[6] + 0.05 * payload_confidence, 0.0, 1.0))
             appearance[7] = float(np.clip(max(0.0, appearance[7] - 0.03 * payload_evidence), 0.0, 1.0))
     elif payload_present and appearance.size > 7:
         appearance[7] = float(np.clip(appearance[7] + 0.035, 0.0, 1.0))
+    if bool(bundle_cond.get("reference_patch_material_used", False)) and mem_vec.size > 8:
+        mem_vec[8] = float(np.clip(max(float(mem_vec[8]), 0.92), 0.0, 1.0))
+    elif bool(bundle_cond.get("reference_patch_material_present", False)) and not bool(bundle_cond.get("reference_patch_material_used", False)) and appearance.size > 7:
+        appearance[7] = float(np.clip(appearance[7] + 0.04, 0.0, 1.0))
     skin_bias = _reference_family_region_bias(
         region_type,
         "skin",
@@ -1270,7 +1451,7 @@ def apply_memory_bundle_conditioning_to_vectors(
         if mem_vec.size > 5:
             mem_vec[5] = float(np.clip(max(float(mem_vec[5]), 0.42 + 0.36 * body_bias), 0.0, 1.0))
         if mem_vec.size > 8:
-            mem_vec[8] = float(np.clip(max(float(mem_vec[8]), 0.58 + 0.32 * body_bias), 0.0, 1.0))
+            mem_vec[8] = float(np.clip(max(float(mem_vec[8]), 0.38 + 0.20 * body_bias), 0.0, 1.0))
         if appearance.size > 7:
             appearance[7] = float(np.clip(max(0.0, appearance[7] - 0.06 * body_bias), 0.0, 1.0))
     if garment_bias > 0.0 and appearance.size > 7:
@@ -1548,6 +1729,21 @@ def _memory_and_appearance_features(request: PatchSynthesisRequest, roi_before: 
         descriptor_signal = _descriptor_numeric_signal(expected_payload.get("descriptor", {}))
         if descriptor_signal > 0.0:
             appearance[6] = float(np.clip(appearance[6] + 0.01 * descriptor_signal, 0.0, 1.0))
+    material = request.transition_context.get("expected_reference_patch_material") if isinstance(request.transition_context, dict) else None
+    if bool(bundle_cond.get("reference_patch_material_used", False)) and isinstance(material, dict):
+        try:
+            ref = np.asarray(material.get("rgb_patch"), dtype=np.float32)
+        except (TypeError, ValueError):
+            ref = np.zeros((0, 0, 3), dtype=np.float32)
+        if ref.ndim == 3 and ref.shape[2] == 3 and ref.size:
+            ref_mean = np.mean(np.clip(ref, 0.0, 1.0), axis=(0, 1))
+            ref_std = np.std(np.clip(ref, 0.0, 1.0), axis=(0, 1))
+            appearance[:3] = np.clip(0.82 * appearance[:3] + 0.18 * ref_mean.astype(np.float32), 0.0, 1.0)
+            appearance[3:6] = np.clip(0.88 * appearance[3:6] + 0.12 * ref_std.astype(np.float32), 0.0, 1.0)
+            if mem_vec.size > 8:
+                mem_vec[8] = float(np.clip(max(float(mem_vec[8]), 0.92), 0.0, 1.0))
+    elif bool(bundle_cond.get("reference_patch_material_present", False)) and appearance.size > 7:
+        appearance[7] = float(np.clip(appearance[7] + 0.05, 0.0, 1.0))
     return mem_vec, appearance
 
 
@@ -1680,6 +1876,8 @@ def _bootstrap_roi_after(
     memory_cond: np.ndarray,
     geometry: dict[str, np.ndarray],
     changed_mask: np.ndarray,
+    reference_rgb: np.ndarray | None = None,
+    reference_validity: np.ndarray | None = None,
 ) -> np.ndarray:
     changed = changed_mask[..., 0]
     mean_rgb = appearance_cond[:3]
@@ -1712,6 +1910,11 @@ def _bootstrap_roi_after(
     edit_mix = changed * (0.40 + 0.60 * profile.edit_strength) * np.clip(local, 0.0, 1.0)
     for c in range(3):
         after[..., c] = np.clip(after[..., c] + edit_mix * (tone[c] + warm_bias[c] * 0.15), 0.0, 1.0)
+    if isinstance(reference_rgb, np.ndarray) and reference_rgb.shape == roi_before.shape:
+        validity = reference_validity if isinstance(reference_validity, np.ndarray) and reference_validity.shape[:2] == roi_before.shape[:2] else np.zeros((*roi_before.shape[:2], 1), dtype=np.float32)
+        support = np.clip(validity[..., 0] * changed * np.clip(local, 0.0, 1.0), 0.0, 1.0)
+        material_mix = support * (0.06 + 0.10 * profile.preservation_strength)
+        after = np.clip(after * (1.0 - material_mix[..., None]) + reference_rgb * material_mix[..., None], 0.0, 1.0)
     return after.astype(np.float32)
 
 
@@ -1723,7 +1926,9 @@ def _build_targets(
     memory_cond: np.ndarray,
     appearance_cond: np.ndarray,
     region_type: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    reference_rgb: np.ndarray | None = None,
+    reference_validity: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     h, w, _ = roi_before.shape
     geometry = _geometry_priors(h, w, region_type, profile)
     changed_mask, blend_hint, alpha_target, uncertainty_target, preservation_mask, seam_prior = _compose_region_priors(
@@ -1733,7 +1938,7 @@ def _build_targets(
         memory_cond,
         geometry,
     )
-    roi_after = _bootstrap_roi_after(roi_before, profile, appearance_cond, memory_cond, geometry, changed_mask)
+    roi_after = _bootstrap_roi_after(roi_before, profile, appearance_cond, memory_cond, geometry, changed_mask, reference_rgb, reference_validity)
     return roi_after, changed_mask, blend_hint, alpha_target, uncertainty_target, preservation_mask, seam_prior
 
 
@@ -1764,6 +1969,20 @@ def summarize_patch_batch(batch: PatchBatch) -> dict[str, object]:
         "reference_payload_untrusted_reason": batch.conditioning_summary.get("reference_payload_untrusted_reason", ""),
         "expected_reference_payload_confidence": _safe_float(batch.conditioning_summary.get("expected_reference_payload_confidence")),
         "expected_reference_payload_evidence_score": _safe_float(batch.conditioning_summary.get("expected_reference_payload_evidence_score")),
+        "reference_patch_material_present": bool(batch.conditioning_summary.get("reference_patch_material_present", False)),
+        "reference_patch_material_validated": bool(batch.conditioning_summary.get("reference_patch_material_validated", False)),
+        "reference_patch_material_trusted": bool(batch.conditioning_summary.get("reference_patch_material_trusted", False)),
+        "reference_patch_material_used": bool(batch.conditioning_summary.get("reference_patch_material_used", False)),
+        "reference_patch_material_source": batch.conditioning_summary.get("reference_patch_material_source", "none"),
+        "reference_patch_material_missing_reason": batch.conditioning_summary.get("reference_patch_material_missing_reason", ""),
+        "reference_patch_material_shape": list(batch.conditioning_summary.get("reference_patch_material_shape", [])) if isinstance(batch.conditioning_summary.get("reference_patch_material_shape", []), list) else [],
+        "reference_patch_material_kind": batch.conditioning_summary.get("reference_patch_material_kind", ""),
+        "reference_patch_material_confidence": _safe_float(batch.conditioning_summary.get("reference_patch_material_confidence")),
+        "reference_patch_material_evidence_score": _safe_float(batch.conditioning_summary.get("reference_patch_material_evidence_score")),
+        "reference_material_lane_active": bool(batch.conditioning_summary.get("reference_material_lane_active", False)),
+        "reference_tensor_input_channels": int(batch.conditioning_summary.get("reference_tensor_input_channels", 0) or 0),
+        "reference_tensor_input_used": bool(batch.conditioning_summary.get("reference_tensor_input_used", False)),
+        "reference_tensor_zero_fallback": bool(batch.conditioning_summary.get("reference_tensor_zero_fallback", True)),
         "identity_reference_used": bool(batch.conditioning_summary.get("identity_reference_used", False)),
         "identity_reference_strength": _safe_float(batch.conditioning_summary.get("identity_reference_strength")),
         "identity_reference_source": batch.conditioning_summary.get("identity_reference_source", "none"),
@@ -1834,6 +2053,8 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
     graph_cond = _graph_features(request)
     bundle_cond = extract_memory_bundle_conditioning(request)
     memory_cond, appearance_cond = _memory_and_appearance_features(request, roi_before, profile)
+    material_cond = extract_reference_material_conditioning(request.transition_context if isinstance(request.transition_context, dict) else {}, request=request)
+    reference_rgb, reference_mask, reference_validity = _reference_material_tensors(request, roi_before, material_cond)
     bbox_cond = np.array(
         [
             float(request.region.bbox.x),
@@ -1853,6 +2074,8 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
         memory_cond,
         appearance_cond,
         region_type,
+        reference_rgb,
+        reference_validity,
     )
     if bundle_cond["memory_bundle_low_evidence_newly_revealed"]:
         uncertainty_target = np.clip(uncertainty_target + 0.08 * changed_mask, 0.0, 1.0).astype(np.float32)
@@ -1896,8 +2119,25 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
         "expected_reference_payload_descriptor_keys": bundle_cond["expected_reference_payload_descriptor_keys"],
         "reference_payload_trusted": bundle_cond["reference_payload_trusted"],
         "reference_payload_untrusted_reason": bundle_cond["reference_payload_untrusted_reason"],
+        "reference_payload_trace_reasons": bundle_cond.get("reference_payload_trace_reasons", []),
         "expected_reference_payload_confidence": bundle_cond["expected_reference_payload_confidence"],
         "expected_reference_payload_evidence_score": bundle_cond["expected_reference_payload_evidence_score"],
+        "reference_patch_material_present": material_cond["reference_patch_material_present"],
+        "reference_patch_material_validated": material_cond["reference_patch_material_validated"],
+        "reference_patch_material_trusted": material_cond["reference_patch_material_trusted"],
+        "reference_patch_material_used": material_cond["reference_patch_material_used"],
+        "reference_patch_material_source": material_cond["reference_patch_material_source"],
+        "reference_patch_material_missing_reason": material_cond["reference_patch_material_missing_reason"],
+        "reference_patch_material_shape": material_cond["reference_patch_material_shape"],
+        "reference_patch_material_kind": material_cond["reference_patch_material_kind"],
+        "reference_patch_material_confidence": material_cond["reference_patch_material_confidence"],
+        "reference_patch_material_evidence_score": material_cond["reference_patch_material_evidence_score"],
+        "reference_patch_material_trace_reasons": material_cond.get("reference_patch_material_trace_reasons", []),
+        "reference_material_lane_active": bool(material_cond["reference_patch_material_used"]),
+        "reference_memory_lane_semantics": "mem_vec[8]=visual_reference_lane; strong boost requires trusted material tensor",
+        "reference_tensor_input_channels": 5,
+        "reference_tensor_input_used": bool(material_cond["reference_patch_material_used"] and np.any(reference_validity > 0.0)),
+        "reference_tensor_zero_fallback": bool(not (material_cond["reference_patch_material_used"] and np.any(reference_validity > 0.0))),
         "identity_sensitive_region": region_type in IDENTITY_SENSITIVE_REGIONS,
         "core_identity_region": region_type in CORE_IDENTITY_REGIONS,
         "identity_reference_used": bundle_cond["identity_reference_used"],
@@ -1948,6 +2188,9 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
         memory_cond=memory_cond,
         appearance_cond=appearance_cond,
         bbox_cond=bbox_cond,
+        reference_rgb=reference_rgb,
+        reference_mask=reference_mask,
+        reference_validity=reference_validity,
         mode_cond=_mode_cond(profile),
         role_cond=_role_cond(profile),
         preservation_mask=preservation_mask,
@@ -2059,6 +2302,20 @@ def output_from_prediction(
         "reference_payload_untrusted_reason": conditioning_summary.get("reference_payload_untrusted_reason", ""),
         "expected_reference_payload_confidence": _safe_float(conditioning_summary.get("expected_reference_payload_confidence")),
         "expected_reference_payload_evidence_score": _safe_float(conditioning_summary.get("expected_reference_payload_evidence_score")),
+        "reference_patch_material_present": bool(conditioning_summary.get("reference_patch_material_present", False)),
+        "reference_patch_material_validated": bool(conditioning_summary.get("reference_patch_material_validated", False)),
+        "reference_patch_material_trusted": bool(conditioning_summary.get("reference_patch_material_trusted", False)),
+        "reference_patch_material_used": bool(conditioning_summary.get("reference_patch_material_used", False)),
+        "reference_patch_material_source": conditioning_summary.get("reference_patch_material_source", "none"),
+        "reference_patch_material_missing_reason": conditioning_summary.get("reference_patch_material_missing_reason", ""),
+        "reference_patch_material_shape": list(conditioning_summary.get("reference_patch_material_shape", [])) if isinstance(conditioning_summary.get("reference_patch_material_shape", []), list) else [],
+        "reference_patch_material_kind": conditioning_summary.get("reference_patch_material_kind", ""),
+        "reference_patch_material_confidence": _safe_float(conditioning_summary.get("reference_patch_material_confidence")),
+        "reference_patch_material_evidence_score": _safe_float(conditioning_summary.get("reference_patch_material_evidence_score")),
+        "reference_material_lane_active": bool(conditioning_summary.get("reference_material_lane_active", False)),
+        "reference_tensor_input_channels": int(conditioning_summary.get("reference_tensor_input_channels", 0) or 0),
+        "reference_tensor_input_used": bool(conditioning_summary.get("reference_tensor_input_used", False)),
+        "reference_tensor_zero_fallback": bool(conditioning_summary.get("reference_tensor_zero_fallback", True)),
         "memory_bundle_present": bool(conditioning_summary.get("memory_bundle_present", memory_bundle_trace.get("memory_bundle_present", False))),
         "memory_support_level": conditioning_summary.get("memory_support_level", memory_bundle_trace.get("memory_support_level", "none")),
         "alpha_semantics": "blend_probability_for_true_changed_region_with_seam_support",
@@ -2137,6 +2394,20 @@ def output_from_prediction(
             "reference_payload_untrusted_reason": conditioning_summary.get("reference_payload_untrusted_reason", ""),
             "expected_reference_payload_confidence": _safe_float(conditioning_summary.get("expected_reference_payload_confidence")),
             "expected_reference_payload_evidence_score": _safe_float(conditioning_summary.get("expected_reference_payload_evidence_score")),
+            "reference_patch_material_present": bool(conditioning_summary.get("reference_patch_material_present", False)),
+            "reference_patch_material_validated": bool(conditioning_summary.get("reference_patch_material_validated", False)),
+            "reference_patch_material_trusted": bool(conditioning_summary.get("reference_patch_material_trusted", False)),
+            "reference_patch_material_used": bool(conditioning_summary.get("reference_patch_material_used", False)),
+            "reference_patch_material_source": conditioning_summary.get("reference_patch_material_source", "none"),
+            "reference_patch_material_missing_reason": conditioning_summary.get("reference_patch_material_missing_reason", ""),
+            "reference_patch_material_shape": list(conditioning_summary.get("reference_patch_material_shape", [])) if isinstance(conditioning_summary.get("reference_patch_material_shape", []), list) else [],
+            "reference_patch_material_kind": conditioning_summary.get("reference_patch_material_kind", ""),
+            "reference_patch_material_confidence": _safe_float(conditioning_summary.get("reference_patch_material_confidence")),
+            "reference_patch_material_evidence_score": _safe_float(conditioning_summary.get("reference_patch_material_evidence_score")),
+            "reference_material_lane_active": bool(conditioning_summary.get("reference_material_lane_active", False)),
+            "reference_tensor_input_channels": int(conditioning_summary.get("reference_tensor_input_channels", 0) or 0),
+            "reference_tensor_input_used": bool(conditioning_summary.get("reference_tensor_input_used", False)),
+            "reference_tensor_zero_fallback": bool(conditioning_summary.get("reference_tensor_zero_fallback", True)),
             "blend_hint_mean": float(np.mean(batch.blend_hint)) if batch is not None else 0.0,
             "changed_mask_mean": float(np.mean(batch.changed_mask)) if batch is not None else 0.0,
             "alpha_mean": float(np.mean(alpha)),

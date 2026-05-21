@@ -314,6 +314,15 @@ class GennadyEngine:
         usage["expected_reference_strength"] = expected_strength
         usage["expected_reference_blocked"] = expected_family != "unknown" and expected_blocked
         usage["expected_reference_missing"] = expected_family != "unknown" and rendered and not expected_used and expected_strength == 0.0 and not expected_blocked
+        material_used = _as_bool(_get_value("reference_patch_material_used", False))
+        material_present = _as_bool(_get_value("reference_patch_material_present", False))
+        material_trusted = _as_bool(_get_value("reference_patch_material_trusted", False))
+        material_reason = str(_get_value("reference_patch_material_missing_reason", "") or "")
+        usage["expected_material_used"] = expected_family != "unknown" and material_used
+        usage["reference_patch_material_present"] = material_present
+        usage["reference_patch_material_trusted"] = material_trusted
+        usage["reference_patch_material_missing_reason"] = material_reason
+        usage["expected_material_missing"] = expected_family != "unknown" and rendered and not material_used
         return usage
 
     @staticmethod
@@ -326,6 +335,9 @@ class GennadyEngine:
         missing_counts = {family: 0 for family in families}
         strong_counts = {family: 0 for family in families}
         medium_counts = {family: 0 for family in families}
+        material_used_counts = {family: 0 for family in families}
+        material_missing_counts = {family: 0 for family in families}
+        material_missing_reasons: dict[str, dict[str, int]] = {family: {} for family in families}
         critical_warnings: list[str] = []
         patches: list[dict[str, object]] = []
         memory_bundle_present_count = 0
@@ -358,6 +370,13 @@ class GennadyEngine:
                 if usage.get("expected_reference_missing"):
                     missing_counts[family] += 1
                     critical_warnings.append(f"{warning_prefix[family]}_without_{family}_reference:{usage.get('region_id', '')}")
+                if usage.get("expected_material_used"):
+                    material_used_counts[family] += 1
+                elif usage.get("expected_material_missing"):
+                    material_missing_counts[family] += 1
+                    reason = str(usage.get("reference_patch_material_missing_reason", "material_missing") or "material_missing")
+                    material_missing_reasons[family][reason] = material_missing_reasons[family].get(reason, 0) + 1
+                    critical_warnings.append(f"{warning_prefix[family]}_without_visual_material:{usage.get('region_id', '')}:{reason}")
                 strength = float(usage.get("expected_reference_strength", 0.0) or 0.0)
                 if usage.get("expected_reference_used") and strength >= 0.9:
                     strong_counts[family] += 1
@@ -372,6 +391,9 @@ class GennadyEngine:
             "missing_counts": missing_counts,
             "strong_counts": strong_counts,
             "medium_counts": medium_counts,
+            "material_used_counts": material_used_counts,
+            "material_missing_counts": material_missing_counts,
+            "material_missing_reasons": material_missing_reasons,
             "memory_bundle_present_count": memory_bundle_present_count,
             "memory_bundle_absent_count": memory_bundle_absent_count,
             "critical_warnings": critical_warnings,
@@ -388,6 +410,9 @@ class GennadyEngine:
         missing_counts = {family: 0 for family in families}
         strong_counts = {family: 0 for family in families}
         medium_counts = {family: 0 for family in families}
+        material_used_counts = {family: 0 for family in families}
+        material_missing_counts = {family: 0 for family in families}
+        material_missing_reasons: dict[str, dict[str, int]] = {family: {} for family in families}
         total_patch_count = 0
         memory_bundle_present_count = 0
         memory_bundle_absent_count = 0
@@ -399,6 +424,16 @@ class GennadyEngine:
             for key in target:
                 target[key] += int(source.get(key, 0) or 0)
 
+        def _add_nested_counts(target: dict[str, dict[str, int]], source: object) -> None:
+            if not isinstance(source, dict):
+                return
+            for family, reasons in source.items():
+                if family not in target or not isinstance(reasons, dict):
+                    continue
+                for reason, count in reasons.items():
+                    r = str(reason)
+                    target[family][r] = target[family].get(r, 0) + int(count or 0)
+
         for coverage in step_coverages:
             total_patch_count += int(coverage.get("patch_count", 0) or 0)
             _add_counts(expected_family_counts, coverage.get("expected_family_counts", {}))
@@ -407,6 +442,9 @@ class GennadyEngine:
             _add_counts(missing_counts, coverage.get("missing_counts", {}))
             _add_counts(strong_counts, coverage.get("strong_counts", {}))
             _add_counts(medium_counts, coverage.get("medium_counts", {}))
+            _add_counts(material_used_counts, coverage.get("material_used_counts", {}))
+            _add_counts(material_missing_counts, coverage.get("material_missing_counts", {}))
+            _add_nested_counts(material_missing_reasons, coverage.get("material_missing_reasons", {}))
             memory_bundle_present_count += int(coverage.get("memory_bundle_present_count", 0) or 0)
             memory_bundle_absent_count += int(coverage.get("memory_bundle_absent_count", 0) or 0)
             warnings = coverage.get("critical_warnings", [])
@@ -416,8 +454,12 @@ class GennadyEngine:
         def _ratio(family: str) -> float:
             return used_counts[family] / max(1, expected_family_counts[family])
 
+        def _material_ratio(family: str) -> float:
+            return material_used_counts[family] / max(1, expected_family_counts[family])
+
         total_expected_known = sum(expected_family_counts[family] for family in families)
         total_used_known = sum(used_counts.values())
+        total_material_used_known = sum(material_used_counts.values())
         return {
             "total_patch_count": total_patch_count,
             "expected_family_counts": expected_family_counts,
@@ -426,6 +468,9 @@ class GennadyEngine:
             "missing_counts": missing_counts,
             "strong_counts": strong_counts,
             "medium_counts": medium_counts,
+            "material_used_counts": material_used_counts,
+            "material_missing_counts": material_missing_counts,
+            "material_missing_reasons": material_missing_reasons,
             "memory_bundle_present_count": memory_bundle_present_count,
             "memory_bundle_absent_count": memory_bundle_absent_count,
             "critical_warning_count": len(critical_warnings),
@@ -434,7 +479,12 @@ class GennadyEngine:
             "body_shape_reference_coverage_ratio": _ratio("body_shape"),
             "garment_reference_coverage_ratio": _ratio("garment"),
             "skin_reference_coverage_ratio": _ratio("skin"),
+            "identity_material_coverage_ratio": _material_ratio("identity"),
+            "body_shape_material_coverage_ratio": _material_ratio("body_shape"),
+            "garment_material_coverage_ratio": _material_ratio("garment"),
+            "skin_material_coverage_ratio": _material_ratio("skin"),
             "overall_expected_reference_coverage_ratio": total_used_known / max(1, total_expected_known),
+            "overall_expected_material_coverage_ratio": total_material_used_known / max(1, total_expected_known),
         }
 
     def run(
@@ -611,6 +661,32 @@ class GennadyEngine:
                 if not learned_target_profile and isinstance(learned_temporal_contract, dict):
                     learned_target_profile = learned_temporal_contract.get("target_profile", {}) if isinstance(learned_temporal_contract.get("target_profile", {}), dict) else {}
                 reference_payload_context = _serialize_reference_payload_context(region.region_id, region_memory_bundle)
+                expected_reference_payload = _expected_reference_payload_for_region(region.region_id, region_memory_bundle)
+                resolved_reference_payload_from_matching = False
+                if expected_reference_payload is None:
+                    matches = _trusted_matching_payloads(region.region_id, region_memory_bundle)
+                    if len(matches) == 1:
+                        expected_reference_payload = matches[0]
+                        resolved_reference_payload_from_matching = True
+                if expected_reference_payload is not None:
+                    reference_payload_context = dict(reference_payload_context)
+                    reference_payload_context["expected_reference_payload"] = asdict(expected_reference_payload)
+                    if resolved_reference_payload_from_matching:
+                        reasons = reference_payload_context.get("reference_payload_trace_reasons", [])
+                        reason_list = list(reasons) if isinstance(reasons, list) else []
+                        if "expected_reference_payload_resolved_from_matching_payload" not in reason_list:
+                            reason_list.append("expected_reference_payload_resolved_from_matching_payload")
+                        reference_payload_context["reference_payload_trace_reasons"] = reason_list
+                reference_material = self.memory_manager.build_reference_patch_material(memory, expected_reference_payload)
+                reference_material_reason = ""
+                if reference_material is None:
+                    reference_material_reason = "payload_missing"
+                elif not reference_material.material_trusted:
+                    reference_material_reason = reference_material.material_missing_reason or "payload_untrusted"
+                reference_material_context = {
+                    "expected_reference_patch_material": asdict(reference_material) if reference_material is not None else None,
+                    "reference_patch_material_trace_reasons": [reference_material_reason] if reference_material_reason else [],
+                }
                 patch_request = PatchSynthesisRequest(
                     region=region,
                     scene_state=scene_graph,
@@ -636,6 +712,7 @@ class GennadyEngine:
                         "region_memory_support_level": region_memory_bundle.memory_support_level,
                         "region_memory_retrieval_reasons": list(region_memory_bundle.retrieval_reasons),
                         **reference_payload_context,
+                        **reference_material_context,
                     },
                     retrieval_summary={
                         "backend": "learned_primary",
@@ -778,6 +855,17 @@ class GennadyEngine:
                                 "accessory_reference_block_reasons",
                                 "memory_bundle_present",
                                 "memory_support_level",
+                                "reference_patch_material_present",
+                                "reference_patch_material_validated",
+                                "reference_patch_material_trusted",
+                                "reference_patch_material_used",
+                                "reference_patch_material_source",
+                                "reference_patch_material_shape",
+                                "reference_patch_material_kind",
+                                "reference_patch_material_missing_reason",
+                                "reference_tensor_input_used",
+                                "reference_tensor_zero_fallback",
+                                "reference_tensor_input_channels",
                             )
                             if key in patch_out.execution_trace
                         },

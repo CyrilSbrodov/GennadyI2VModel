@@ -324,6 +324,7 @@ class TexturePatchMemory:
     coverage_targets: list[str] = field(default_factory=list)
     attachment_targets: list[str] = field(default_factory=list)
     suitable_for_reveal: bool = False
+    rgb_patch: list | None = None
 
 
 @dataclass(slots=True)
@@ -400,6 +401,28 @@ class ReferencePatchPayload:
     memory_support_level: str = "none"
     descriptor: dict[str, object] = field(default_factory=dict)
     retrieval_reasons: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ReferencePatchMaterial:
+    reference_kind: str
+    region_id: str
+    canonical_region: str
+    entity_id: str
+    source_patch_id: str | None
+    source_patch_ref: str | None
+    rgb_patch: list | None
+    alpha_or_mask: list | None = None
+    descriptor: dict[str, object] = field(default_factory=dict)
+    confidence: float = 0.0
+    evidence_score: float = 0.0
+    observed_directly: bool = False
+    generated: bool = False
+    inferred: bool = False
+    provenance: str = "unknown"
+    material_source: str = "unknown"
+    material_trusted: bool = False
+    material_missing_reason: str = ""
 
 
 @dataclass(slots=True)
