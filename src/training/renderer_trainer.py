@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
+from core.schema import BBox, RegionRef, SceneGraph
 from dynamics.human_state_transition import HumanStateTransitionModel
 from dynamics.temporal_transition_encoder import PHASES, TemporalTransitionEncoder
 from dynamics.model import DynamicsModel
@@ -27,11 +28,13 @@ from rendering.trainable_patch_renderer import (
     apply_region_metadata_conditioning_to_vectors,
     extract_memory_bundle_conditioning_from_context,
     extract_region_metadata_conditioning_from_metadata,
+    summarize_reference_material_trace,
 )
+from learned.interfaces import PatchSynthesisRequest
 from training.rollout_eval import evaluate_rollout_modes_on_video_manifest
 from rendering.target_provenance_policy import classify_target_training_role, target_quality_warning, target_supervision_summary
 from rendering.renderer_checkpoint_loader import RENDERER_CHECKPOINT_CONTRACT_VERSION, load_renderer_model_from_checkpoint
-from rendering.torch_local_patch_generator import TorchBackendUnavailableError, TorchLocalPatchGenerator
+from rendering.torch_local_patch_generator import LOCAL_INPUT_CHANNELS, REFERENCE_TENSOR_INPUT_CHANNELS, TorchBackendUnavailableError, TorchLocalPatchGenerator
 from training.datasets import RendererDataset
 from training.types import StageResult, TrainingConfig
 
@@ -68,6 +71,59 @@ class RendererBatchAdapter:
     def _mask(before: np.ndarray, after: np.ndarray) -> np.ndarray:
         diff = np.mean(np.abs(after - before), axis=2, keepdims=True)
         return np.clip(diff * 3.0, 0.0, 1.0)
+
+    @staticmethod
+    def _resize_hw3(arr: np.ndarray, h: int, w: int) -> np.ndarray:
+        if arr.ndim != 3 or arr.shape[2] != 3 or h <= 0 or w <= 0:
+            return np.zeros((h, w, 3), dtype=np.float32)
+        ys = np.linspace(0, arr.shape[0] - 1, h).round().astype(int)
+        xs = np.linspace(0, arr.shape[1] - 1, w).round().astype(int)
+        return np.clip(arr[ys][:, xs], 0.0, 1.0).astype(np.float32)
+
+    @staticmethod
+    def _reference_tensors_from_contract(contract: dict[str, object], h: int, w: int, *, region_id: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, object]]:
+        zeros_rgb = np.zeros((h, w, 3), dtype=np.float32)
+        zeros_mask = np.zeros((h, w, 1), dtype=np.float32)
+        material = contract.get("expected_reference_patch_material")
+        transition_context = {
+            "expected_reference_payload": contract.get("expected_reference_payload"),
+            "expected_reference_patch_material": material,
+            "reference_patch_material_trace_reasons": contract.get("reference_patch_material_trace_reasons", []),
+        }
+        request = PatchSynthesisRequest(
+            region=RegionRef(region_id=region_id, bbox=BBox(0.0, 0.0, 1.0, 1.0), reason="renderer_manifest_reference_material_validation"),
+            scene_state=SceneGraph(frame_index=0),
+            memory_summary={},
+            transition_context=transition_context,
+            retrieval_summary={},
+            current_frame=zeros_rgb.tolist(),
+        )
+        material_trace = summarize_reference_material_trace(transition_context, request=request)
+        base_summary = {
+            "reference_patch_material_present": bool(material_trace.get("reference_patch_material_present", False)),
+            "reference_patch_material_validated": bool(material_trace.get("reference_patch_material_validated", False)),
+            "reference_patch_material_trusted": bool(material_trace.get("reference_patch_material_trusted", False)),
+            "reference_patch_material_used": bool(material_trace.get("reference_patch_material_used", False)),
+            "reference_patch_material_shape": list(material_trace.get("reference_patch_material_shape", [])) if isinstance(material_trace.get("reference_patch_material_shape", []), list) else [],
+            "reference_patch_material_source": str(material_trace.get("reference_patch_material_source", "none") or "none"),
+            "reference_patch_material_kind": str(material_trace.get("reference_patch_material_kind", "") or ""),
+            "reference_patch_material_confidence": float(material_trace.get("reference_patch_material_confidence", 0.0) or 0.0),
+            "reference_patch_material_evidence_score": float(material_trace.get("reference_patch_material_evidence_score", 0.0) or 0.0),
+            "reference_payload_trusted": bool(material_trace.get("reference_payload_trusted", False)),
+            "reference_payload_untrusted_reason": str(material_trace.get("reference_payload_untrusted_reason", "") or ""),
+            "expected_reference_payload_present": bool(material_trace.get("expected_reference_payload_present", False)),
+            "expected_reference_payload_kind": str(material_trace.get("expected_reference_payload_kind", "") or ""),
+            "reference_patch_material_missing_reason": str(material_trace.get("reference_patch_material_missing_reason", "") or ""),
+            "reference_patch_material_trace_reasons": list(material_trace.get("reference_patch_material_trace_reasons", [])) if isinstance(material_trace.get("reference_patch_material_trace_reasons", []), list) else [],
+            "reference_tensor_input_channels": REFERENCE_TENSOR_INPUT_CHANNELS,
+        }
+        if not material_trace.get("reference_patch_material_used", False) or not isinstance(material, dict):
+            return zeros_rgb, zeros_mask, zeros_mask.copy(), {**base_summary, "reference_tensor_input_used": False, "reference_tensor_zero_fallback": True}
+        raw_rgb = np.asarray(material.get("rgb_patch"), dtype=np.float32)
+        rgb = RendererBatchAdapter._resize_hw3(raw_rgb, h, w)
+        mask = np.ones((h, w, 1), dtype=np.float32)
+        validity = np.ones((h, w, 1), dtype=np.float32)
+        return rgb, mask, validity, {**base_summary, "reference_tensor_input_used": bool(np.any(validity > 0.0)), "reference_tensor_zero_fallback": False}
 
     def _weak_contract(self, sample: dict[str, object]) -> RendererTemporalConditioning:
         contract = sample.get("renderer_batch_contract", {}) if isinstance(sample.get("renderer_batch_contract", {}), dict) else {}
@@ -113,6 +169,14 @@ class RendererBatchAdapter:
         b = self._np3(before)
         a = self._np3(after)
         contract = sample.get("renderer_batch_contract", {}) if isinstance(sample.get("renderer_batch_contract", {}), dict) else {}
+        contract = dict(contract) if isinstance(contract, dict) else {}
+        if "expected_reference_payload" not in contract and isinstance(sample.get("expected_reference_payload"), dict):
+            contract["expected_reference_payload"] = sample.get("expected_reference_payload")
+        if "expected_reference_patch_material" not in contract and "expected_reference_patch_material" in sample:
+            contract["expected_reference_patch_material"] = sample.get("expected_reference_patch_material")
+        if "reference_patch_material_trace_reasons" not in contract and "reference_patch_material_trace_reasons" in sample:
+            contract["reference_patch_material_trace_reasons"] = sample.get("reference_patch_material_trace_reasons")
+        reference_rgb, reference_mask, reference_validity, reference_tensor_summary = self._reference_tensors_from_contract(contract, b.shape[0], b.shape[1], region_id=str(sample.get("region_id", contract.get("region_id", "unknown:region"))))
         weak = self._weak_contract(sample)
         learned: RendererTemporalConditioning | None = None
         features = sample.get("temporal_transition_features")
@@ -241,6 +305,7 @@ class RendererBatchAdapter:
                     "mask_kind": str(metadata_cond.get("mask_kind", "")),
                 }
             )
+        conditioning_summary.update(reference_tensor_summary)
         conditioning_summary.update(provenance_summary)
         conditioning_summary.update(target_role_summary)
         return PatchBatch(
@@ -256,6 +321,9 @@ class RendererBatchAdapter:
             memory_cond=memory_cond,
             appearance_cond=appearance_cond,
             bbox_cond=bbox_cond,
+            reference_rgb=reference_rgb,
+            reference_mask=reference_mask,
+            reference_validity=reference_validity,
             conditioning_summary=conditioning_summary,
             preservation_mask=preservation_mask,
             uncertainty_target=uncertainty_target,
@@ -530,6 +598,8 @@ class RendererTrainer:
             "model_family": "local_conv_conditioned_patch_generator" if isinstance(model, TorchLocalPatchGenerator) else "numpy_linear_patch_generator",
             "torch_backend_used": 1.0 if isinstance(model, TorchLocalPatchGenerator) else 0.0,
             "global_cond_dim": float(GLOBAL_COND_DIM),
+            "local_input_channels": float(LOCAL_INPUT_CHANNELS),
+            "reference_tensor_input_channels": float(REFERENCE_TENSOR_INPUT_CHANNELS),
             "fallback_used": 1.0 if fallback_used else 0.0,
             "invalid_records": float((diagnostics or {}).get("invalid_records", 0)),
             "skipped_records": float((diagnostics or {}).get("skipped_records", 0)),
@@ -715,7 +785,9 @@ class RendererTrainer:
             "model_family": model_family,
             "torch_backend_used": bool(torch_backend_used),
             "global_cond_dim": GLOBAL_COND_DIM,
-            "patch_batch_contract_version": "patch_batch_v1",
+            "local_input_channels": LOCAL_INPUT_CHANNELS,
+            "reference_tensor_input_channels": REFERENCE_TENSOR_INPUT_CHANNELS,
+            "patch_batch_contract_version": "patch_batch_v2_reference_material",
             "runtime_loadable": True,
             "runtime_backend": runtime_backend,
             "model_path": str(model_path),

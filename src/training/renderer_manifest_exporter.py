@@ -146,6 +146,14 @@ class RendererManifestRecordExporter:
             "target_source": target_source,
             "training_target_quality": training_target_quality,
             "renderer_memory_bundle": memory_bundle,
+            "reference_patch_material_present": bool(execution_trace_summary.get("reference_patch_material_present", False)),
+            "reference_patch_material_validated": bool(execution_trace_summary.get("reference_patch_material_validated", False)),
+            "reference_patch_material_trusted": bool(execution_trace_summary.get("reference_patch_material_trusted", False)),
+            "reference_patch_material_used": bool(execution_trace_summary.get("reference_patch_material_used", False)),
+            "reference_patch_material_shape": execution_trace_summary.get("reference_patch_material_shape", []),
+            "reference_patch_material_missing_reason": str(execution_trace_summary.get("reference_patch_material_missing_reason", "")),
+            "reference_tensor_input_used": bool(execution_trace_summary.get("reference_tensor_input_used", False)),
+            "reference_tensor_zero_fallback": bool(execution_trace_summary.get("reference_tensor_zero_fallback", True)),
             "memory_retrieval_evidence": _memory_summary(memory_bundle, request.retrieval_summary),
             "execution_trace_summary": execution_trace_summary,
         }
@@ -241,6 +249,50 @@ def _memory_bundle_serialized(ctx: dict[str, object]) -> dict[str, object]:
     return {"memory_bundle_present": False, "memory_support_level": "none", "memory_support_level_reason": "no_runtime_region_memory_bundle"}
 
 
+
+def _fallback_reference_material_summary(ctx: dict[str, object], trace: dict[str, object]) -> dict[str, object]:
+    material = ctx.get("expected_reference_patch_material") if isinstance(ctx, dict) else None
+    expected_payload = ctx.get("expected_reference_payload") if isinstance(ctx, dict) else None
+    shape = _shape_of(material.get("rgb_patch")) if isinstance(material, dict) else []
+    validated = bool(
+        isinstance(material, dict)
+        and bool(material.get("material_trusted", False))
+        and len(shape) == 3
+        and shape[2] == 3
+        and shape[0] > 0
+        and shape[1] > 0
+    )
+    payload_present = isinstance(expected_payload, dict)
+    payload_safe = bool(
+        payload_present
+        and bool(expected_payload.get("observed_directly", False))
+        and not bool(expected_payload.get("generated", False))
+        and not bool(expected_payload.get("inferred", False))
+    )
+    trusted = bool(validated and payload_safe)
+    used = bool(trusted)
+    if used:
+        missing_reason = ""
+    elif material is None:
+        missing_reason = "material_missing"
+    elif not validated:
+        missing_reason = str(material.get("material_missing_reason", "material_untrusted") or "material_untrusted")
+    elif not payload_safe:
+        missing_reason = "expected_reference_payload_missing" if not payload_present else "payload_untrusted"
+    else:
+        missing_reason = "material_untrusted"
+    fallback = {
+        "reference_patch_material_present": isinstance(material, dict),
+        "reference_patch_material_validated": validated,
+        "reference_patch_material_trusted": trusted,
+        "reference_patch_material_used": used,
+        "reference_patch_material_missing_reason": missing_reason,
+    }
+    if isinstance(material, dict):
+        fallback["reference_patch_material_source"] = str(material.get("material_source", "unknown"))
+        fallback["reference_patch_material_shape"] = shape
+    return fallback
+
 def _execution_trace_summary(
     *,
     trace: dict[str, object],
@@ -292,6 +344,39 @@ def _execution_trace_summary(
     if isinstance(hidden_slot, dict):
         summary["memory_bundle_hidden_type"] = str(hidden_slot.get("hidden_type", summary["memory_bundle_hidden_type"]))
 
+    for key in (
+        "expected_reference_payload_kind",
+        "reference_patch_material_present",
+        "reference_patch_material_validated",
+        "reference_patch_material_trusted",
+        "reference_patch_material_source",
+        "reference_patch_material_shape",
+        "reference_patch_material_missing_reason",
+        "reference_patch_material_used",
+        "reference_tensor_input_used",
+        "reference_tensor_zero_fallback",
+        "reference_tensor_input_channels",
+    ):
+        if key in trace:
+            summary[key] = _safe_json(trace[key])
+    expected_payload = ctx.get("expected_reference_payload")
+    if isinstance(expected_payload, dict):
+        summary.setdefault("expected_reference_payload_kind", str(expected_payload.get("reference_kind", "")))
+    material = ctx.get("expected_reference_patch_material")
+    fallback_material = _fallback_reference_material_summary(ctx, trace)
+    for key, value in fallback_material.items():
+        summary.setdefault(key, _safe_json(value))
+    if isinstance(material, dict):
+        summary.setdefault("reference_patch_material_patch_id", str(material.get("source_patch_id", "")))
+        descriptor = material.get("descriptor")
+        if isinstance(descriptor, dict):
+            summary.setdefault("reference_patch_material_descriptor_keys", sorted(str(k) for k in descriptor.keys()))
+    elif "reference_patch_material_present" not in summary:
+        summary["reference_patch_material_present"] = False
+        reasons = ctx.get("reference_patch_material_trace_reasons", [])
+        if isinstance(reasons, list) and reasons:
+            summary["reference_patch_material_missing_reason"] = str(reasons[0])
+
     for key in ("confidence_semantics_by_mode", "uncertainty_semantics_by_mode"):
         if isinstance(trace.get(key), dict):
             summary[key] = _safe_json(trace[key])
@@ -332,6 +417,28 @@ def _renderer_batch_contract(
     contract["blend_hint"] = blend_hint
     contract["changed_mask"] = changed_mask
     contract["region_memory_bundle_serialized"] = memory_bundle
+    if isinstance(ctx.get("expected_reference_payload"), dict):
+        contract["expected_reference_payload"] = _safe_json(ctx.get("expected_reference_payload"))
+    material = ctx.get("expected_reference_patch_material")
+    if isinstance(material, dict):
+        contract["expected_reference_patch_material"] = _safe_json(material)
+    elif "expected_reference_patch_material" in ctx:
+        contract["expected_reference_patch_material"] = None
+    if "reference_patch_material_trace_reasons" in ctx:
+        contract["reference_patch_material_trace_reasons"] = _safe_json(ctx.get("reference_patch_material_trace_reasons"))
+    for key in (
+        "reference_patch_material_present",
+        "reference_patch_material_validated",
+        "reference_patch_material_trusted",
+        "reference_patch_material_used",
+        "reference_patch_material_shape",
+        "reference_patch_material_missing_reason",
+        "reference_tensor_input_used",
+        "reference_tensor_zero_fallback",
+        "reference_tensor_input_channels",
+    ):
+        if key in trace:
+            contract[key] = _safe_json(trace[key])
     if "conditioning_summary" not in contract:
         summary = trace.get("conditioning_summary") or ctx.get("conditioning_summary")
         if summary is not None:
@@ -339,11 +446,31 @@ def _renderer_batch_contract(
     return contract
 
 
+def _compact_reference_material_summary(material: object) -> dict[str, object] | None:
+    if not isinstance(material, dict):
+        return None
+    descriptor = material.get("descriptor")
+    return {
+        "reference_kind": str(material.get("reference_kind", "")),
+        "canonical_region": str(material.get("canonical_region", "")),
+        "entity_id": str(material.get("entity_id", "")),
+        "source_patch_id": material.get("source_patch_id"),
+        "source_patch_ref": material.get("source_patch_ref"),
+        "material_source": str(material.get("material_source", "unknown")),
+        "material_trusted": bool(material.get("material_trusted", False)),
+        "material_missing_reason": str(material.get("material_missing_reason", "")),
+        "rgb_patch_shape": _shape_of(material.get("rgb_patch")),
+        "descriptor_keys": sorted(str(k) for k in descriptor.keys()) if isinstance(descriptor, dict) else [],
+    }
+
+
 def _transition_context_summary(ctx: dict[str, object], *, step_index: int | None, memory_bundle: dict[str, object]) -> dict[str, object]:
     summary: dict[str, object] = {}
-    for key in ("transition_phase", "target_profile", "semantic_families", "region_route_decision"):
+    for key in ("transition_phase", "target_profile", "semantic_families", "region_route_decision", "expected_reference_payload", "reference_patch_material_trace_reasons"):
         if key in ctx:
             summary[key] = _safe_json(ctx[key])
+    if "expected_reference_patch_material" in ctx:
+        summary["expected_reference_patch_material"] = _safe_json(_compact_reference_material_summary(ctx.get("expected_reference_patch_material")))
     summary["step_index"] = int(step_index if step_index is not None else ctx.get("step_index", -1)) if (step_index is not None or "step_index" in ctx) else None
     summary["memory_bundle_present"] = bool(memory_bundle.get("memory_bundle_present", bool(memory_bundle)))
     summary["memory_support_level"] = str(memory_bundle.get("memory_support_level", "none"))

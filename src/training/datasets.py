@@ -1639,6 +1639,17 @@ class RendererDataset(BaseStageDataset):
         contract = sample.get("renderer_batch_contract", {}) if isinstance(sample.get("renderer_batch_contract", {}), dict) else {}
         if contract:
             transition_context = dict(transition_context, renderer_batch_contract=contract)
+            if "expected_reference_payload" in contract:
+                transition_context["expected_reference_payload"] = contract.get("expected_reference_payload")
+            if "expected_reference_patch_material" in contract:
+                transition_context["expected_reference_patch_material"] = contract.get("expected_reference_patch_material")
+            if "reference_patch_material_trace_reasons" in contract:
+                transition_context["reference_patch_material_trace_reasons"] = contract.get("reference_patch_material_trace_reasons")
+        else:
+            if "expected_reference_payload" in sample:
+                transition_context = dict(transition_context, expected_reference_payload=sample.get("expected_reference_payload"))
+            if "expected_reference_patch_material" in sample:
+                transition_context = dict(transition_context, expected_reference_patch_material=sample.get("expected_reference_patch_material"))
         return PatchSynthesisRequest(
             region=RegionRef(region_id=region_id, bbox=bbox, reason=str(metadata.get("roi_reason", sample.get("source", "manifest_renderer_record")))),
             scene_state=SceneGraph(frame_index=int(sample.get("frame_index", 0) or 0)),
