@@ -10,6 +10,8 @@ from rendering.patch_conditioning_contract import GLOBAL_COND_DIM, MODE_DIM, ROL
 BASE_LOCAL_INPUT_CHANNELS = 9
 REFERENCE_TENSOR_INPUT_CHANNELS = 5
 LOCAL_INPUT_CHANNELS = BASE_LOCAL_INPUT_CHANNELS + REFERENCE_TENSOR_INPUT_CHANNELS
+MATERIAL_GATE_MAX = 0.35
+MATERIAL_GATE_INIT_BIAS = -3.0
 from rendering.patch_tensor_utils import map_to_shape
 
 from rendering.target_provenance_policy import target_supervision_weight
@@ -20,6 +22,7 @@ if TYPE_CHECKING:
 try:
     import torch
     import torch.nn as nn
+    import torch.nn.functional as F
 except Exception:  # pragma: no cover
     torch = None
     nn = None
@@ -38,21 +41,49 @@ class _TorchBatch:
     global_cond: "torch.Tensor"
 
 
+class _ConvBlock(nn.Module if nn is not None else _UnavailableTorchModule):
+    def __init__(self, in_ch: int, out_ch: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(nn.Conv2d(in_ch, out_ch, 3, padding=1), nn.SiLU(), nn.Conv2d(out_ch, out_ch, 3, padding=1), nn.SiLU())
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        return self.net(x)
+
+
 class TorchLocalPatchGeneratorNet(nn.Module if nn is not None else _UnavailableTorchModule):
-    def __init__(self, global_dim: int, hidden: int = 48, input_channels: int = LOCAL_INPUT_CHANNELS) -> None:
+    def __init__(self, global_dim: int, hidden: int = 32, input_channels: int = LOCAL_INPUT_CHANNELS) -> None:
         super().__init__()
         self.input_channels = int(input_channels)
-        self.encoder = nn.Sequential(nn.Conv2d(self.input_channels, hidden, 3, padding=1), nn.SiLU(), nn.Conv2d(hidden, hidden, 3, padding=1), nn.SiLU())
-        self.cond = nn.Sequential(nn.Linear(global_dim, hidden * 2), nn.SiLU(), nn.Linear(hidden * 2, hidden * 2))
-        self.residual = nn.Sequential(nn.Conv2d(hidden, hidden, 3, padding=1), nn.SiLU(), nn.Conv2d(hidden, 3, 1))
+        self.global_dim = int(global_dim)
+        self.stem = _ConvBlock(self.input_channels, hidden)
+        self.down1 = _ConvBlock(hidden, hidden * 2)
+        self.down2 = _ConvBlock(hidden * 2, hidden * 4)
+        self.pool = nn.AvgPool2d(2, 2)
+        self.film = nn.Sequential(nn.Linear(global_dim, hidden * 8), nn.SiLU(), nn.Linear(hidden * 8, hidden * 8))
+        self.up1 = _ConvBlock(hidden * 4 + hidden * 2, hidden * 2)
+        self.up2 = _ConvBlock(hidden * 2 + hidden, hidden)
+        self.rgb_residual = nn.Sequential(nn.Conv2d(hidden, hidden, 3, padding=1), nn.SiLU(), nn.Conv2d(hidden, 3, 1))
         self.alpha = nn.Sequential(nn.Conv2d(hidden, hidden // 2, 3, padding=1), nn.SiLU(), nn.Conv2d(hidden // 2, 1, 1))
         self.uncertainty = nn.Sequential(nn.Conv2d(hidden, hidden // 2, 3, padding=1), nn.SiLU(), nn.Conv2d(hidden // 2, 1, 1))
+        self.material_gate = nn.Sequential(nn.Conv2d(hidden, hidden // 2, 3, padding=1), nn.SiLU(), nn.Conv2d(hidden // 2, 1, 1))
+        nn.init.constant_(self.material_gate[-1].bias, MATERIAL_GATE_INIT_BIAS)
 
     def forward(self, local_maps: "torch.Tensor", global_cond: "torch.Tensor") -> dict[str, "torch.Tensor"]:
-        feat = self.encoder(local_maps)
-        gamma, beta = torch.chunk(self.cond(global_cond), 2, dim=1)
-        feat = feat * (1.0 + gamma[..., None, None]) + beta[..., None, None]
-        return {"rgb_residual": torch.tanh(self.residual(feat)), "alpha_logits": self.alpha(feat), "uncertainty_logits": self.uncertainty(feat)}
+        s0 = self.stem(local_maps)
+        d1 = self.down1(self.pool(s0))
+        d2 = self.down2(self.pool(d1))
+        gamma, beta = torch.chunk(self.film(global_cond), 2, dim=1)
+        d2 = d2 * (1.0 + gamma[..., None, None]) + beta[..., None, None]
+        u1 = F.interpolate(d2, size=d1.shape[-2:], mode="bilinear", align_corners=False)
+        u1 = self.up1(torch.cat([u1, d1], dim=1))
+        u2 = F.interpolate(u1, size=s0.shape[-2:], mode="bilinear", align_corners=False)
+        u2 = self.up2(torch.cat([u2, s0], dim=1))
+        return {
+            "rgb_residual": torch.tanh(self.rgb_residual(u2)),
+            "alpha_logits": self.alpha(u2),
+            "uncertainty_logits": self.uncertainty(u2),
+            "material_gate_logits": self.material_gate(u2),
+        }
 
 
 class TorchBackendUnavailableError(RuntimeError):
@@ -68,7 +99,6 @@ class TorchLocalPatchGenerator:
         self.net = TorchLocalPatchGeneratorNet(global_dim=GLOBAL_COND_DIM, input_channels=LOCAL_INPUT_CHANNELS).to(self.device)
         self.optim = torch.optim.Adam(self.net.parameters(), lr=1e-4)
 
-
     @staticmethod
     def _reference_inputs(batch: "PatchBatch", shape_hw: tuple[int, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
         h, w = shape_hw
@@ -77,40 +107,57 @@ class TorchLocalPatchGenerator:
             rgb = np.clip(ref_rgb.astype(np.float32), 0.0, 1.0)
         else:
             rgb = np.zeros((h, w, 3), dtype=np.float32)
-        ref_mask = getattr(batch, "reference_mask", None)
-        mask = map_to_shape(ref_mask if isinstance(ref_mask, np.ndarray) else None, (h, w), 0.0)
-        ref_validity = getattr(batch, "reference_validity", None)
-        validity = map_to_shape(ref_validity if isinstance(ref_validity, np.ndarray) else None, (h, w), 0.0)
+        mask = map_to_shape(getattr(batch, "reference_mask", None), (h, w), 0.0)
+        validity = map_to_shape(getattr(batch, "reference_validity", None), (h, w), 0.0)
         used = bool(np.any(validity > 0.0))
         return rgb, mask, validity, used
 
     @staticmethod
     def _global_cond(batch: "PatchBatch") -> np.ndarray:
-        out = np.concatenate([
-            batch.semantic_embed,
-            batch.delta_cond,
-            batch.planner_cond,
-            batch.graph_cond,
-            batch.memory_cond,
-            batch.appearance_cond,
-            batch.bbox_cond,
-            batch.mode_cond if batch.mode_cond is not None else np.zeros((MODE_DIM,), dtype=np.float32),
-            batch.role_cond if batch.role_cond is not None else np.zeros((ROLE_DIM,), dtype=np.float32),
-        ]).astype(np.float32)
+        mode_cond = batch.mode_cond if batch.mode_cond is not None else np.zeros((MODE_DIM,), dtype=np.float32)
+        role_cond = batch.role_cond if batch.role_cond is not None else np.zeros((ROLE_DIM,), dtype=np.float32)
+        out = np.concatenate(
+            [
+                batch.semantic_embed,
+                batch.delta_cond,
+                batch.planner_cond,
+                batch.graph_cond,
+                batch.memory_cond,
+                batch.appearance_cond,
+                batch.bbox_cond,
+                mode_cond,
+                role_cond,
+            ]
+        ).astype(np.float32)
         if out.shape[0] != GLOBAL_COND_DIM:
             raise RuntimeError(f"Global conditioning dim mismatch: expected {GLOBAL_COND_DIM}, got {out.shape[0]}")
         return out
 
     def _to_torch_batch(self, batch: "PatchBatch") -> _TorchBatch:
         h, w, _ = batch.roi_before.shape
-        maps = [batch.changed_mask, batch.blend_hint, batch.alpha_target, map_to_shape(batch.preservation_mask, (h, w), 0.0), map_to_shape(batch.uncertainty_target, (h, w), 0.0), map_to_shape(batch.seam_prior, (h, w), 0.0)]
+        if h < 4 or w < 4:
+            raise ValueError(f"TorchLocalPatchGenerator requires ROI >= 4x4, got {h}x{w}")
+        maps = [
+            batch.changed_mask,
+            batch.blend_hint,
+            batch.alpha_target,
+            map_to_shape(batch.preservation_mask, (h, w), 0.0),
+            map_to_shape(batch.uncertainty_target, (h, w), 0.0),
+            map_to_shape(batch.seam_prior, (h, w), 0.0),
+        ]
         reference_rgb, reference_mask, reference_validity, reference_used = self._reference_inputs(batch, (h, w))
         local = np.concatenate([batch.roi_before.astype(np.float32), *maps, reference_rgb, reference_mask, reference_validity], axis=2)
         if isinstance(batch.conditioning_summary, dict):
-            batch.conditioning_summary["reference_tensor_input_channels"] = REFERENCE_TENSOR_INPUT_CHANNELS
-            batch.conditioning_summary["reference_tensor_input_used"] = bool(reference_used)
-            batch.conditioning_summary["reference_tensor_zero_fallback"] = bool(not reference_used)
-            batch.conditioning_summary["local_tensor_input_channels"] = int(local.shape[2])
+            batch.conditioning_summary.update(
+                {
+                    "reference_tensor_input_channels": REFERENCE_TENSOR_INPUT_CHANNELS,
+                    "reference_tensor_input_used": bool(reference_used),
+                    "reference_tensor_zero_fallback": bool(not reference_used),
+                    "local_tensor_input_channels": int(local.shape[2]),
+                    "reference_validity_mean": float(np.mean(reference_validity)),
+                    "reference_mask_mean": float(np.mean(reference_mask)),
+                }
+            )
         return _TorchBatch(
             roi_before=torch.from_numpy(batch.roi_before.transpose(2, 0, 1)[None]).float().to(self.device),
             roi_after=torch.from_numpy(batch.roi_after.transpose(2, 0, 1)[None]).float().to(self.device),
@@ -123,16 +170,41 @@ class TorchLocalPatchGenerator:
         out = self.net(tb.local_maps, tb.global_cond)
         changed, blend, alpha_target = tb.local_maps[:, 3:4], tb.local_maps[:, 4:5], tb.local_maps[:, 5:6]
         preservation, uncertainty_target, seam = tb.local_maps[:, 6:7], tb.local_maps[:, 7:8], tb.local_maps[:, 8:9]
-        edit_gate = torch.clamp(0.6 * changed + 0.4 * blend, 0.0, 1.0) * (1.0 - 0.85 * preservation)
-        rgb_base = torch.clamp(tb.roi_before + 0.25 * out["rgb_residual"] * edit_gate, 0.0, 1.0)
-        reference_rgb = tb.local_maps[:, 9:12]
-        reference_mask = tb.local_maps[:, 12:13]
-        reference_validity = tb.local_maps[:, 13:14]
-        reference_gate = torch.clamp(reference_mask * reference_validity * edit_gate * 0.10, 0.0, 0.18)
-        rgb = torch.clamp(rgb_base * (1.0 - reference_gate) + reference_rgb * reference_gate, 0.0, 1.0)
-        alpha = torch.sigmoid(out["alpha_logits"]) * (0.55 * blend + 0.45 * alpha_target)
-        uncertainty = torch.clamp(torch.sigmoid(out["uncertainty_logits"]) * 0.6 + uncertainty_target * 0.4 + seam * 0.05, 0.0, 1.0)
-        return {"rgb": rgb, "alpha": alpha, "uncertainty": uncertainty, "tb": tb, "reference_tensor_input_channels": REFERENCE_TENSOR_INPUT_CHANNELS, "reference_tensor_input_used": bool(float(torch.sum(reference_validity).detach().cpu()) > 0.0), "reference_tensor_zero_fallback": bool(float(torch.sum(reference_validity).detach().cpu()) <= 0.0)}
+        reference_rgb, reference_mask, reference_validity = tb.local_maps[:, 9:12], tb.local_maps[:, 12:13], tb.local_maps[:, 13:14]
+        edit_strength = torch.clamp(0.6 * changed + 0.4 * blend, 0.0, 1.0)
+        edit_gate = torch.clamp(edit_strength * (1.0 - 0.95 * preservation), 0.0, 1.0)
+        rgb_base = torch.clamp(tb.roi_before + 0.35 * out["rgb_residual"] * edit_gate, 0.0, 1.0)
+        learned_gate = torch.sigmoid(out["material_gate_logits"])
+        material_gate_candidate = learned_gate * reference_mask * reference_validity * edit_strength
+        material_gate_raw = material_gate_candidate * (1.0 - preservation)
+        material_gate = torch.clamp(material_gate_raw, 0.0, MATERIAL_GATE_MAX)
+        rgb = torch.clamp(rgb_base * (1.0 - material_gate) + reference_rgb * material_gate, 0.0, 1.0)
+        alpha = torch.sigmoid(out["alpha_logits"]) * (0.55 * blend + 0.45 * alpha_target) * (1.0 - 0.7 * preservation)
+        ref_sensitive = torch.clamp(changed * reference_mask, 0.0, 1.0)
+        ref_missing = ref_sensitive * (1.0 - reference_validity)
+        uncertainty = torch.clamp(torch.sigmoid(out["uncertainty_logits"]) * 0.5 + uncertainty_target * 0.35 + seam * 0.12 + ref_missing * 0.18 + changed * 0.08, 0.0, 1.0)
+        used = bool(float(torch.sum(reference_validity).detach().cpu()) > 0.0)
+        suppressed = torch.clamp(material_gate_raw - material_gate, 0.0, 1.0) + material_gate_raw * preservation
+        return {
+            "rgb": rgb,
+            "alpha": alpha,
+            "uncertainty": uncertainty,
+            "tb": tb,
+            "reference_tensor_input_channels": REFERENCE_TENSOR_INPUT_CHANNELS,
+            "reference_tensor_input_used": used,
+            "reference_tensor_zero_fallback": not used,
+            "material_gate": material_gate,
+            "reference_validity": reference_validity,
+            "reference_mask": reference_mask,
+            "edit_gate": edit_gate,
+            "material_gate_max": float(material_gate.max().item()),
+            "material_gate_cap": float(MATERIAL_GATE_MAX),
+            "material_gate_suppressed_by_preservation": float((material_gate_candidate * preservation).mean().item()),
+            "reference_validity_mean": float(reference_validity.mean().item()),
+            "reference_mask_mean": float(reference_mask.mean().item()),
+            "material_gate_mean": float(material_gate.mean().item()),
+            "suppressed_gate_mean": float(suppressed.mean().item()),
+        }
 
     def infer(self, batch: "PatchBatch") -> dict[str, np.ndarray | float]:
         self.net.eval()
@@ -142,8 +214,7 @@ class TorchLocalPatchGenerator:
         alpha = pred["alpha"][0, 0].cpu().numpy().astype(np.float32)
         uncertainty = pred["uncertainty"][0, 0].cpu().numpy().astype(np.float32)
         drift = float(np.mean(np.abs(rgb - batch.roi_before) * map_to_shape(batch.preservation_mask, alpha.shape, 0.0)))
-        conf = float(np.clip(1.0 - float(np.mean(uncertainty)) - drift, 0.0, 1.0))
-        return {"rgb": rgb, "alpha": alpha, "uncertainty": uncertainty, "confidence": conf, "residual_mean": float(np.mean(np.abs(rgb - batch.roi_before))), "alpha_mean": float(np.mean(alpha)), "uncertainty_mean": float(np.mean(uncertainty)), "preservation_drift": drift, "memory_cond_norm": float(np.linalg.norm(batch.memory_cond)), "appearance_cond_norm": float(np.linalg.norm(batch.appearance_cond)), "reference_tensor_input_channels": REFERENCE_TENSOR_INPUT_CHANNELS, "reference_tensor_input_used": bool(pred.get("reference_tensor_input_used", False)), "reference_tensor_zero_fallback": bool(pred.get("reference_tensor_zero_fallback", True))}
+        return {"rgb": rgb, "alpha": alpha, "uncertainty": uncertainty, "confidence": float(np.clip(1.0 - float(np.mean(uncertainty)) - drift, 0.0, 1.0)), "residual_mean": float(np.mean(np.abs(rgb - batch.roi_before))), "alpha_mean": float(np.mean(alpha)), "uncertainty_mean": float(np.mean(uncertainty)), "preservation_drift": drift, "memory_cond_norm": float(np.linalg.norm(batch.memory_cond)), "appearance_cond_norm": float(np.linalg.norm(batch.appearance_cond)), "reference_tensor_input_channels": REFERENCE_TENSOR_INPUT_CHANNELS, "reference_tensor_input_used": bool(pred.get("reference_tensor_input_used", False)), "reference_tensor_zero_fallback": bool(pred.get("reference_tensor_zero_fallback", True)), "material_gate_mean": float(pred.get("material_gate_mean", 0.0)), "material_gate_max": float(pred.get("material_gate_max", 0.0)), "material_gate_cap": float(pred.get("material_gate_cap", MATERIAL_GATE_MAX)), "material_gate_suppressed_by_preservation": float(pred.get("material_gate_suppressed_by_preservation", 0.0)), "reference_validity_mean": float(pred.get("reference_validity_mean", 0.0)), "reference_mask_mean": float(pred.get("reference_mask_mean", 0.0))}
 
     def train_step(self, batch: "PatchBatch", lr: float = 1e-4) -> dict[str, float]:
         for g in self.optim.param_groups:
@@ -151,31 +222,86 @@ class TorchLocalPatchGenerator:
         self.net.train()
         pred = self._predict_tensors(batch)
         tb = pred["tb"]
-        changed, preservation, seam = tb.local_maps[:, 3:4], tb.local_maps[:, 6:7], tb.local_maps[:, 8:9]
+        changed = tb.local_maps[:, 3:4]
+        preservation = tb.local_maps[:, 6:7]
+        seam = tb.local_maps[:, 8:9]
+        blend = tb.local_maps[:, 4:5]
         uncertainty_target, alpha_target = tb.local_maps[:, 7:8], tb.local_maps[:, 5:6]
+        ref_mask, ref_validity, ref_rgb = pred["reference_mask"], pred["reference_validity"], tb.local_maps[:, 9:12]
         reconstruction_loss = ((pred["rgb"] - tb.roi_after) ** 2 * (0.2 + changed)).mean()
         alpha_loss = ((pred["alpha"] - alpha_target) ** 2).mean()
         uncertainty_loss = ((pred["uncertainty"] - uncertainty_target) ** 2).mean()
         preservation_loss = (torch.abs(pred["rgb"] - tb.roi_before) * preservation).mean()
         seam_loss = (torch.abs(pred["rgb"] - tb.roi_after) * seam).mean()
         drift_penalty = torch.abs(pred["rgb"] - tb.roi_before).mean()
-        total = reconstruction_loss + 0.3 * alpha_loss + 0.25 * uncertainty_loss + 0.4 * preservation_loss + 0.15 * seam_loss + 0.1 * drift_penalty
-        self.optim.zero_grad(); total.backward(); self.optim.step()
-        supervision_weight = target_supervision_weight(
-            str((batch.conditioning_summary or {}).get("training_target_quality", "unknown"))
-            if isinstance(batch.conditioning_summary, dict)
-            else "unknown"
+        mat_region = ref_validity * ref_mask * torch.clamp(0.65 * changed + 0.35 * blend, 0.0, 1.0) * (1.0 - preservation)
+        eps = 1e-6
+        mat_denom = torch.clamp(mat_region.sum(), min=eps)
+        material_consistency_loss = ((torch.abs(pred["rgb"] - ref_rgb) * mat_region).sum() / (mat_denom * 3.0))
+        material_gate_preservation_penalty = (pred["material_gate"] * preservation).mean()
+        material_gate_invalidity_penalty = ((1.0 - ref_validity) * pred["material_gate"]).mean()
+        valid_scalar = torch.clamp(ref_validity.mean(), 0.0, 1.0)
+        material_gate_area_penalty = torch.clamp(pred["material_gate"].mean() - 0.22, min=0.0) * valid_scalar
+        material_gate_regularization = material_gate_preservation_penalty + material_gate_invalidity_penalty + material_gate_area_penalty
+        total = (
+            reconstruction_loss
+            + 0.3 * alpha_loss
+            + 0.25 * uncertainty_loss
+            + 0.4 * preservation_loss
+            + 0.15 * seam_loss
+            + 0.1 * drift_penalty
+            + 0.2 * material_consistency_loss
+            + 0.1 * material_gate_regularization
         )
-        total_value = float(total.item())
-        return {"total_loss": total_value, "weighted_total_loss": float(total_value * supervision_weight), "target_supervision_weight": float(supervision_weight), "reconstruction_loss": float(reconstruction_loss.item()), "alpha_loss": float(alpha_loss.item()), "uncertainty_calibration_loss": float(uncertainty_loss.item()), "appearance_preservation_loss": float(preservation_loss.item()), "seam_loss": float(seam_loss.item()), "drift_penalty": float(drift_penalty.item())}
+        self.optim.zero_grad()
+        total.backward()
+        self.optim.step()
+        supervision_weight = target_supervision_weight(str((batch.conditioning_summary or {}).get("training_target_quality", "unknown")) if isinstance(batch.conditioning_summary, dict) else "unknown")
+        return {
+            "total_loss": float(total.item()),
+            "weighted_total_loss": float(total.item() * supervision_weight),
+            "target_supervision_weight": float(supervision_weight),
+            "reconstruction_loss": float(reconstruction_loss.item()),
+            "alpha_loss": float(alpha_loss.item()),
+            "uncertainty_calibration_loss": float(uncertainty_loss.item()),
+            "appearance_preservation_loss": float(preservation_loss.item()),
+            "seam_loss": float(seam_loss.item()),
+            "drift_penalty": float(drift_penalty.item()),
+            "material_consistency_loss": float(material_consistency_loss.item()),
+            "material_gate_regularization": float(material_gate_regularization.item()),
+            "material_gate_preservation_penalty": float(material_gate_preservation_penalty.item()),
+            "material_gate_invalidity_penalty": float(material_gate_invalidity_penalty.item()),
+            "material_gate_area_penalty": float(material_gate_area_penalty.item()),
+            "material_gate_mean": float(pred.get("material_gate_mean", 0.0)),
+            "material_gate_max": float(pred.get("material_gate_max", 0.0)),
+            "material_gate_cap": float(pred.get("material_gate_cap", MATERIAL_GATE_MAX)),
+            "material_gate_suppressed_by_preservation": float(pred.get("material_gate_suppressed_by_preservation", 0.0)),
+            "reference_validity_mean": float(pred.get("reference_validity_mean", 0.0)),
+            "reference_tensor_input_used": float(pred.get("reference_tensor_input_used", False)),
+            "reference_tensor_zero_fallback": float(pred.get("reference_tensor_zero_fallback", True)),
+        }
 
     def eval_step(self, batch: "PatchBatch") -> dict[str, float]:
         self.net.eval()
         with torch.no_grad():
             pred = self._predict_tensors(batch)
             tb = pred["tb"]
-            total = ((pred["rgb"] - tb.roi_after) ** 2).mean() + ((pred["alpha"] - tb.local_maps[:, 5:6]) ** 2).mean()
-        return {"total_loss": float(total.item()), "alpha_mae": float(torch.abs(pred["alpha"] - tb.local_maps[:, 5:6]).mean().item()), "uncertainty_mean": float(pred["uncertainty"].mean().item())}
+            mat_region = pred["reference_validity"] * pred["reference_mask"] * (1.0 - tb.local_maps[:, 6:7])
+            mat_denom = torch.clamp(mat_region.sum(), min=1e-6)
+            mat_consistency = (torch.abs(pred["rgb"] - tb.local_maps[:, 9:12]) * mat_region).sum() / (mat_denom * 3.0)
+            total = ((pred["rgb"] - tb.roi_after) ** 2).mean() + ((pred["alpha"] - tb.local_maps[:, 5:6]) ** 2).mean() + 0.2 * mat_consistency
+        return {
+            "total_loss": float(total.item()),
+            "alpha_mae": float(torch.abs(pred["alpha"] - tb.local_maps[:, 5:6]).mean().item()),
+            "uncertainty_mean": float(pred["uncertainty"].mean().item()),
+            "material_consistency_loss": float(mat_consistency.item()),
+            "material_gate_mean": float(pred.get("material_gate_mean", 0.0)),
+            "material_gate_max": float(pred.get("material_gate_max", 0.0)),
+            "material_gate_cap": float(pred.get("material_gate_cap", MATERIAL_GATE_MAX)),
+            "reference_validity_mean": float(pred.get("reference_validity_mean", 0.0)),
+            "reference_mask_mean": float(pred.get("reference_mask_mean", 0.0)),
+            "material_gate_suppressed_by_preservation": float(pred.get("material_gate_suppressed_by_preservation", 0.0)),
+        }
 
     def save(self, path: str) -> None:
         torch.save({"state_dict": self.net.state_dict(), "local_input_channels": LOCAL_INPUT_CHANNELS, "reference_tensor_input_channels": REFERENCE_TENSOR_INPUT_CHANNELS}, str(path))
@@ -190,45 +316,35 @@ class TorchLocalPatchGenerator:
         upgraded = False
         current = inst.net.state_dict()
         load_state = dict(state)
-        first_key = "encoder.0.weight"
-        if first_key in load_state and first_key in current and tuple(load_state[first_key].shape) != tuple(current[first_key].shape):
-            old_weight = load_state[first_key]
-            new_weight = current[first_key].clone()
+        if "encoder.0.weight" in load_state:
+            raise ValueError("legacy tiny encoder checkpoint is not compatible with reference-guided UNet; retrain renderer or provide v2 checkpoint")
+        if "stem.net.0.weight" in load_state and tuple(load_state["stem.net.0.weight"].shape) != tuple(current["stem.net.0.weight"].shape):
+            old_weight = load_state["stem.net.0.weight"]
+            new_weight = current["stem.net.0.weight"].clone()
             if (
-                len(old_weight.shape) == 4
-                and len(new_weight.shape) == 4
-                and int(old_weight.shape[0]) == int(new_weight.shape[0])
-                and int(old_weight.shape[2]) == int(new_weight.shape[2])
-                and int(old_weight.shape[3]) == int(new_weight.shape[3])
-                and int(old_weight.shape[1]) == BASE_LOCAL_INPUT_CHANNELS
+                int(old_weight.shape[1]) == BASE_LOCAL_INPUT_CHANNELS
                 and int(new_weight.shape[1]) == LOCAL_INPUT_CHANNELS
+                and old_weight.shape[0] == new_weight.shape[0]
+                and old_weight.shape[2:] == new_weight.shape[2:]
             ):
                 new_weight.zero_()
                 new_weight[:, :BASE_LOCAL_INPUT_CHANNELS, :, :] = old_weight
-                load_state[first_key] = new_weight
+                load_state["stem.net.0.weight"] = new_weight
                 upgraded = True
             else:
-                raise ValueError(
-                    "TorchLocalPatchGenerator checkpoint first conv input channel mismatch: "
-                    f"checkpoint_shape={tuple(old_weight.shape)}, runtime_shape={tuple(new_weight.shape)}"
-                )
-        incompatible = [
-            (key, tuple(value.shape), tuple(current[key].shape))
-            for key, value in load_state.items()
-            if key in current and tuple(value.shape) != tuple(current[key].shape)
-        ]
+                raise ValueError(f"TorchLocalPatchGenerator checkpoint first conv input channel mismatch: checkpoint_shape={tuple(old_weight.shape)}, runtime_shape={tuple(new_weight.shape)}")
+        incompatible = [(k, tuple(v.shape), tuple(current[k].shape)) for k, v in load_state.items() if k in current and tuple(v.shape) != tuple(current[k].shape)]
         if incompatible:
-            key, checkpoint_shape, runtime_shape = incompatible[0]
-            raise ValueError(f"TorchLocalPatchGenerator checkpoint tensor shape mismatch for {key}: checkpoint={checkpoint_shape}, runtime={runtime_shape}")
+            k, cs, rs = incompatible[0]
+            raise ValueError(f"TorchLocalPatchGenerator checkpoint tensor shape mismatch for {k}: checkpoint={cs}, runtime={rs}")
         missing, unexpected = inst.net.load_state_dict(load_state, strict=False)
         if missing or unexpected:
-            raise ValueError(
-                "TorchLocalPatchGenerator checkpoint key mismatch after reference-channel upgrade: "
-                f"missing={list(missing)}, unexpected={list(unexpected)}"
-            )
+            raise ValueError(f"TorchLocalPatchGenerator checkpoint key mismatch after reference-channel upgrade: missing={list(missing)}, unexpected={list(unexpected)}")
         inst.checkpoint_compatibility = {
             "checkpoint_reference_channel_upgrade": bool(upgraded),
-            "checkpoint_local_input_channels": int(data.get("local_input_channels", BASE_LOCAL_INPUT_CHANNELS)) if isinstance(data, dict) else BASE_LOCAL_INPUT_CHANNELS,
+            "checkpoint_local_input_channels": int(data.get("local_input_channels", BASE_LOCAL_INPUT_CHANNELS))
+            if isinstance(data, dict)
+            else BASE_LOCAL_INPUT_CHANNELS,
             "runtime_local_input_channels": LOCAL_INPUT_CHANNELS,
             "missing_keys": list(missing),
             "unexpected_keys": list(unexpected),

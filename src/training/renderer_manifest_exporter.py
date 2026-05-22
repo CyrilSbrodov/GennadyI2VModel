@@ -356,6 +356,18 @@ def _execution_trace_summary(
         "reference_tensor_input_used",
         "reference_tensor_zero_fallback",
         "reference_tensor_input_channels",
+        "local_tensor_input_channels",
+        "material_gate_mean",
+        "material_gate_max",
+        "material_gate_cap",
+        "reference_validity_mean",
+        "reference_mask_mean",
+        "material_consistency_loss",
+        "material_gate_regularization",
+        "material_gate_preservation_penalty",
+        "material_gate_invalidity_penalty",
+        "material_gate_area_penalty",
+        "material_gate_suppressed_by_preservation",
     ):
         if key in trace:
             summary[key] = _safe_json(trace[key])
@@ -436,6 +448,18 @@ def _renderer_batch_contract(
         "reference_tensor_input_used",
         "reference_tensor_zero_fallback",
         "reference_tensor_input_channels",
+        "local_tensor_input_channels",
+        "material_gate_mean",
+        "material_gate_max",
+        "material_gate_cap",
+        "reference_validity_mean",
+        "reference_mask_mean",
+        "material_consistency_loss",
+        "material_gate_regularization",
+        "material_gate_preservation_penalty",
+        "material_gate_invalidity_penalty",
+        "material_gate_area_penalty",
+        "material_gate_suppressed_by_preservation",
     ):
         if key in trace:
             contract[key] = _safe_json(trace[key])
