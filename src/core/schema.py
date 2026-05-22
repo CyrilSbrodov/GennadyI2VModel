@@ -325,6 +325,10 @@ class TexturePatchMemory:
     attachment_targets: list[str] = field(default_factory=list)
     suitable_for_reveal: bool = False
     rgb_patch: list | None = None
+    observed_directly: bool = True
+    generated: bool = False
+    inferred: bool = False
+    provenance: str = "unknown"
 
 
 @dataclass(slots=True)

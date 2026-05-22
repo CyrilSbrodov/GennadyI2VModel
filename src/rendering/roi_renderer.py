@@ -1198,6 +1198,10 @@ class PatchRenderer:
             coverage_targets=[region_type],
             attachment_targets=[],
             suitable_for_reveal=True,
+            observed_directly=False,
+            generated=True,
+            inferred=True,
+            provenance="runtime_generated_frame",
         )
         slot = memory.hidden_region_slots.get(region.region_id)
         if slot is None:
