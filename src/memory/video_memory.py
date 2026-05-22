@@ -476,6 +476,10 @@ class MemoryManager:
                     attachment_targets=self._default_attachment_targets(region_type),
                     suitable_for_reveal=region_type in {"torso", "sleeves", "garments", "pelvis"},
                     rgb_patch=self._bounded_rgb_patch(patch),
+                    observed_directly=not frame_generated,
+                    generated=frame_generated,
+                    inferred=frame_generated,
+                    provenance="runtime_generated_frame" if frame_generated else "observed_input_frame",
                 )
                 memory.patch_cache[patch_id] = patch
 
@@ -898,6 +902,13 @@ class MemoryManager:
             candidates.append(patch)
         if not candidates:
             return None
+        trusted_candidates = [
+            patch
+            for patch in candidates
+            if self._texture_patch_is_trusted_observed_material(patch).get("trusted", False)
+        ]
+        if trusted_candidates:
+            candidates = trusted_candidates
         return max(
             candidates,
             key=lambda patch: (
@@ -1017,6 +1028,19 @@ class MemoryManager:
             material_missing_reason=reason,
         )
 
+    def _texture_patch_is_trusted_observed_material(self, patch: TexturePatchMemory) -> dict[str, object]:
+        provenance = str(getattr(patch, "provenance", "unknown") or "unknown").strip().lower()
+        generated = bool(getattr(patch, "generated", False))
+        inferred = bool(getattr(patch, "inferred", False))
+        observed_directly = bool(getattr(patch, "observed_directly", True))
+        if generated or inferred or not observed_directly:
+            return {"trusted": False, "reason": "patch_generated", "provenance": provenance}
+        if provenance in {"runtime_generated_frame", "generated", "synthetic", "self_generated_runtime_target"}:
+            return {"trusted": False, "reason": "patch_generated", "provenance": provenance}
+        if provenance == "unknown":
+            return {"trusted": True, "reason": "patch_provenance_unknown", "provenance": provenance}
+        return {"trusted": True, "reason": "", "provenance": provenance}
+
     def build_reference_patch_material(
         self,
         memory: VideoMemory,
@@ -1052,6 +1076,9 @@ class MemoryManager:
         patch_kind = reference_kind_for_region(patch_region)
         if patch_kind != "none" and patch_kind != payload.reference_kind:
             return self._material_from_payload(payload, reason="region_mismatch")
+        patch_trust = self._texture_patch_is_trusted_observed_material(patch)
+        if not bool(patch_trust.get("trusted", False)):
+            return self._material_from_payload(payload, reason=str(patch_trust.get("reason", "patch_generated") or "patch_generated"))
 
         source = "texture_patch.rgb_patch"
         raw_patch = getattr(patch, "rgb_patch", None)
@@ -1072,6 +1099,9 @@ class MemoryManager:
             material_trusted=True,
         )
         material.descriptor = descriptor
+        trust_reason = str(patch_trust.get("reason", "") or "")
+        if trust_reason == "patch_provenance_unknown":
+            material.descriptor.setdefault("source_patch_trust_note", trust_reason)
         material.source_patch_ref = payload.patch_ref or patch.patch_ref
         material.confidence = min(float(payload.confidence), float(patch.confidence))
         material.evidence_score = min(float(payload.evidence_score), float(patch.evidence_score)) if patch.evidence_score > 0 else float(payload.evidence_score)

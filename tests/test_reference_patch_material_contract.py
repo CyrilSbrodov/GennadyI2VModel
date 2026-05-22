@@ -102,6 +102,128 @@ def test_generated_or_missing_tensor_or_mismatch_rejects_material() -> None:
     assert manager.build_reference_patch_material(memory, _payload()).material_missing_reason == "region_mismatch"
 
 
+def test_inferred_and_not_observed_payload_are_rejected() -> None:
+    manager = MemoryManager()
+    memory = VideoMemory()
+    memory.texture_patches["patch::p1:face:0"] = _patch(rgb_patch=np.ones((2, 2, 3), dtype=np.float32).tolist())
+
+    inferred = _payload()
+    inferred.inferred = True
+    assert manager.build_reference_patch_material(memory, inferred).material_missing_reason == "generated_or_inferred"
+
+    unobserved = _payload()
+    unobserved.observed_directly = False
+    assert manager.build_reference_patch_material(memory, unobserved).material_missing_reason == "payload_untrusted"
+
+
+def test_generated_texture_patch_cannot_be_trusted_material() -> None:
+    manager = MemoryManager()
+    memory = VideoMemory()
+    memory.texture_patches["patch::p1:face:0"] = _patch(
+        rgb_patch=np.ones((2, 2, 3), dtype=np.float32).tolist(),
+    )
+    memory.texture_patches["patch::p1:face:0"].generated = True
+    memory.texture_patches["patch::p1:face:0"].observed_directly = False
+    memory.texture_patches["patch::p1:face:0"].provenance = "runtime_generated_frame"
+
+    material = manager.build_reference_patch_material(memory, _payload())
+
+    assert material is not None
+    assert material.material_trusted is False
+    assert material.material_missing_reason == "patch_generated"
+
+
+def test_runtime_generated_provenance_rejected_even_if_generated_flag_false() -> None:
+    manager = MemoryManager()
+    memory = VideoMemory()
+    memory.texture_patches["patch::p1:face:0"] = _patch(rgb_patch=np.ones((2, 2, 3), dtype=np.float32).tolist())
+    memory.texture_patches["patch::p1:face:0"].generated = False
+    memory.texture_patches["patch::p1:face:0"].inferred = False
+    memory.texture_patches["patch::p1:face:0"].observed_directly = True
+    memory.texture_patches["patch::p1:face:0"].provenance = "runtime_generated_frame"
+
+    material = manager.build_reference_patch_material(memory, _payload())
+
+    assert material is not None
+    assert material.material_trusted is False
+    assert material.material_missing_reason == "patch_generated"
+
+
+def test_generated_flag_rejected_even_if_provenance_claims_observed() -> None:
+    manager = MemoryManager()
+    memory = VideoMemory()
+    memory.texture_patches["patch::p1:face:0"] = _patch(rgb_patch=np.ones((2, 2, 3), dtype=np.float32).tolist())
+    memory.texture_patches["patch::p1:face:0"].generated = True
+    memory.texture_patches["patch::p1:face:0"].inferred = False
+    memory.texture_patches["patch::p1:face:0"].observed_directly = True
+    memory.texture_patches["patch::p1:face:0"].provenance = "observed_input_frame"
+
+    material = manager.build_reference_patch_material(memory, _payload())
+
+    assert material is not None
+    assert material.material_trusted is False
+    assert material.material_missing_reason == "patch_generated"
+
+
+def test_legacy_unknown_provenance_patch_remains_compatible_when_payload_trusted() -> None:
+    manager = MemoryManager()
+    memory = VideoMemory()
+    memory.texture_patches["patch::p1:face:0"] = _patch(rgb_patch=np.ones((2, 2, 3), dtype=np.float32).tolist())
+    material = manager.build_reference_patch_material(memory, _payload())
+
+    assert material is not None
+    assert material.material_trusted is True
+    assert material.material_missing_reason == ""
+    assert material.descriptor.get("source_patch_trust_note") == "patch_provenance_unknown"
+
+def test_observed_patch_preferred_over_newer_generated_patch_for_reference_payload() -> None:
+    manager = MemoryManager()
+    memory = VideoMemory()
+    memory.texture_patches["patch::p1:face:0"] = _patch(
+        patch_id="patch::p1:face:0",
+        rgb_patch=np.ones((2, 2, 3), dtype=np.float32).tolist(),
+    )
+    memory.texture_patches["patch::p1:face:0"].source_frame = 0
+    memory.texture_patches["patch::p1:face:0"].observed_directly = True
+    memory.texture_patches["patch::p1:face:0"].generated = False
+    memory.texture_patches["patch::p1:face:0"].provenance = "observed_input_frame"
+    memory.texture_patches["patch::p1:face:5"] = _patch(
+        patch_id="patch::p1:face:5",
+        rgb_patch=np.full((2, 2, 3), 0.5, dtype=np.float32).tolist(),
+    )
+    memory.texture_patches["patch::p1:face:5"].source_frame = 5
+    memory.texture_patches["patch::p1:face:5"].observed_directly = False
+    memory.texture_patches["patch::p1:face:5"].generated = True
+    memory.texture_patches["patch::p1:face:5"].inferred = True
+    memory.texture_patches["patch::p1:face:5"].provenance = "runtime_generated_frame"
+
+    payload = _payload(patch_id="patch::p1:face:5")
+    payload.source_frame = 5
+    material = manager.build_reference_patch_material(memory, payload)
+    assert material is not None
+    assert material.material_trusted is False
+    assert material.material_missing_reason == "patch_generated"
+
+    from core.schema import CanonicalRegionMemoryEntry
+    entry = CanonicalRegionMemoryEntry(
+        record_id="p1:face",
+        entity_id="p1",
+        canonical_region="face",
+        memory_kind="reference",
+        source_frame=5,
+        confidence=0.9,
+        evidence_score=0.9,
+        observed_directly=True,
+        generated=False,
+        inferred=False,
+        reliable_as_reference=True,
+        reference_kind="identity_reference",
+    )
+    chosen = manager._find_reference_texture_patch(memory, entry)
+    assert chosen is not None
+    assert chosen.patch_id == "patch::p1:face:0"
+
+
 def test_renderer_maps_trusted_material_to_batch_tensors_and_trace() -> None:
     material = asdict(MemoryManager().build_reference_patch_material(
         VideoMemory(texture_patches={"patch::p1:face:0": _patch(rgb_patch=np.full((2, 3, 3), [0.7, 0.2, 0.1], dtype=np.float32).tolist())}),
@@ -264,6 +386,43 @@ def test_reference_material_coverage_is_separate_from_family_coverage() -> None:
     assert agg["identity_material_coverage_ratio"] == 0.0
     assert agg["body_shape_material_coverage_ratio"] == 1.0
     assert agg["material_missing_reasons"]["identity"]["material_missing"] == 1
+
+
+def test_renderer_zero_fallback_when_only_generated_material_exists() -> None:
+    manager = MemoryManager()
+    memory = VideoMemory()
+    memory.texture_patches["patch::p1:face:0"] = _patch(rgb_patch=np.ones((2, 2, 3), dtype=np.float32).tolist())
+    memory.texture_patches["patch::p1:face:0"].generated = True
+    memory.texture_patches["patch::p1:face:0"].observed_directly = False
+    payload = _payload()
+    material = asdict(manager.build_reference_patch_material(memory, payload))
+    request = _request({"expected_reference_payload": asdict(payload), "reference_patch_payloads": [asdict(payload)], "expected_reference_patch_material": material})
+
+    batch = build_patch_batch(request, np.zeros((4, 4, 3), dtype=np.float32))
+
+    assert batch.conditioning_summary["reference_patch_material_used"] is False
+    assert batch.conditioning_summary["reference_patch_material_trusted"] is False
+    assert batch.conditioning_summary["reference_tensor_zero_fallback"] is True
+    assert batch.conditioning_summary["reference_patch_material_missing_reason"] == "patch_generated"
+    assert np.allclose(batch.reference_validity, 0.0)
+
+
+def test_generated_material_rejection_appears_in_runtime_coverage_warnings() -> None:
+    coverage = GennadyEngine._summarize_step_reference_coverage([
+        {
+            "region_id": "p1:face",
+            "execution_trace": {
+                "identity_reference_used": True,
+                "identity_reference_strength": 0.9,
+                "reference_patch_material_present": True,
+                "reference_patch_material_trusted": False,
+                "reference_patch_material_used": False,
+                "reference_patch_material_missing_reason": "patch_generated",
+            },
+        }
+    ])
+    assert coverage["material_missing_reasons"]["identity"]["patch_generated"] == 1
+    assert any("patch_generated" in warning for warning in coverage["critical_warnings"])
 
 
 def test_black_reference_material_counts_as_tensor_input_used() -> None:
