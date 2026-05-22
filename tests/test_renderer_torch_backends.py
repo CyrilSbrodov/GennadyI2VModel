@@ -132,7 +132,7 @@ def test_renderer_can_load_saved_torch_checkpoints_when_available(tmp_path: Path
     assert patch.execution_trace["module_trace"]["backend_selection"] in {"torch_learned_primary", "torch_learned_unusable_fallback", "bootstrap_fallback"}
 
 
-def test_torch_local_patch_generator_upgrades_legacy_9_channel_checkpoint(tmp_path: Path) -> None:
+def test_torch_local_patch_generator_upgrades_v2_9_channel_stem_checkpoint(tmp_path: Path) -> None:
     import pytest
 
     torch = pytest.importorskip("torch")
@@ -141,15 +141,15 @@ def test_torch_local_patch_generator_upgrades_legacy_9_channel_checkpoint(tmp_pa
 
     legacy = TorchLocalPatchGeneratorNet(global_dim=GLOBAL_COND_DIM, input_channels=BASE_LOCAL_INPUT_CHANNELS)
     with torch.no_grad():
-        legacy.encoder[0].weight.fill_(0.25)
+        legacy.stem.net[0].weight.fill_(0.25)
     checkpoint = tmp_path / "legacy_9_channel.pt"
     torch.save({"state_dict": legacy.state_dict(), "local_input_channels": BASE_LOCAL_INPUT_CHANNELS}, str(checkpoint))
 
     loaded = TorchLocalPatchGenerator.load(str(checkpoint))
-    weight = loaded.net.encoder[0].weight.detach().cpu()
+    weight = loaded.net.stem.net[0].weight.detach().cpu()
 
     assert loaded.net.input_channels == LOCAL_INPUT_CHANNELS
-    assert torch.allclose(weight[:, :BASE_LOCAL_INPUT_CHANNELS], legacy.encoder[0].weight.detach().cpu())
+    assert torch.allclose(weight[:, :BASE_LOCAL_INPUT_CHANNELS], legacy.stem.net[0].weight.detach().cpu())
     assert torch.count_nonzero(weight[:, BASE_LOCAL_INPUT_CHANNELS:]) == 0
     assert loaded.checkpoint_compatibility["checkpoint_reference_channel_upgrade"] is True
 
@@ -162,7 +162,7 @@ def test_torch_local_patch_generator_rejects_incomplete_checkpoint(tmp_path: Pat
 
     model = TorchLocalPatchGenerator()
     state = model.net.state_dict()
-    state.pop("encoder.2.weight")
+    state.pop("stem.net.2.weight")
     checkpoint = tmp_path / "missing_key.pt"
     torch.save({"state_dict": state}, str(checkpoint))
 
@@ -194,9 +194,189 @@ def test_torch_local_patch_generator_rejects_unsupported_shape_mismatch(tmp_path
 
     model = TorchLocalPatchGenerator()
     state = model.net.state_dict()
-    state["encoder.2.weight"] = state["encoder.2.weight"][:, :1, :, :]
+    state["stem.net.2.weight"] = state["stem.net.2.weight"][:, :1, :, :]
     checkpoint = tmp_path / "bad_shape.pt"
     torch.save({"state_dict": state}, str(checkpoint))
 
     with pytest.raises(ValueError, match="tensor shape mismatch"):
         TorchLocalPatchGenerator.load(str(checkpoint))
+
+
+def _torch_batch_with_reference(h: int = 16, w: int = 16, *, validity: float = 1.0, mask: float = 1.0, preservation: float = 0.0):
+    import numpy as np
+    from core.schema import BBox, SceneGraph, RegionRef
+    from learned.interfaces import PatchSynthesisRequest
+    from rendering.trainable_patch_renderer import build_patch_batch
+
+    request = PatchSynthesisRequest(
+        region=RegionRef(region_id="p1:face", bbox=BBox(0.0, 0.0, 1.0, 1.0), reason="test"),
+        scene_state=SceneGraph(frame_index=0),
+        memory_summary={},
+        transition_context={},
+        retrieval_summary={},
+        current_frame=np.full((h, w, 3), 0.2, dtype=np.float32).tolist(),
+    )
+    roi = np.full((h, w, 3), 0.2, dtype=np.float32)
+    batch = build_patch_batch(request, roi)
+    batch.reference_rgb = np.zeros((h, w, 3), dtype=np.float32)
+    batch.reference_mask = np.full((h, w, 1), mask, dtype=np.float32)
+    batch.reference_validity = np.full((h, w, 1), validity, dtype=np.float32)
+    batch.changed_mask = np.ones((h, w, 1), dtype=np.float32)
+    batch.blend_hint = np.ones((h, w, 1), dtype=np.float32)
+    batch.preservation_mask = np.full((h, w, 1), preservation, dtype=np.float32)
+    return batch
+
+
+def test_torch_local_patch_generator_local_tensor_layout_contract() -> None:
+    import numpy as np
+    import pytest
+
+    pytest.importorskip("torch")
+    from rendering.torch_local_patch_generator import LOCAL_INPUT_CHANNELS, TorchLocalPatchGenerator
+
+    gen = TorchLocalPatchGenerator()
+    batch = _torch_batch_with_reference(16, 16, validity=1.0, mask=1.0)
+    tb = gen._to_torch_batch(batch)
+    assert tb.local_maps.shape[1] == LOCAL_INPUT_CHANNELS == 14
+    assert np.allclose(tb.local_maps[0, 9:12].cpu().numpy(), 0.0)
+    assert float(tb.local_maps[0, 13:14].mean().item()) > 0.0
+    assert batch.conditioning_summary["reference_tensor_input_used"] is True
+    assert batch.conditioning_summary["reference_tensor_zero_fallback"] is False
+
+
+def test_torch_local_patch_generator_material_gate_cold_start_and_caps() -> None:
+    import pytest
+
+    pytest.importorskip("torch")
+    from rendering.torch_local_patch_generator import MATERIAL_GATE_MAX, TorchLocalPatchGenerator
+
+    gen = TorchLocalPatchGenerator(seed=1)
+    batch = _torch_batch_with_reference(16, 16, validity=1.0, mask=1.0)
+    pred = gen._predict_tensors(batch)
+    assert pred["material_gate_mean"] < 0.2
+    assert pred["material_gate_max"] <= MATERIAL_GATE_MAX + 1e-6
+
+
+def test_torch_local_patch_generator_reference_validity_zero_disables_gate() -> None:
+    import pytest
+
+    pytest.importorskip("torch")
+    from rendering.torch_local_patch_generator import TorchLocalPatchGenerator
+
+    gen = TorchLocalPatchGenerator(seed=2)
+    batch = _torch_batch_with_reference(16, 16, validity=0.0, mask=1.0)
+    pred = gen._predict_tensors(batch)
+    assert pred["material_gate_max"] == 0.0
+    assert pred["reference_tensor_zero_fallback"] is True
+
+
+def test_torch_local_patch_generator_reference_mask_zero_disables_gate() -> None:
+    import pytest
+
+    pytest.importorskip("torch")
+    from rendering.torch_local_patch_generator import TorchLocalPatchGenerator
+
+    gen = TorchLocalPatchGenerator(seed=6)
+    batch = _torch_batch_with_reference(16, 16, validity=1.0, mask=0.0)
+    pred = gen._predict_tensors(batch)
+    assert pred["material_gate_max"] == 0.0
+
+
+def test_torch_local_patch_generator_preservation_suppresses_gate_and_drift() -> None:
+    import pytest
+
+    pytest.importorskip("torch")
+    from rendering.torch_local_patch_generator import TorchLocalPatchGenerator
+
+    gen = TorchLocalPatchGenerator(seed=7)
+    low_pres = _torch_batch_with_reference(16, 16, validity=1.0, mask=1.0, preservation=0.0)
+    hi_pres = _torch_batch_with_reference(16, 16, validity=1.0, mask=1.0, preservation=1.0)
+    low_pred = gen._predict_tensors(low_pres)
+    hi_pred = gen._predict_tensors(hi_pres)
+    low_inf = gen.infer(low_pres)
+    hi_inf = gen.infer(hi_pres)
+    assert hi_pred["material_gate_mean"] == 0.0
+    assert hi_pred["material_gate_suppressed_by_preservation"] > 0.0
+    assert abs(low_pred["material_gate_suppressed_by_preservation"]) <= 1e-6
+    assert hi_pred["material_gate_mean"] <= low_pred["material_gate_mean"]
+    assert hi_inf["preservation_drift"] <= low_inf["preservation_drift"] + 1e-6
+
+
+def test_torch_local_patch_generator_valid_reference_enables_bounded_gate() -> None:
+    import pytest
+
+    pytest.importorskip("torch")
+    from rendering.torch_local_patch_generator import MATERIAL_GATE_MAX, TorchLocalPatchGenerator
+
+    gen = TorchLocalPatchGenerator(seed=8)
+    batch = _torch_batch_with_reference(16, 16, validity=1.0, mask=1.0, preservation=0.0)
+    pred = gen._predict_tensors(batch)
+    assert pred["material_gate_mean"] > 0.0
+    assert pred["material_gate_max"] <= MATERIAL_GATE_MAX + 1e-6
+
+
+def test_torch_local_patch_generator_legacy_tiny_encoder_checkpoint_fails_fast(tmp_path: Path) -> None:
+    import pytest
+
+    torch = pytest.importorskip("torch")
+    from rendering.torch_local_patch_generator import TorchLocalPatchGenerator
+
+    checkpoint = tmp_path / "legacy_encoder_key.pt"
+    torch.save({"state_dict": {"encoder.0.weight": torch.zeros((32, 9, 3, 3))}}, str(checkpoint))
+    with pytest.raises(ValueError, match="legacy tiny encoder checkpoint is not compatible"):
+        TorchLocalPatchGenerator.load(str(checkpoint))
+
+
+def test_torch_local_patch_generator_material_consistency_weighted_no_nan() -> None:
+    import math
+    import pytest
+
+    pytest.importorskip("torch")
+    from rendering.torch_local_patch_generator import TorchLocalPatchGenerator
+
+    gen = TorchLocalPatchGenerator(seed=3)
+    valid_batch = _torch_batch_with_reference(16, 16, validity=1.0, mask=1.0)
+    zero_batch = _torch_batch_with_reference(16, 16, validity=0.0, mask=1.0)
+    valid_metrics = gen.train_step(valid_batch)
+    zero_metrics = gen.train_step(zero_batch)
+
+    assert math.isfinite(valid_metrics["material_consistency_loss"])
+    assert math.isfinite(zero_metrics["material_consistency_loss"])
+    assert abs(zero_metrics["material_consistency_loss"]) <= 1e-6
+    assert abs(zero_metrics["material_gate_area_penalty"]) <= 1e-6
+
+
+def test_torch_local_patch_generator_eval_no_nan() -> None:
+    import math
+    import pytest
+
+    pytest.importorskip("torch")
+    from rendering.torch_local_patch_generator import TorchLocalPatchGenerator
+
+    gen = TorchLocalPatchGenerator(seed=9)
+    metrics = gen.eval_step(_torch_batch_with_reference(16, 16, validity=1.0, mask=1.0))
+    assert math.isfinite(metrics["total_loss"])
+    assert math.isfinite(metrics["material_consistency_loss"])
+
+
+def test_torch_local_patch_generator_supports_standard_roi_sizes() -> None:
+    import pytest
+
+    pytest.importorskip("torch")
+    from rendering.torch_local_patch_generator import TorchLocalPatchGenerator
+
+    gen = TorchLocalPatchGenerator(seed=4)
+    for size in (16, 32, 64):
+        pred = gen.infer(_torch_batch_with_reference(size, size, validity=1.0, mask=1.0))
+        assert pred["material_gate_cap"] > 0.0
+
+
+def test_torch_local_patch_generator_rejects_too_small_roi() -> None:
+    import pytest
+
+    pytest.importorskip("torch")
+    from rendering.torch_local_patch_generator import TorchLocalPatchGenerator
+
+    gen = TorchLocalPatchGenerator(seed=5)
+    with pytest.raises(ValueError, match="ROI >= 4x4"):
+        gen.infer(_torch_batch_with_reference(2, 2, validity=1.0, mask=1.0))

@@ -1981,8 +1981,16 @@ def summarize_patch_batch(batch: PatchBatch) -> dict[str, object]:
         "reference_patch_material_evidence_score": _safe_float(batch.conditioning_summary.get("reference_patch_material_evidence_score")),
         "reference_material_lane_active": bool(batch.conditioning_summary.get("reference_material_lane_active", False)),
         "reference_tensor_input_channels": int(batch.conditioning_summary.get("reference_tensor_input_channels", 0) or 0),
+        "local_tensor_input_channels": int(batch.conditioning_summary.get("local_tensor_input_channels", 0) or 0),
         "reference_tensor_input_used": bool(batch.conditioning_summary.get("reference_tensor_input_used", False)),
         "reference_tensor_zero_fallback": bool(batch.conditioning_summary.get("reference_tensor_zero_fallback", True)),
+
+        "material_gate_mean": _safe_float(batch.conditioning_summary.get("material_gate_mean")),
+        "material_gate_max": _safe_float(batch.conditioning_summary.get("material_gate_max")),
+        "material_gate_cap": _safe_float(batch.conditioning_summary.get("material_gate_cap")),
+        "reference_validity_mean": _safe_float(batch.conditioning_summary.get("reference_validity_mean")),
+        "reference_mask_mean": _safe_float(batch.conditioning_summary.get("reference_mask_mean")),
+        "material_gate_suppressed_by_preservation": _safe_float(batch.conditioning_summary.get("material_gate_suppressed_by_preservation")),
         "identity_reference_used": bool(batch.conditioning_summary.get("identity_reference_used", False)),
         "identity_reference_strength": _safe_float(batch.conditioning_summary.get("identity_reference_strength")),
         "identity_reference_source": batch.conditioning_summary.get("identity_reference_source", "none"),
@@ -2249,6 +2257,20 @@ def output_from_prediction(
         conf = float(np.clip(conf * (1.0 - preserved_drift * 1.35) * (1.0 - 0.18 * float(np.mean(uncertainty))), 0.0, 1.0))
 
     memory_bundle_trace = summarize_memory_bundle_trace(request.transition_context)
+
+    material_diag = {
+        "material_gate_mean": _safe_float(pred.get("material_gate_mean")),
+        "material_gate_max": _safe_float(pred.get("material_gate_max")),
+        "material_gate_cap": _safe_float(pred.get("material_gate_cap")),
+        "reference_validity_mean": _safe_float(pred.get("reference_validity_mean")),
+        "reference_mask_mean": _safe_float(pred.get("reference_mask_mean")),
+        "material_consistency_loss": _safe_float(pred.get("material_consistency_loss")),
+        "material_gate_regularization": _safe_float(pred.get("material_gate_regularization")),
+        "material_gate_preservation_penalty": _safe_float(pred.get("material_gate_preservation_penalty")),
+        "material_gate_invalidity_penalty": _safe_float(pred.get("material_gate_invalidity_penalty")),
+        "material_gate_area_penalty": _safe_float(pred.get("material_gate_area_penalty")),
+        "material_gate_suppressed_by_preservation": _safe_float(pred.get("material_gate_suppressed_by_preservation")),
+    }
     exec_trace = {
         "renderer_path": renderer_path,
         "selected_render_strategy": _strategy_name(batch, renderer_path),
@@ -2314,6 +2336,7 @@ def output_from_prediction(
         "reference_patch_material_evidence_score": _safe_float(conditioning_summary.get("reference_patch_material_evidence_score")),
         "reference_material_lane_active": bool(conditioning_summary.get("reference_material_lane_active", False)),
         "reference_tensor_input_channels": int(conditioning_summary.get("reference_tensor_input_channels", 0) or 0),
+        "local_tensor_input_channels": int(conditioning_summary.get("local_tensor_input_channels", 0) or 0),
         "reference_tensor_input_used": bool(conditioning_summary.get("reference_tensor_input_used", False)),
         "reference_tensor_zero_fallback": bool(conditioning_summary.get("reference_tensor_zero_fallback", True)),
         "memory_bundle_present": bool(conditioning_summary.get("memory_bundle_present", memory_bundle_trace.get("memory_bundle_present", False))),
@@ -2339,6 +2362,7 @@ def output_from_prediction(
         "checkpoint_runtime_loadable": bool(diagnostics.get("checkpoint_runtime_loadable", False)),
         "checkpoint_global_cond_dim": int(diagnostics.get("checkpoint_global_cond_dim", 0) or 0),
         **memory_bundle_trace,
+        **material_diag,
     }
     return PatchSynthesisOutput(
         region=request.region,
@@ -2357,6 +2381,7 @@ def output_from_prediction(
             f"role={exec_trace['profile_role']}",
             f"alpha_mean={float(np.mean(alpha)):.4f}",
             f"unc_mean={float(np.mean(uncertainty)):.4f}",
+            f"mat_gate_mean={float(material_diag.get('material_gate_mean', 0.0) or 0.0):.4f}",
         ],
         execution_trace=exec_trace,
         metadata={
@@ -2406,11 +2431,13 @@ def output_from_prediction(
             "reference_patch_material_evidence_score": _safe_float(conditioning_summary.get("reference_patch_material_evidence_score")),
             "reference_material_lane_active": bool(conditioning_summary.get("reference_material_lane_active", False)),
             "reference_tensor_input_channels": int(conditioning_summary.get("reference_tensor_input_channels", 0) or 0),
+            "local_tensor_input_channels": int(conditioning_summary.get("local_tensor_input_channels", 0) or 0),
             "reference_tensor_input_used": bool(conditioning_summary.get("reference_tensor_input_used", False)),
             "reference_tensor_zero_fallback": bool(conditioning_summary.get("reference_tensor_zero_fallback", True)),
             "blend_hint_mean": float(np.mean(batch.blend_hint)) if batch is not None else 0.0,
             "changed_mask_mean": float(np.mean(batch.changed_mask)) if batch is not None else 0.0,
             "alpha_mean": float(np.mean(alpha)),
             "uncertainty_mean": float(np.mean(uncertainty)),
+            **material_diag,
         },
     )

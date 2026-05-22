@@ -606,3 +606,50 @@ def test_runtime_debug_trace_exports_reference_patch_material_validated() -> Non
     assert output.execution_trace["reference_patch_material_validated"] is True
     assert output.metadata["reference_patch_material_validated"] is True
 
+
+def test_output_from_prediction_propagates_material_gate_and_local_tensor_channels() -> None:
+    import importlib
+
+    importlib.import_module("rendering.torch_local_patch_generator")
+    importlib.import_module("rendering.trainable_patch_renderer")
+    importlib.import_module("training.renderer_manifest_exporter")
+
+    material = asdict(
+        MemoryManager().build_reference_patch_material(
+            VideoMemory(texture_patches={"patch::p1:face:0": _patch(rgb_patch=np.ones((2, 2, 3), dtype=np.float32).tolist())}),
+            _payload(),
+        )
+    )
+    request = _request(
+        {
+            "expected_reference_payload": asdict(_payload()),
+            "reference_patch_payloads": [asdict(_payload())],
+            "expected_reference_patch_material": material,
+        }
+    )
+    batch = build_patch_batch(request, np.zeros((3, 3, 3), dtype=np.float32))
+    batch.conditioning_summary["local_tensor_input_channels"] = 14
+    pred = {
+        "rgb": batch.roi_after,
+        "alpha": batch.alpha_target[..., 0],
+        "uncertainty": batch.uncertainty_target[..., 0],
+        "confidence": 0.9,
+        "material_gate_mean": 0.12,
+        "material_gate_max": 0.22,
+        "material_gate_cap": 0.35,
+    }
+    output = output_from_prediction(request, pred, "learned_primary", {}, batch)
+    record = RendererManifestRecordExporter().build_record(
+        request=request,
+        output=output,
+        roi_before=batch.roi_before,
+        roi_after=batch.roi_after,
+        step_index=0,
+        frame_index=0,
+    )
+    assert output.execution_trace["material_gate_mean"] == 0.12
+    assert output.metadata["material_gate_mean"] == 0.12
+    assert any("mat_gate_mean=" in item for item in output.debug_trace)
+    assert output.execution_trace["local_tensor_input_channels"] == 14
+    assert output.metadata["local_tensor_input_channels"] == 14
+    assert record["execution_trace_summary"]["local_tensor_input_channels"] == 14
