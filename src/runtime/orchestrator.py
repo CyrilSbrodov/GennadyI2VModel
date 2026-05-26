@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from core.input_layer import InputAssetLayer
-from core.schema import GraphDelta, ReferencePatchPayload, RegionMemoryBundle, SceneGraph
+from core.schema import BBox, GraphDelta, ReferencePatchPayload, RegionMemoryBundle, RegionRef, SceneGraph
 from dynamics.state_update import apply_delta
 from learned.factory import BackendBundle, BackendConfig, LearnedBackendFactory
 from learned.interfaces import DynamicsTransitionRequest, PatchSynthesisRequest, TemporalRefinementRequest
@@ -29,6 +29,7 @@ from representation.learned_bridge import summarize_memory
 from runtime.profiles import PROFILES, RuntimeProfile
 from runtime.region_metadata import build_region_metadata
 from runtime.region_routing import CanonicalRegionRouter
+from runtime.i2v_frame_planner import I2VFramePlanEntry, plan_i2v_frames
 from text.intent_parser import IntentParser
 from utils_tensor import shape, zeros
 from core.region_ids import make_region_id, parse_region_id
@@ -137,6 +138,67 @@ class GennadyEngine:
         self.memory_summarizer = AppearanceMemorySummarizer()
         self.backend_config = backend_config or BackendConfig()
         self.backends = backend_bundle or LearnedBackendFactory(self.backend_config).build()
+
+    @staticmethod
+    def _frame_plan_entry_to_dict(entry: I2VFramePlanEntry | None) -> dict[str, object]:
+        return asdict(entry) if entry is not None else {}
+
+    @staticmethod
+    def _resolve_planned_region(scene_graph: SceneGraph, roi_selector: ROISelector, region_id: str) -> RegionRef | None:
+        if not isinstance(region_id, str) or ":" not in region_id:
+            return None
+        try:
+            entity_id, region_type = parse_region_id(region_id)
+        except ValueError:
+            return None
+        semantic_resolver = getattr(roi_selector, "semantic_roi_from_graph", None)
+        if callable(semantic_resolver):
+            resolved = semantic_resolver(scene_graph, entity_id, region_type)
+            if resolved is not None:
+                return resolved
+        fallback_resolver = getattr(roi_selector, "fallback_roi_from_person_bbox", None)
+        if callable(fallback_resolver):
+            resolved = fallback_resolver(scene_graph, entity_id, region_type)
+            if resolved is not None:
+                return resolved
+        person = next((p for p in scene_graph.persons if p.person_id == entity_id), None)
+        if person is None:
+            return None
+        x, y, w, h = person.bbox.x, person.bbox.y, person.bbox.w, person.bbox.h
+        layout = {
+            "face": (x + 0.30 * w, y + 0.05 * h, 0.40 * w, 0.24 * h),
+            "hair": (x + 0.24 * w, y + 0.00 * h, 0.52 * w, 0.16 * h),
+            "torso": (x + 0.20 * w, y + 0.30 * h, 0.60 * w, 0.48 * h),
+            "left_arm": (x + 0.00 * w, y + 0.30 * h, 0.22 * w, 0.52 * h),
+            "right_arm": (x + 0.78 * w, y + 0.30 * h, 0.22 * w, 0.52 * h),
+            "upper_clothes": (x + 0.20 * w, y + 0.30 * h, 0.60 * w, 0.32 * h),
+        }
+        if region_type not in layout:
+            return None
+        rx, ry, rw, rh = layout[region_type]
+        return RegionRef(region_id=region_id, bbox=BBox(max(0.0, rx), max(0.0, ry), max(0.05, min(1.0 - rx, rw)), max(0.05, min(1.0 - ry, rh))), reason="frame_plan_debug_layout_fallback")
+
+    @staticmethod
+    def _apply_frame_plan_to_delta(delta: GraphDelta, frame_plan_entry: I2VFramePlanEntry | None) -> tuple[bool, list[str]]:
+        if frame_plan_entry is None:
+            return False, []
+        applied: list[str] = []
+        if not isinstance(delta.region_transition_mode, dict):
+            delta.region_transition_mode = {}
+        for region_id, mode in frame_plan_entry.region_transition_mode.items():
+            if not isinstance(region_id, str) or not isinstance(mode, str):
+                continue
+            try:
+                _, region_type = parse_region_id(region_id)
+            except ValueError:
+                region_type = region_id
+            if not delta.region_transition_mode.get(region_type):
+                delta.region_transition_mode[region_type] = mode
+                applied.append(region_type)
+            if not delta.region_transition_mode.get(region_id):
+                delta.region_transition_mode[region_id] = mode
+                applied.append(region_id)
+        return bool(applied), applied
 
     @staticmethod
     def _normalize_frame_tensor(frame: object, *, field_name: str) -> list[list[list[float]]]:
@@ -530,6 +592,7 @@ class GennadyEngine:
             "overall_expected_reference_coverage_ratio": total_used_known / max(1, total_expected_known),
             "overall_expected_material_coverage_ratio": total_material_used_known / max(1, total_expected_known),
             "overall_input_frame_material_coverage_ratio": total_input_material_used_known / max(1, total_expected_known),
+            "input_frame_material_coverage_source": "observed_directly_not_generated_v1",
         }
 
     def run(
@@ -612,6 +675,11 @@ class GennadyEngine:
             target_duration_sec=duration,
             policy="insert" if quality_profile == "debug" else "use_existing",
         )
+        frame_plan = plan_i2v_frames(
+            request.text,
+            max(1, len(state_plan.steps)),
+            scene_graph.persons[0].person_id if scene_graph.persons else "scene",
+        )
 
         frames: list[list[list[list[float]]]] = [current_frame]
         graphs = [scene_graph]
@@ -634,6 +702,7 @@ class GennadyEngine:
         }
 
         for planned_state in state_plan.steps[1 : profile.max_transition_steps + 1]:
+            frame_plan_entry = frame_plan[min(len(frame_plan) - 1, planned_state.step_index)] if frame_plan else None
             memory_summary = self.memory_summarizer.summarize(memory).as_dict()
             memory_channels = summarize_memory(memory)
             dynamics_channels = self.build_dynamics_memory_channels(memory_channels)
@@ -665,6 +734,7 @@ class GennadyEngine:
                     fallback_log.append(f"step={planned_state.step_index}:dynamics_semantic_{severity}={issue}")
 
             delta = transition_output.delta
+            frame_plan_modes_applied, frame_plan_transition_modes_applied = self._apply_frame_plan_to_delta(delta, frame_plan_entry)
             region_plan = self.region_router.build_plan(
                 scene_graph=scene_graph,
                 delta=delta,
@@ -689,6 +759,21 @@ class GennadyEngine:
             transition_diag["region_transition_semantics"] = region_plan.as_debug_dict()["transition_semantics"]
             delta.transition_diagnostics = transition_diag
             changed_regions = region_plan.render_regions or self.roi_selector.select(scene_graph, delta)
+            frame_plan_added_regions: list[str] = []
+            frame_plan_missing_regions: list[str] = []
+            if frame_plan_entry and frame_plan_entry.affected_regions:
+                existing_ids = {r.region_id for r in changed_regions}
+                for planned_region_id in frame_plan_entry.affected_regions:
+                    if planned_region_id in existing_ids:
+                        continue
+                    resolved = self._resolve_planned_region(scene_graph, self.roi_selector, planned_region_id)
+                    if resolved is None:
+                        frame_plan_missing_regions.append(planned_region_id)
+                        continue
+                    changed_regions.append(resolved)
+                    existing_ids.add(planned_region_id)
+                    frame_plan_added_regions.append(planned_region_id)
+            frame_plan_applied = bool(frame_plan_modes_applied or frame_plan_added_regions)
             patches: list[RenderedPatch] = []
             patch_step_debug: list[dict[str, object]] = []
             step_hidden_reconstruction = False
@@ -753,6 +838,9 @@ class GennadyEngine:
                         "video_memory": memory,
                         "transition_phase": delta.transition_phase,
                         "step_index": planned_state.step_index,
+                        "frame_plan": self._frame_plan_entry_to_dict(frame_plan_entry),
+                        "i2v_action_phase": frame_plan_entry.action_phase if frame_plan_entry is not None else "stable_idle",
+                        "i2v_region_transition_mode": frame_plan_entry.region_transition_mode if frame_plan_entry is not None else {},
                         "target_profile": learned_target_profile or transition_metadata.get("target_profile", {}),
                         "learned_temporal_contract": learned_temporal_contract,
                         "learned_human_state_contract": learned_human_state_contract,
@@ -865,6 +953,8 @@ class GennadyEngine:
                         "runtime_plan_authoritative": (patch_out.execution_trace.get("memory_dependency_summary", {}) or {}).get("runtime_plan_authoritative", False),
                         "confidence": patch_out.confidence,
                         "synthesis_mode": synth_mode,
+                        "i2v_action_phase": frame_plan_entry.action_phase if frame_plan_entry is not None else "stable_idle",
+                        "i2v_region_transition_mode": frame_plan_entry.region_transition_mode if frame_plan_entry is not None else {},
                         "retrieval_summary": str(patch_request.retrieval_summary)[:120],
                         "learned_ready": patch_out.metadata.get("learned_ready_usage", {}),
                         "region_metadata_completeness_score": region_metadata.get("metadata_completeness_score", 0.0),
@@ -923,6 +1013,14 @@ class GennadyEngine:
                                 "reference_tensor_input_used",
                                 "reference_tensor_zero_fallback",
                                 "reference_tensor_input_channels",
+                                "region_id",
+                                "transition_mode",
+                                "reference_payload_trusted",
+                                "material_gate_mean",
+                                "material_gate_max",
+                                "preservation_drift",
+                                "alpha_mean",
+                                "uncertainty_mean",
                             )
                             if key in patch_out.execution_trace
                         },
@@ -1034,6 +1132,11 @@ class GennadyEngine:
             step_debug.append(
                 {
                     "step_index": planned_state.step_index,
+                    "frame_plan": self._frame_plan_entry_to_dict(frame_plan_entry),
+                    "frame_plan_applied": frame_plan_applied,
+                    "frame_plan_added_regions": frame_plan_added_regions,
+                    "frame_plan_missing_regions": frame_plan_missing_regions,
+                    "frame_plan_transition_modes_applied": frame_plan_transition_modes_applied,
                     "region_routing": region_plan.as_debug_dict(),
                     "region_render_order": [r.region_id for r in changed_regions[: profile.max_roi_count]],
                     "dynamics": {
@@ -1087,6 +1190,7 @@ class GennadyEngine:
             channel_usage_log.append(
                 {
                     "step_index": planned_state.step_index,
+                    "frame_plan": self._frame_plan_entry_to_dict(frame_plan_entry),
                     "dynamics_channels": list(transition_request.memory_channels.keys()),
                     "patch_channels": list(self.build_patch_memory_channels(memory_channels).keys()) if changed_regions else [],
                     "temporal_channels": list(temporal_request.memory_channels.keys()),
@@ -1150,6 +1254,7 @@ class GennadyEngine:
                 "renderer_manifest_export_contract_version": renderer_manifest_export_contract_version if export_renderer_manifest_path else None,
                 "renderer_manifest_export_warnings": list(renderer_manifest_export_warnings),
                 "renderer_manifest_export_error": renderer_manifest_export_error,
+                "i2v_frame_plan": [self._frame_plan_entry_to_dict(entry) for entry in frame_plan],
                 "input_metadata": {
                     "input_type": request.input_type,
                     "orig_size": request.orig_size,
