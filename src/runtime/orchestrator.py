@@ -215,6 +215,9 @@ class GennadyEngine:
             "is_generated": True,
             "frame_source": "runtime_generated_stable_frame",
             "update_source": update_source,
+            "source_frame_kind": "generated_runtime_frame",
+            "source_is_input_frame": False,
+            "immutable_i2v_anchor": False,
         }
         if delta.affected_regions:
             primary_region = delta.affected_regions[0]
@@ -318,7 +321,11 @@ class GennadyEngine:
         material_present = _as_bool(_get_value("reference_patch_material_present", False))
         material_trusted = _as_bool(_get_value("reference_patch_material_trusted", False))
         material_reason = str(_get_value("reference_patch_material_missing_reason", "") or "")
+        material_from_input = _as_bool(_get_value("reference_material_from_input_frame", False))
+        material_from_generated = _as_bool(_get_value("reference_material_from_generated_frame", False))
         usage["expected_material_used"] = expected_family != "unknown" and material_used
+        usage["expected_input_frame_material_used"] = expected_family != "unknown" and material_used and material_from_input
+        usage["reference_material_from_generated_frame"] = material_from_generated
         usage["reference_patch_material_present"] = material_present
         usage["reference_patch_material_trusted"] = material_trusted
         usage["reference_patch_material_missing_reason"] = material_reason
@@ -336,6 +343,10 @@ class GennadyEngine:
         strong_counts = {family: 0 for family in families}
         medium_counts = {family: 0 for family in families}
         material_used_counts = {family: 0 for family in families}
+        input_frame_material_used_counts = {family: 0 for family in families}
+        generated_material_rejected_counts = {family: 0 for family in families}
+        non_input_material_rejected_counts = {family: 0 for family in families}
+        missing_i2v_anchor_counts = {family: 0 for family in families}
         material_missing_counts = {family: 0 for family in families}
         material_missing_reasons: dict[str, dict[str, int]] = {family: {} for family in families}
         critical_warnings: list[str] = []
@@ -372,11 +383,21 @@ class GennadyEngine:
                     critical_warnings.append(f"{warning_prefix[family]}_without_{family}_reference:{usage.get('region_id', '')}")
                 if usage.get("expected_material_used"):
                     material_used_counts[family] += 1
+                if usage.get("expected_input_frame_material_used"):
+                    input_frame_material_used_counts[family] += 1
                 elif usage.get("expected_material_missing"):
                     material_missing_counts[family] += 1
                     reason = str(usage.get("reference_patch_material_missing_reason", "material_missing") or "material_missing")
                     material_missing_reasons[family][reason] = material_missing_reasons[family].get(reason, 0) + 1
                     critical_warnings.append(f"{warning_prefix[family]}_without_visual_material:{usage.get('region_id', '')}:{reason}")
+                    critical_warnings.append(f"{warning_prefix[family]}_without_input_frame_material:{usage.get('region_id', '')}:{reason}")
+                    if reason == "generated_runtime_material_rejected":
+                        generated_material_rejected_counts[family] += 1
+                        critical_warnings.append(f"generated_material_rejected_for_reference:{usage.get('region_id', '')}:{reason}")
+                    if reason == "non_input_frame_material_rejected":
+                        non_input_material_rejected_counts[family] += 1
+                    if reason == "missing_i2v_anchor":
+                        missing_i2v_anchor_counts[family] += 1
                 strength = float(usage.get("expected_reference_strength", 0.0) or 0.0)
                 if usage.get("expected_reference_used") and strength >= 0.9:
                     strong_counts[family] += 1
@@ -392,6 +413,10 @@ class GennadyEngine:
             "strong_counts": strong_counts,
             "medium_counts": medium_counts,
             "material_used_counts": material_used_counts,
+            "input_frame_material_used_counts": input_frame_material_used_counts,
+            "generated_material_rejected_counts": generated_material_rejected_counts,
+            "non_input_material_rejected_counts": non_input_material_rejected_counts,
+            "missing_i2v_anchor_counts": missing_i2v_anchor_counts,
             "material_missing_counts": material_missing_counts,
             "material_missing_reasons": material_missing_reasons,
             "memory_bundle_present_count": memory_bundle_present_count,
@@ -411,6 +436,10 @@ class GennadyEngine:
         strong_counts = {family: 0 for family in families}
         medium_counts = {family: 0 for family in families}
         material_used_counts = {family: 0 for family in families}
+        input_frame_material_used_counts = {family: 0 for family in families}
+        generated_material_rejected_counts = {family: 0 for family in families}
+        non_input_material_rejected_counts = {family: 0 for family in families}
+        missing_i2v_anchor_counts = {family: 0 for family in families}
         material_missing_counts = {family: 0 for family in families}
         material_missing_reasons: dict[str, dict[str, int]] = {family: {} for family in families}
         total_patch_count = 0
@@ -443,6 +472,10 @@ class GennadyEngine:
             _add_counts(strong_counts, coverage.get("strong_counts", {}))
             _add_counts(medium_counts, coverage.get("medium_counts", {}))
             _add_counts(material_used_counts, coverage.get("material_used_counts", {}))
+            _add_counts(input_frame_material_used_counts, coverage.get("input_frame_material_used_counts", {}))
+            _add_counts(generated_material_rejected_counts, coverage.get("generated_material_rejected_counts", {}))
+            _add_counts(non_input_material_rejected_counts, coverage.get("non_input_material_rejected_counts", {}))
+            _add_counts(missing_i2v_anchor_counts, coverage.get("missing_i2v_anchor_counts", {}))
             _add_counts(material_missing_counts, coverage.get("material_missing_counts", {}))
             _add_nested_counts(material_missing_reasons, coverage.get("material_missing_reasons", {}))
             memory_bundle_present_count += int(coverage.get("memory_bundle_present_count", 0) or 0)
@@ -456,10 +489,13 @@ class GennadyEngine:
 
         def _material_ratio(family: str) -> float:
             return material_used_counts[family] / max(1, expected_family_counts[family])
+        def _input_ratio(family: str) -> float:
+            return input_frame_material_used_counts[family] / max(1, expected_family_counts[family])
 
         total_expected_known = sum(expected_family_counts[family] for family in families)
         total_used_known = sum(used_counts.values())
         total_material_used_known = sum(material_used_counts.values())
+        total_input_material_used_known = sum(input_frame_material_used_counts.values())
         return {
             "total_patch_count": total_patch_count,
             "expected_family_counts": expected_family_counts,
@@ -469,6 +505,10 @@ class GennadyEngine:
             "strong_counts": strong_counts,
             "medium_counts": medium_counts,
             "material_used_counts": material_used_counts,
+            "input_frame_material_used_counts": input_frame_material_used_counts,
+            "generated_material_rejected_counts": generated_material_rejected_counts,
+            "non_input_material_rejected_counts": non_input_material_rejected_counts,
+            "missing_i2v_anchor_counts": missing_i2v_anchor_counts,
             "material_missing_counts": material_missing_counts,
             "material_missing_reasons": material_missing_reasons,
             "memory_bundle_present_count": memory_bundle_present_count,
@@ -483,8 +523,13 @@ class GennadyEngine:
             "body_shape_material_coverage_ratio": _material_ratio("body_shape"),
             "garment_material_coverage_ratio": _material_ratio("garment"),
             "skin_material_coverage_ratio": _material_ratio("skin"),
+            "identity_input_frame_material_coverage_ratio": _input_ratio("identity"),
+            "body_shape_input_frame_material_coverage_ratio": _input_ratio("body_shape"),
+            "garment_input_frame_material_coverage_ratio": _input_ratio("garment"),
+            "skin_input_frame_material_coverage_ratio": _input_ratio("skin"),
             "overall_expected_reference_coverage_ratio": total_used_known / max(1, total_expected_known),
             "overall_expected_material_coverage_ratio": total_material_used_known / max(1, total_expected_known),
+            "overall_input_frame_material_coverage_ratio": total_input_material_used_known / max(1, total_expected_known),
         }
 
     def run(
@@ -516,6 +561,18 @@ class GennadyEngine:
         scene_graph.global_context.source_type = request.input_type
 
         memory = self.memory_manager.initialize_from_scene(scene_graph)
+        memory = self.memory_manager.update_from_frame(
+            memory,
+            current_frame,
+            scene_graph,
+            transition_context={
+                "frame_source": "observed_input_frame",
+                "generated": False,
+                "source_frame_kind": "observed_input_frame",
+                "source_is_input_frame": True,
+                "immutable_i2v_anchor": True,
+            },
+        )
         graph_encoding = self.backends.graph_encoder.encode(scene_graph)
         fallback_log: list[str] = []
         renderer_manifest_records: list[dict[str, object]] = []

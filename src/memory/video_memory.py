@@ -449,6 +449,9 @@ class MemoryManager:
             context.get("generated"),
             context.get("is_generated"),
         )
+        source_frame_kind = str(context.get("source_frame_kind", "generated_runtime_frame" if frame_generated else "observed_input_frame"))
+        source_is_input_frame = bool(context.get("source_is_input_frame", not frame_generated))
+        immutable_i2v_anchor = bool(context.get("immutable_i2v_anchor", (not frame_generated and scene_graph.frame_index == 0)))
         for person in scene_graph.persons:
             for region_type in self._semantic_region_types(person):
                 region_ref = self.roi.resolve_region(scene_graph, person.person_id, region_type)
@@ -480,6 +483,9 @@ class MemoryManager:
                     generated=frame_generated,
                     inferred=frame_generated,
                     provenance="runtime_generated_frame" if frame_generated else "observed_input_frame",
+                    source_frame_kind=source_frame_kind,
+                    immutable_i2v_anchor=immutable_i2v_anchor,
+                    source_is_input_frame=source_is_input_frame,
                 )
                 memory.patch_cache[patch_id] = patch
 
@@ -1026,6 +1032,10 @@ class MemoryManager:
             material_source=material_source,
             material_trusted=bool(material_trusted),
             material_missing_reason=reason,
+            source_frame_kind="unknown",
+            source_frame_index=int(payload.source_frame),
+            immutable_i2v_anchor=False,
+            source_is_input_frame=False,
         )
 
     def _texture_patch_is_trusted_observed_material(self, patch: TexturePatchMemory) -> dict[str, object]:
@@ -1033,10 +1043,21 @@ class MemoryManager:
         generated = bool(getattr(patch, "generated", False))
         inferred = bool(getattr(patch, "inferred", False))
         observed_directly = bool(getattr(patch, "observed_directly", True))
-        if generated or inferred or not observed_directly:
-            return {"trusted": False, "reason": "patch_generated", "provenance": provenance}
+        source_frame_kind = str(getattr(patch, "source_frame_kind", "unknown") or "unknown")
+        source_is_input_frame = bool(getattr(patch, "source_is_input_frame", False))
+        immutable_i2v_anchor = bool(getattr(patch, "immutable_i2v_anchor", False))
+        if source_frame_kind == "generated_runtime_frame":
+            return {"trusted": False, "reason": "generated_runtime_material_rejected", "provenance": provenance}
+        if generated or inferred:
+            return {"trusted": False, "reason": "generated_runtime_material_rejected", "provenance": provenance}
         if provenance in {"runtime_generated_frame", "generated", "synthetic", "self_generated_runtime_target"}:
-            return {"trusted": False, "reason": "patch_generated", "provenance": provenance}
+            return {"trusted": False, "reason": "generated_runtime_material_rejected", "provenance": provenance}
+        if not source_is_input_frame:
+            return {"trusted": False, "reason": "non_input_frame_material_rejected", "provenance": provenance}
+        if not immutable_i2v_anchor or source_frame_kind != "observed_input_frame":
+            return {"trusted": False, "reason": "missing_i2v_anchor", "provenance": provenance}
+        if not observed_directly:
+            return {"trusted": False, "reason": "generated_or_unobserved_material_rejected", "provenance": provenance}
         if provenance == "unknown":
             return {"trusted": True, "reason": "patch_provenance_unknown", "provenance": provenance}
         return {"trusted": True, "reason": "", "provenance": provenance}
@@ -1078,7 +1099,7 @@ class MemoryManager:
             return self._material_from_payload(payload, reason="region_mismatch")
         patch_trust = self._texture_patch_is_trusted_observed_material(patch)
         if not bool(patch_trust.get("trusted", False)):
-            return self._material_from_payload(payload, reason=str(patch_trust.get("reason", "patch_generated") or "patch_generated"))
+            return self._material_from_payload(payload, reason=str(patch_trust.get("reason", "generated_or_unobserved_material_rejected") or "generated_or_unobserved_material_rejected"))
 
         source = "texture_patch.rgb_patch"
         raw_patch = getattr(patch, "rgb_patch", None)
@@ -1105,6 +1126,10 @@ class MemoryManager:
         material.source_patch_ref = payload.patch_ref or patch.patch_ref
         material.confidence = min(float(payload.confidence), float(patch.confidence))
         material.evidence_score = min(float(payload.evidence_score), float(patch.evidence_score)) if patch.evidence_score > 0 else float(payload.evidence_score)
+        material.source_frame_kind = str(getattr(patch, "source_frame_kind", "unknown") or "unknown")
+        material.source_frame_index = int(getattr(patch, "source_frame", payload.source_frame))
+        material.immutable_i2v_anchor = bool(getattr(patch, "immutable_i2v_anchor", False))
+        material.source_is_input_frame = bool(getattr(patch, "source_is_input_frame", False))
         return material
 
     def debug_canonical_memory(self, memory: VideoMemory, entity_id: str | None = None) -> dict[str, object]:
