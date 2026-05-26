@@ -1094,10 +1094,17 @@ def validate_reference_material_for_request(request: PatchSynthesisRequest, mate
             payload_value = expected_payload.get(payload_key)
             if payload_value is not None and str(material_dict.get(material_key, "")) != str(payload_value):
                 return {"valid": False, "reason": "payload_material_mismatch", "shape": shape_value}
-    if bool(material_dict.get("generated", False)) or bool(material_dict.get("inferred", False)):
-        return {"valid": False, "reason": "generated_or_inferred", "shape": shape_value}
+    source_frame_kind = str(material_dict.get("source_frame_kind", "unknown") or "unknown")
+    source_is_input_frame = bool(material_dict.get("source_is_input_frame", False))
+    immutable_i2v_anchor = bool(material_dict.get("immutable_i2v_anchor", False))
+    if bool(material_dict.get("generated", False)) or bool(material_dict.get("inferred", False)) or source_frame_kind == "generated_runtime_frame":
+        return {"valid": False, "reason": "generated_runtime_material_rejected", "shape": shape_value}
+    if not source_is_input_frame:
+        return {"valid": False, "reason": "non_input_frame_material_rejected", "shape": shape_value}
+    if (not immutable_i2v_anchor) or source_frame_kind != "observed_input_frame":
+        return {"valid": False, "reason": "missing_i2v_anchor", "shape": shape_value}
     if not bool(material_dict.get("observed_directly", False)):
-        return {"valid": False, "reason": "not_observed_directly", "shape": shape_value}
+        return {"valid": False, "reason": "generated_or_unobserved_material_rejected", "shape": shape_value}
     min_confidence, min_evidence = (0.65, 0.70) if material_kind == "identity_reference" else (0.58, 0.58)
     if _safe_float(material_dict.get("confidence")) < min_confidence:
         return {"valid": False, "reason": "low_confidence", "shape": shape_value}
@@ -1151,6 +1158,12 @@ def summarize_reference_material_trace(transition_context: dict[str, object] | N
             missing_reason = "expected_reference_payload_missing" if payload_reason == "missing" else payload_reason
         else:
             missing_reason = "material_untrusted"
+    source_frame_kind = str(material_dict.get("source_frame_kind", "unknown")) if material_dict else "unknown"
+    source_is_input_frame = bool(material_dict.get("source_is_input_frame", False)) if material_dict else False
+    immutable_i2v_anchor = bool(material_dict.get("immutable_i2v_anchor", False)) if material_dict else False
+    source_frame_index = int(material_dict.get("source_frame_index", 0) or 0) if material_dict else 0
+    from_generated = bool(material_dict is not None and (source_frame_kind == "generated_runtime_frame" or (not source_is_input_frame) or bool(material_dict.get("generated", False)) or bool(material_dict.get("inferred", False))))
+    from_input = bool(used and source_is_input_frame and immutable_i2v_anchor and source_frame_kind == "observed_input_frame")
     return {
         **payload_trace,
         "reference_patch_material_present": material_dict is not None,
@@ -1164,6 +1177,13 @@ def summarize_reference_material_trace(transition_context: dict[str, object] | N
         "reference_patch_material_confidence": _safe_float(material_dict.get("confidence")) if material_dict else 0.0,
         "reference_patch_material_evidence_score": _safe_float(material_dict.get("evidence_score")) if material_dict else 0.0,
         "reference_patch_material_trace_reasons": list(trace_reasons) if isinstance(trace_reasons, list) else [],
+        "i2v_reference_contract_version": "i2v_first_frame_reference_v1",
+        "reference_material_from_input_frame": from_input,
+        "reference_material_from_generated_frame": from_generated,
+        "reference_patch_material_source_frame_kind": source_frame_kind,
+        "reference_patch_material_source_frame_index": source_frame_index,
+        "reference_patch_material_immutable_i2v_anchor": immutable_i2v_anchor,
+        "reference_patch_material_source_is_input_frame": source_is_input_frame,
     }
 
 
@@ -1979,6 +1999,13 @@ def summarize_patch_batch(batch: PatchBatch) -> dict[str, object]:
         "reference_patch_material_kind": batch.conditioning_summary.get("reference_patch_material_kind", ""),
         "reference_patch_material_confidence": _safe_float(batch.conditioning_summary.get("reference_patch_material_confidence")),
         "reference_patch_material_evidence_score": _safe_float(batch.conditioning_summary.get("reference_patch_material_evidence_score")),
+        "i2v_reference_contract_version": batch.conditioning_summary.get("i2v_reference_contract_version", "i2v_first_frame_reference_v1"),
+        "reference_material_from_input_frame": bool(batch.conditioning_summary.get("reference_material_from_input_frame", False)),
+        "reference_material_from_generated_frame": bool(batch.conditioning_summary.get("reference_material_from_generated_frame", False)),
+        "reference_patch_material_source_frame_kind": batch.conditioning_summary.get("reference_patch_material_source_frame_kind", "unknown"),
+        "reference_patch_material_source_frame_index": int(batch.conditioning_summary.get("reference_patch_material_source_frame_index", 0) or 0),
+        "reference_patch_material_immutable_i2v_anchor": bool(batch.conditioning_summary.get("reference_patch_material_immutable_i2v_anchor", False)),
+        "reference_patch_material_source_is_input_frame": bool(batch.conditioning_summary.get("reference_patch_material_source_is_input_frame", False)),
         "reference_material_lane_active": bool(batch.conditioning_summary.get("reference_material_lane_active", False)),
         "reference_tensor_input_channels": int(batch.conditioning_summary.get("reference_tensor_input_channels", 0) or 0),
         "local_tensor_input_channels": int(batch.conditioning_summary.get("local_tensor_input_channels", 0) or 0),
@@ -2318,6 +2345,13 @@ def output_from_prediction(
         "expected_reference_payload_present": bool(conditioning_summary.get("expected_reference_payload_present", False)),
         "expected_reference_payload_kind": conditioning_summary.get("expected_reference_payload_kind", ""),
         "expected_reference_payload_patch_id_present": bool(conditioning_summary.get("expected_reference_payload_patch_id_present", False)),
+        "i2v_reference_contract_version": conditioning_summary.get("i2v_reference_contract_version", "i2v_first_frame_reference_v1"),
+        "reference_material_from_input_frame": bool(conditioning_summary.get("reference_material_from_input_frame", False)),
+        "reference_material_from_generated_frame": bool(conditioning_summary.get("reference_material_from_generated_frame", False)),
+        "reference_patch_material_source_frame_kind": conditioning_summary.get("reference_patch_material_source_frame_kind", "unknown"),
+        "reference_patch_material_source_frame_index": int(conditioning_summary.get("reference_patch_material_source_frame_index", 0) or 0),
+        "reference_patch_material_immutable_i2v_anchor": bool(conditioning_summary.get("reference_patch_material_immutable_i2v_anchor", False)),
+        "reference_patch_material_source_is_input_frame": bool(conditioning_summary.get("reference_patch_material_source_is_input_frame", False)),
         "expected_reference_payload_descriptor_present": bool(conditioning_summary.get("expected_reference_payload_descriptor_present", False)),
         "expected_reference_payload_descriptor_keys": list(conditioning_summary.get("expected_reference_payload_descriptor_keys", [])) if isinstance(conditioning_summary.get("expected_reference_payload_descriptor_keys", []), list) else [],
         "reference_payload_trusted": bool(conditioning_summary.get("reference_payload_trusted", False)),

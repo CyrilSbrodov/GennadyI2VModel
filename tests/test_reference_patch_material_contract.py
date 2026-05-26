@@ -4,7 +4,7 @@ from dataclasses import asdict
 
 import numpy as np
 
-from core.schema import BBox, ReferencePatchPayload, RegionRef, SceneGraph, TexturePatchMemory, VideoMemory
+from core.schema import BBox, BodyPartNode, PersonNode, ReferencePatchPayload, RegionRef, SceneGraph, TexturePatchMemory, VideoMemory
 from learned.interfaces import PatchSynthesisRequest
 from memory.video_memory import MemoryManager
 from rendering.trainable_patch_renderer import build_patch_batch, output_from_prediction, summarize_reference_material_trace, validate_reference_material_for_request
@@ -43,6 +43,9 @@ def _patch(patch_id: str = "patch::p1:face:0", region: str = "face", entity: str
         evidence_score=0.9,
         descriptor={"std": [0.1, 0.1, 0.1]},
         rgb_patch=rgb_patch,
+        source_frame_kind="observed_input_frame",
+        immutable_i2v_anchor=True,
+        source_is_input_frame=True,
     )
 
 
@@ -130,7 +133,91 @@ def test_generated_texture_patch_cannot_be_trusted_material() -> None:
 
     assert material is not None
     assert material.material_trusted is False
-    assert material.material_missing_reason == "patch_generated"
+    assert material.material_missing_reason == "generated_runtime_material_rejected"
+
+
+def test_input_frame_patch_becomes_immutable_i2v_anchor() -> None:
+    manager = MemoryManager()
+    scene = SceneGraph(
+        frame_index=0,
+        persons=[
+            PersonNode(
+                person_id="p1",
+                track_id="p1",
+                bbox=BBox(0.1, 0.1, 0.6, 0.6),
+                mask_ref=None,
+                body_parts=[BodyPartNode(part_id="p1:face", part_type="face", visibility="visible", confidence=0.95)],
+                confidence=0.95,
+            )
+        ],
+    )
+    memory = manager.initialize_from_scene(scene)
+    frame = np.full((32, 32, 3), 0.5, dtype=np.float32).tolist()
+    memory = manager.update_from_frame(
+        memory,
+        frame,
+        scene,
+        transition_context={
+            "frame_source": "observed_input_frame",
+            "generated": False,
+            "source_frame_kind": "observed_input_frame",
+            "source_is_input_frame": True,
+            "immutable_i2v_anchor": True,
+        },
+    )
+    created = [p for p in memory.texture_patches.values() if p.entity_id == "p1" and p.region_type == "face"]
+    assert created
+    patch = created[0]
+    assert patch.source_frame_kind == "observed_input_frame"
+    assert patch.source_is_input_frame is True
+    assert patch.immutable_i2v_anchor is True
+    assert patch.observed_directly is True
+    assert patch.generated is False
+    assert patch.inferred is False
+    assert patch.provenance == "observed_input_frame"
+    assert patch.rgb_patch is not None
+
+
+def test_non_input_observed_patch_rejected_for_i2v_reference() -> None:
+    manager = MemoryManager()
+    memory = VideoMemory()
+    memory.texture_patches["patch::p1:face:0"] = _patch(rgb_patch=np.ones((2, 2, 3), dtype=np.float32).tolist())
+    memory.texture_patches["patch::p1:face:0"].source_frame_kind = "observed_external_frame"
+    memory.texture_patches["patch::p1:face:0"].source_is_input_frame = False
+    memory.texture_patches["patch::p1:face:0"].immutable_i2v_anchor = False
+    material = manager.build_reference_patch_material(memory, _payload())
+    assert material is not None
+    assert material.material_trusted is False
+    assert material.material_missing_reason == "non_input_frame_material_rejected"
+
+
+def test_missing_i2v_anchor_rejected_even_if_observed_input_frame() -> None:
+    manager = MemoryManager()
+    memory = VideoMemory()
+    memory.texture_patches["patch::p1:face:0"] = _patch(rgb_patch=np.ones((2, 2, 3), dtype=np.float32).tolist())
+    memory.texture_patches["patch::p1:face:0"].source_frame_kind = "observed_input_frame"
+    memory.texture_patches["patch::p1:face:0"].source_is_input_frame = True
+    memory.texture_patches["patch::p1:face:0"].immutable_i2v_anchor = False
+    material = manager.build_reference_patch_material(memory, _payload())
+    assert material is not None
+    assert material.material_trusted is False
+    assert material.material_missing_reason == "missing_i2v_anchor"
+
+
+def test_observed_input_anchor_flags_but_not_observed_directly_is_generated_or_unobserved_rejected() -> None:
+    manager = MemoryManager()
+    memory = VideoMemory()
+    memory.texture_patches["patch::p1:face:0"] = _patch(rgb_patch=np.ones((2, 2, 3), dtype=np.float32).tolist())
+    memory.texture_patches["patch::p1:face:0"].source_frame_kind = "observed_input_frame"
+    memory.texture_patches["patch::p1:face:0"].source_is_input_frame = True
+    memory.texture_patches["patch::p1:face:0"].immutable_i2v_anchor = True
+    memory.texture_patches["patch::p1:face:0"].generated = False
+    memory.texture_patches["patch::p1:face:0"].inferred = False
+    memory.texture_patches["patch::p1:face:0"].observed_directly = False
+    material = manager.build_reference_patch_material(memory, _payload())
+    assert material is not None
+    assert material.material_trusted is False
+    assert material.material_missing_reason == "generated_or_unobserved_material_rejected"
 
 
 def test_runtime_generated_provenance_rejected_even_if_generated_flag_false() -> None:
@@ -146,7 +233,7 @@ def test_runtime_generated_provenance_rejected_even_if_generated_flag_false() ->
 
     assert material is not None
     assert material.material_trusted is False
-    assert material.material_missing_reason == "patch_generated"
+    assert material.material_missing_reason == "generated_runtime_material_rejected"
 
 
 def test_generated_flag_rejected_even_if_provenance_claims_observed() -> None:
@@ -162,7 +249,7 @@ def test_generated_flag_rejected_even_if_provenance_claims_observed() -> None:
 
     assert material is not None
     assert material.material_trusted is False
-    assert material.material_missing_reason == "patch_generated"
+    assert material.material_missing_reason == "generated_runtime_material_rejected"
 
 
 def test_legacy_unknown_provenance_patch_remains_compatible_when_payload_trusted() -> None:
@@ -202,7 +289,7 @@ def test_observed_patch_preferred_over_newer_generated_patch_for_reference_paylo
     material = manager.build_reference_patch_material(memory, payload)
     assert material is not None
     assert material.material_trusted is False
-    assert material.material_missing_reason == "patch_generated"
+    assert material.material_missing_reason == "generated_runtime_material_rejected"
 
     from core.schema import CanonicalRegionMemoryEntry
     entry = CanonicalRegionMemoryEntry(
@@ -287,6 +374,26 @@ def test_output_trace_and_manifest_include_reference_material_metadata() -> None
     assert record["reference_tensor_input_used"] is True
 
 
+def test_generated_material_trace_fields_are_exported_as_rejected() -> None:
+    manager = MemoryManager()
+    memory = VideoMemory()
+    memory.texture_patches["patch::p1:face:0"] = _patch(rgb_patch=np.ones((2, 2, 3), dtype=np.float32).tolist())
+    memory.texture_patches["patch::p1:face:0"].source_frame_kind = "generated_runtime_frame"
+    memory.texture_patches["patch::p1:face:0"].source_is_input_frame = False
+    memory.texture_patches["patch::p1:face:0"].immutable_i2v_anchor = False
+    memory.texture_patches["patch::p1:face:0"].generated = True
+    payload = _payload()
+    material = asdict(manager.build_reference_patch_material(memory, payload))
+    request = _request({"expected_reference_payload": asdict(payload), "reference_patch_payloads": [asdict(payload)], "expected_reference_patch_material": material})
+    batch = build_patch_batch(request, np.zeros((3, 3, 3), dtype=np.float32))
+    pred = {"rgb": batch.roi_after, "alpha": batch.alpha_target[..., 0], "uncertainty": batch.uncertainty_target[..., 0], "confidence": 0.9}
+    output = output_from_prediction(request, pred, "learned_primary", {}, batch)
+    assert output.execution_trace["reference_patch_material_used"] is False
+    assert output.execution_trace["reference_material_from_generated_frame"] is True
+    assert output.execution_trace["reference_material_from_input_frame"] is False
+    assert output.execution_trace["reference_patch_material_missing_reason"] == "generated_runtime_material_rejected"
+
+
 def test_renderer_defensive_validation_rejects_forged_material() -> None:
     material = asdict(MemoryManager().build_reference_patch_material(
         VideoMemory(texture_patches={"patch::p1:face:0": _patch(rgb_patch=np.ones((2, 2, 3), dtype=np.float32).tolist())}),
@@ -302,7 +409,7 @@ def test_renderer_defensive_validation_rejects_forged_material() -> None:
     assert validate_reference_material_for_request(request, wrong_kind)["reason"] == "kind_mismatch"
 
     generated = dict(material, generated=True, material_trusted=True)
-    assert validate_reference_material_for_request(request, generated)["reason"] == "generated_or_inferred"
+    assert validate_reference_material_for_request(request, generated)["reason"] == "generated_runtime_material_rejected"
 
     invalid_rgb = dict(material, rgb_patch=[[1.0, 0.0, 0.0]], material_trusted=True)
     assert validate_reference_material_for_request(request, invalid_rgb)["reason"] == "invalid_rgb_shape"
@@ -322,7 +429,7 @@ def test_untrusted_runtime_material_object_remains_in_context_for_renderer_rejec
     assert request.transition_context["expected_reference_patch_material"]["material_trusted"] is False
     assert request.transition_context["reference_patch_material_trace_reasons"] == ["generated_or_inferred"]
     assert batch.conditioning_summary["reference_patch_material_used"] is False
-    assert batch.conditioning_summary["reference_patch_material_missing_reason"] == "generated_or_inferred"
+    assert batch.conditioning_summary["reference_patch_material_missing_reason"] == "generated_runtime_material_rejected"
 
 
 def test_manifest_loader_and_training_adapter_restore_reference_tensors() -> None:
@@ -403,7 +510,7 @@ def test_renderer_zero_fallback_when_only_generated_material_exists() -> None:
     assert batch.conditioning_summary["reference_patch_material_used"] is False
     assert batch.conditioning_summary["reference_patch_material_trusted"] is False
     assert batch.conditioning_summary["reference_tensor_zero_fallback"] is True
-    assert batch.conditioning_summary["reference_patch_material_missing_reason"] == "patch_generated"
+    assert batch.conditioning_summary["reference_patch_material_missing_reason"] == "generated_runtime_material_rejected"
     assert np.allclose(batch.reference_validity, 0.0)
 
 
@@ -417,12 +524,33 @@ def test_generated_material_rejection_appears_in_runtime_coverage_warnings() -> 
                 "reference_patch_material_present": True,
                 "reference_patch_material_trusted": False,
                 "reference_patch_material_used": False,
-                "reference_patch_material_missing_reason": "patch_generated",
+                "reference_patch_material_missing_reason": "generated_runtime_material_rejected",
             },
         }
     ])
-    assert coverage["material_missing_reasons"]["identity"]["patch_generated"] == 1
-    assert any("patch_generated" in warning for warning in coverage["critical_warnings"])
+    assert coverage["material_missing_reasons"]["identity"]["generated_runtime_material_rejected"] == 1
+    assert any("generated_runtime_material_rejected" in warning for warning in coverage["critical_warnings"])
+
+
+def test_reference_coverage_separates_reference_payload_from_input_frame_material() -> None:
+    coverage = GennadyEngine._summarize_step_reference_coverage([
+        {
+            "region_id": "p1:face",
+            "execution_trace": {
+                "identity_reference_used": True,
+                "identity_reference_strength": 0.95,
+                "reference_patch_material_used": False,
+                "reference_material_from_input_frame": False,
+                "reference_material_from_generated_frame": True,
+                "reference_patch_material_missing_reason": "generated_runtime_material_rejected",
+            },
+        }
+    ])
+    agg = GennadyEngine._aggregate_reference_coverage([coverage])
+    assert agg["identity_reference_coverage_ratio"] == 1.0
+    assert agg["identity_input_frame_material_coverage_ratio"] == 0.0
+    assert agg["generated_material_rejected_counts"]["identity"] == 1
+    assert any("generated_material_rejected_for_reference" in warning for warning in agg["top_critical_warnings"])
 
 
 def test_black_reference_material_counts_as_tensor_input_used() -> None:
@@ -562,6 +690,8 @@ def test_manifest_compacts_transition_summary_but_loader_restores_full_material(
     compact = record["transition_context_summary"]["expected_reference_patch_material"]
     assert "rgb_patch" not in compact
     assert compact["rgb_patch_shape"] == [2, 2, 3]
+    assert compact["reference_material_from_input_frame"] is True
+    assert compact["reference_material_from_generated_frame"] is False
     assert loaded_request.transition_context["expected_reference_patch_material"]["rgb_patch"] == material["rgb_patch"]
 
 

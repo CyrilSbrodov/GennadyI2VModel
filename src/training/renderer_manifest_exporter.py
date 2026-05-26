@@ -353,6 +353,13 @@ def _execution_trace_summary(
         "reference_patch_material_shape",
         "reference_patch_material_missing_reason",
         "reference_patch_material_used",
+        "i2v_reference_contract_version",
+        "reference_material_from_input_frame",
+        "reference_material_from_generated_frame",
+        "reference_patch_material_source_frame_kind",
+        "reference_patch_material_source_frame_index",
+        "reference_patch_material_immutable_i2v_anchor",
+        "reference_patch_material_source_is_input_frame",
         "reference_tensor_input_used",
         "reference_tensor_zero_fallback",
         "reference_tensor_input_channels",
@@ -445,6 +452,13 @@ def _renderer_batch_contract(
         "reference_patch_material_used",
         "reference_patch_material_shape",
         "reference_patch_material_missing_reason",
+        "i2v_reference_contract_version",
+        "reference_material_from_input_frame",
+        "reference_material_from_generated_frame",
+        "reference_patch_material_source_frame_kind",
+        "reference_patch_material_source_frame_index",
+        "reference_patch_material_immutable_i2v_anchor",
+        "reference_patch_material_source_is_input_frame",
         "reference_tensor_input_used",
         "reference_tensor_zero_fallback",
         "reference_tensor_input_channels",
@@ -473,6 +487,13 @@ def _renderer_batch_contract(
 def _compact_reference_material_summary(material: object) -> dict[str, object] | None:
     if not isinstance(material, dict):
         return None
+    source_frame_kind = str(material.get("source_frame_kind", "unknown") or "unknown")
+    source_is_input_frame = bool(material.get("source_is_input_frame", False))
+    immutable_i2v_anchor = bool(material.get("immutable_i2v_anchor", False))
+    generated = bool(material.get("generated", False))
+    inferred = bool(material.get("inferred", False))
+    from_input = bool(source_is_input_frame and immutable_i2v_anchor and source_frame_kind == "observed_input_frame")
+    from_generated = bool(source_frame_kind == "generated_runtime_frame" or generated or inferred or not source_is_input_frame)
     descriptor = material.get("descriptor")
     return {
         "reference_kind": str(material.get("reference_kind", "")),
@@ -483,6 +504,13 @@ def _compact_reference_material_summary(material: object) -> dict[str, object] |
         "material_source": str(material.get("material_source", "unknown")),
         "material_trusted": bool(material.get("material_trusted", False)),
         "material_missing_reason": str(material.get("material_missing_reason", "")),
+        "i2v_reference_contract_version": str(material.get("i2v_reference_contract_version", "i2v_first_frame_reference_v1")),
+        "reference_material_from_input_frame": from_input,
+        "reference_material_from_generated_frame": from_generated,
+        "source_frame_kind": source_frame_kind,
+        "source_frame_index": int(material.get("source_frame_index", 0) or 0),
+        "immutable_i2v_anchor": immutable_i2v_anchor,
+        "source_is_input_frame": source_is_input_frame,
         "rgb_patch_shape": _shape_of(material.get("rgb_patch")),
         "descriptor_keys": sorted(str(k) for k in descriptor.keys()) if isinstance(descriptor, dict) else [],
     }

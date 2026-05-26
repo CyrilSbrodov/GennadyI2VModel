@@ -329,6 +329,9 @@ class TexturePatchMemory:
     generated: bool = False
     inferred: bool = False
     provenance: str = "unknown"
+    source_frame_kind: str = "unknown"
+    immutable_i2v_anchor: bool = False
+    source_is_input_frame: bool = False
 
 
 @dataclass(slots=True)
@@ -427,6 +430,10 @@ class ReferencePatchMaterial:
     material_source: str = "unknown"
     material_trusted: bool = False
     material_missing_reason: str = ""
+    source_frame_kind: str = "unknown"
+    source_frame_index: int = 0
+    immutable_i2v_anchor: bool = False
+    source_is_input_frame: bool = False
 
 
 @dataclass(slots=True)
