@@ -1,0 +1,31 @@
+{
+  "contract_version": "renderer_observed_pair_manifest_input_v1",
+  "pairs": [
+    {
+      "record_id": "example_face_0001",
+      "source_frame": "examples/assets/source_0001.png",
+      "target_frame": "examples/assets/target_0001.png",
+      "prompt": "person smiles slightly",
+      "transition_context": {
+        "summary": "observed paired-frame expression transition",
+        "family": "expression_transition"
+      },
+      "tags": ["face", "expression", "observed_pair"],
+      "regions": [
+        {
+          "region_id": "person_1:face",
+          "bbox": [0.25, 0.20, 0.30, 0.25],
+          "reason": "manual_or_parser_region"
+        }
+      ],
+      "region_metadata": {
+        "person_1:face": {
+          "roi_source": "manual_or_parser_region",
+          "source_node_type": "body_part",
+          "metadata_completeness_score": 0.9,
+          "evidence_strength_score": 0.8
+        }
+      }
+    }
+  ]
+}
