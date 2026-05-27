@@ -5,7 +5,10 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from core.schema import BBox, PersonNode, SceneGraph
+from core.schema import BBox, PersonNode, RegionRef, SceneGraph
+import numpy as np
+from learned.interfaces import PatchSynthesisRequest
+from rendering.trainable_patch_renderer import build_patch_batch, output_from_prediction
 from runtime.i2v_frame_planner import I2VFramePlanEntry, plan_i2v_frames
 from runtime.orchestrator import GennadyEngine
 
@@ -118,3 +121,99 @@ def test_resolve_planned_region_uses_deterministic_fallback_when_selector_method
     resolved = GennadyEngine._resolve_planned_region(scene, _FakeROISelector(), "p1:face")
     assert resolved is not None
     assert resolved.region_id == "p1:face"
+
+
+def _i2v_request(region_id: str, phase: str) -> PatchSynthesisRequest:
+    return PatchSynthesisRequest(
+        region=RegionRef(region_id=region_id, bbox=BBox(0.1, 0.1, 0.4, 0.4), reason="i2v"),
+        scene_state=SceneGraph(frame_index=0, persons=[PersonNode(person_id="p1", track_id="p1", bbox=BBox(0.1, 0.1, 0.6, 0.8), mask_ref=None)]),
+        memory_summary={},
+        transition_context={"i2v_action_phase": phase, "i2v_region_transition_mode": {region_id: phase}},
+        retrieval_summary={},
+        current_frame=np.full((16, 16, 3), 0.3, dtype=np.float32).tolist(),
+    )
+
+
+def test_i2v_head_turn_face_batch_exposes_phase_and_nonzero_masks() -> None:
+    req = _i2v_request("p1:face", "head_turn")
+    batch = build_patch_batch(req, np.full((16, 16, 3), 0.3, dtype=np.float32))
+    assert batch.conditioning_summary["i2v_action_phase"] == "head_turn"
+    assert float(np.mean(batch.changed_mask)) > 0.0
+    assert float(np.mean(batch.blend_hint)) > 0.0
+
+
+def test_i2v_build_patch_batch_request_has_no_name_error() -> None:
+    reqs = (
+        _i2v_request("p1:face", "head_turn"),
+        _i2v_request("p1:left_arm", "arm_raise"),
+        _i2v_request("p1:face", "arm_raise"),
+    )
+    for req in reqs:
+        batch = build_patch_batch(req, np.full((16, 16, 3), 0.3, dtype=np.float32))
+        assert batch is not None
+
+
+def test_i2v_expression_smile_changes_face_target() -> None:
+    req = _i2v_request("p1:face", "expression_smile")
+    before = np.full((16, 16, 3), 0.3, dtype=np.float32)
+    batch = build_patch_batch(req, before)
+    assert not np.allclose(batch.roi_after, before)
+
+
+def test_i2v_arm_raise_stronger_arm_mask_than_idle() -> None:
+    idle = build_patch_batch(_i2v_request("p1:left_arm", "stable_idle"), np.full((16, 16, 3), 0.3, dtype=np.float32))
+    raised = build_patch_batch(_i2v_request("p1:left_arm", "arm_raise"), np.full((16, 16, 3), 0.3, dtype=np.float32))
+    assert float(np.mean(raised.changed_mask)) > float(np.mean(idle.changed_mask))
+
+
+def test_i2v_arm_raise_face_is_not_arm_targeted() -> None:
+    idle = build_patch_batch(_i2v_request("p1:face", "stable_idle"), np.full((16, 16, 3), 0.3, dtype=np.float32))
+    face_arm_raise = build_patch_batch(_i2v_request("p1:face", "arm_raise"), np.full((16, 16, 3), 0.3, dtype=np.float32))
+    assert float(np.mean(face_arm_raise.changed_mask)) <= float(np.mean(idle.changed_mask)) + 0.02
+    idle_delta = float(np.mean(np.abs(idle.roi_after - idle.roi_before)))
+    arm_delta = float(np.mean(np.abs(face_arm_raise.roi_after - face_arm_raise.roi_before)))
+    assert arm_delta <= idle_delta + 0.01
+
+
+def test_i2v_arm_raise_left_arm_stronger_mask_and_delta_than_idle() -> None:
+    idle = build_patch_batch(_i2v_request("p1:left_arm", "stable_idle"), np.full((16, 16, 3), 0.3, dtype=np.float32))
+    raised = build_patch_batch(_i2v_request("p1:left_arm", "arm_raise"), np.full((16, 16, 3), 0.3, dtype=np.float32))
+    idle_delta = float(np.mean(np.abs(idle.roi_after - idle.roi_before)))
+    raised_delta = float(np.mean(np.abs(raised.roi_after - raised.roi_before)))
+    assert float(np.mean(raised.changed_mask)) > float(np.mean(idle.changed_mask))
+    assert raised_delta > idle_delta
+
+
+def test_i2v_edit_strength_boost_only_for_targeted_regions() -> None:
+    arm_idle = build_patch_batch(_i2v_request("p1:left_arm", "stable_idle"), np.full((16, 16, 3), 0.3, dtype=np.float32))
+    arm_raise = build_patch_batch(_i2v_request("p1:left_arm", "arm_raise"), np.full((16, 16, 3), 0.3, dtype=np.float32))
+    face_idle = build_patch_batch(_i2v_request("p1:face", "stable_idle"), np.full((16, 16, 3), 0.3, dtype=np.float32))
+    face_arm_raise = build_patch_batch(_i2v_request("p1:face", "arm_raise"), np.full((16, 16, 3), 0.3, dtype=np.float32))
+    face_head_turn = build_patch_batch(_i2v_request("p1:face", "head_turn"), np.full((16, 16, 3), 0.3, dtype=np.float32))
+
+    assert float(arm_raise.conditioning_summary["edit_strength"]) > float(arm_idle.conditioning_summary["edit_strength"])
+    assert abs(float(face_arm_raise.conditioning_summary["edit_strength"]) - float(face_idle.conditioning_summary["edit_strength"])) <= 0.02
+    assert float(face_head_turn.conditioning_summary["edit_strength"]) > float(face_idle.conditioning_summary["edit_strength"])
+
+
+def test_i2v_garment_phase_traces_output_and_reference_fallback() -> None:
+    req = _i2v_request("p1:upper_clothes", "garment_reveal_or_adjust")
+    batch = build_patch_batch(req, np.full((16, 16, 3), 0.3, dtype=np.float32))
+    pred = {"rgb": batch.roi_after, "alpha": batch.alpha_target[..., 0], "uncertainty": batch.uncertainty_target[..., 0], "confidence": 0.8}
+    out = output_from_prediction(req, pred, "learned_primary", {}, batch)
+    expected_fields = {
+        "i2v_action_phase",
+        "i2v_action_active",
+        "i2v_region_action_mode",
+        "i2v_action_strength",
+        "i2v_motion_direction_x",
+        "i2v_motion_direction_y",
+        "i2v_expression_bias",
+        "i2v_pose_bias",
+        "i2v_garment_bias",
+    }
+    assert out.execution_trace["i2v_action_phase"] == "garment_reveal_or_adjust"
+    assert out.metadata["i2v_action_phase"] == "garment_reveal_or_adjust"
+    assert expected_fields.issubset(set(out.execution_trace.keys()))
+    assert expected_fields.issubset(set(out.metadata.keys()))
+    assert "reference_tensor_zero_fallback" in out.execution_trace
