@@ -59,6 +59,26 @@ REFERENCE_BLOCKED_REASONS = {
     for family in REFERENCE_FAMILIES
 }
 
+ACTION_PHASE_TARGETS: dict[str, set[str]] = {
+    "arm_raise": {"left_arm", "right_arm"},
+    "expression_smile": {"face", "mouth", "cheek"},
+    "head_turn": {"face", "head", "hair"},
+    "torso_shift": {"torso", "upper_clothes", "inner_garment"},
+    "garment_reveal_or_adjust": {"torso", "upper_clothes", "inner_garment", "outer_garment"},
+}
+
+
+def _i2v_action_targets_region(action_phase: str, region_type: str, region_action_mode: str) -> bool:
+    phase = str(action_phase or "").strip().lower()
+    mode = str(region_action_mode or "").strip().lower()
+    if phase in {"", "stable", "stable_idle", "idle"}:
+        return False
+    if mode in {"", "stable", "stable_idle", "idle", "unknown", "none"}:
+        return False
+    if mode != phase:
+        return False
+    return region_type in ACTION_PHASE_TARGETS.get(phase, set())
+
 ROI_FAMILIES = {
     "face_expression": {"face", "head", "mouth", "eyes", "cheek", "neck", "hair"},
     "torso_reveal": {"torso", "inner_garment", "innerwear", "chest", "pelvis"},
@@ -317,6 +337,7 @@ def _build_render_profile(request: PatchSynthesisRequest) -> RenderConditioningP
         base.uncertainty_bias = max(0.03, base.uncertainty_bias - identity_bonus)
 
     bundle_cond = extract_memory_bundle_conditioning(request)
+    i2v_action_cond = extract_i2v_action_conditioning(request)
     identity_bias = _identity_preservation_bias(
         region_type,
         float(bundle_cond.get("identity_reference_strength", 0.0)),
@@ -329,6 +350,14 @@ def _build_render_profile(request: PatchSynthesisRequest) -> RenderConditioningP
         base.memory_dependency = min(1.0, base.memory_dependency + 0.10)
         if transition_mode != "expression_refine":
             base.edit_strength *= 0.90
+    region_action_mode = str(i2v_action_cond.get("i2v_region_action_mode", ""))
+    action_phase = str(i2v_action_cond.get("i2v_action_phase", "stable_idle"))
+    action_targets_region = _i2v_action_targets_region(action_phase, region_type, region_action_mode)
+    if action_targets_region:
+        action_boost = 0.06 * _safe_float(i2v_action_cond.get("i2v_action_strength"), 0.0)
+        base.edit_strength = min(0.98, base.edit_strength + action_boost)
+    if region_type in IDENTITY_SENSITIVE_REGIONS and action_targets_region:
+        base.preservation_strength = max(base.preservation_strength, 0.90)
     return base
 
 
@@ -1635,6 +1664,46 @@ def extract_region_metadata_conditioning(request: PatchSynthesisRequest) -> dict
     return extract_region_metadata_conditioning_from_metadata(metadata)
 
 
+def extract_i2v_action_conditioning(request: PatchSynthesisRequest) -> dict[str, object]:
+    ctx = request.transition_context if isinstance(request.transition_context, dict) else {}
+    _, region_type = parse_region_id(request.region.region_id)
+    action_phase = str(ctx.get("i2v_action_phase", "") or "stable_idle").strip().lower()
+    mode_map = ctx.get("i2v_region_transition_mode", {})
+    region_mode = ""
+    if isinstance(mode_map, dict):
+        region_mode = str(mode_map.get(request.region.region_id) or mode_map.get(region_type) or "").strip().lower()
+    if not region_mode:
+        region_mode = str(ctx.get("region_transition_mode", "") or "stable").strip().lower()
+    active = action_phase not in {"", "stable", "stable_idle", "idle"}
+    strength = 0.20 if not active else 0.58
+    motion_x = 0.0
+    motion_y = 0.0
+    expression = 0.0
+    pose = 0.0
+    garment = 0.0
+    if action_phase == "head_turn":
+        strength, motion_x, pose = 0.72, 0.35, 0.25
+    elif action_phase == "expression_smile":
+        strength, expression = 0.68, 0.8
+    elif action_phase == "torso_shift":
+        strength, motion_x, pose = 0.62, 0.2, 0.7
+    elif action_phase == "arm_raise":
+        strength, motion_y, pose = 0.82, -0.6, 0.92
+    elif action_phase == "garment_reveal_or_adjust":
+        strength, garment, pose = 0.7, 0.88, 0.35
+    return {
+        "i2v_action_phase": action_phase,
+        "i2v_action_active": active,
+        "i2v_region_action_mode": region_mode,
+        "i2v_action_strength": float(np.clip(strength, 0.0, 1.0)),
+        "i2v_motion_direction_x": float(np.clip(motion_x, -1.0, 1.0)),
+        "i2v_motion_direction_y": float(np.clip(motion_y, -1.0, 1.0)),
+        "i2v_expression_bias": float(np.clip(expression, 0.0, 1.0)),
+        "i2v_pose_bias": float(np.clip(pose, 0.0, 1.0)),
+        "i2v_garment_bias": float(np.clip(garment, 0.0, 1.0)),
+    }
+
+
 def apply_region_metadata_conditioning_to_vectors(
     memory_cond: np.ndarray,
     appearance_cond: np.ndarray,
@@ -1898,6 +1967,8 @@ def _bootstrap_roi_after(
     changed_mask: np.ndarray,
     reference_rgb: np.ndarray | None = None,
     reference_validity: np.ndarray | None = None,
+    region_type: str = "",
+    i2v_action_cond: dict[str, object] | None = None,
 ) -> np.ndarray:
     changed = changed_mask[..., 0]
     mean_rgb = appearance_cond[:3]
@@ -1905,7 +1976,27 @@ def _bootstrap_roi_after(
     retrieval_evidence = float(memory_cond[6]) if memory_cond.size > 6 else 0.0
     hidden_evidence = float(memory_cond[9]) if memory_cond.size > 9 else 0.0
 
-    if profile.transition_mode == "garment_surface":
+    i2v_action_cond = i2v_action_cond if isinstance(i2v_action_cond, dict) else {}
+    action_phase = str(i2v_action_cond.get("i2v_action_phase", "stable_idle"))
+    action_strength = _safe_float(i2v_action_cond.get("i2v_action_strength"), 0.2)
+    region_action_mode = str(i2v_action_cond.get("i2v_region_action_mode", "")).strip().lower()
+    action_targeted = _i2v_action_targets_region(action_phase, region_type, region_action_mode)
+    if action_targeted and action_phase == "head_turn":
+        tone = np.array([0.025, 0.018, 0.012], dtype=np.float32) * (0.6 + 0.4 * action_strength)
+        local = 0.72 * geometry["lateral"] + 0.28 * geometry["center"]
+    elif action_targeted and action_phase == "expression_smile":
+        tone = np.array([0.04, 0.022, 0.014], dtype=np.float32) * (0.55 + 0.45 * action_strength)
+        local = 0.88 * geometry["expression_hotspot"] + 0.12 * geometry["lower_band"]
+    elif action_targeted and action_phase == "torso_shift":
+        tone = np.array([0.034, 0.026, 0.01], dtype=np.float32) * (0.5 + 0.5 * action_strength)
+        local = 0.7 * geometry["surface_band"] + 0.3 * geometry["lateral"]
+    elif action_targeted and action_phase == "arm_raise":
+        tone = np.array([0.052, 0.03, 0.016], dtype=np.float32) * (0.55 + 0.45 * action_strength)
+        local = 0.82 * geometry["lateral"] + 0.18 * geometry["upper_band"]
+    elif action_targeted and action_phase == "garment_reveal_or_adjust":
+        tone = np.array([0.055, 0.048, -0.02], dtype=np.float32) * (0.5 + 0.5 * action_strength)
+        local = 0.75 * geometry["vertical_split"] + 0.25 * geometry["surface_band"]
+    elif profile.transition_mode == "garment_surface":
         tone = np.array([0.06, 0.10, -0.02], dtype=np.float32)
         local = geometry["surface_band"]
     elif profile.transition_mode == "garment_reveal":
@@ -1927,7 +2018,8 @@ def _bootstrap_roi_after(
 
     warm_bias = np.asarray(mean_rgb, dtype=np.float32) * 0.10
     after = roi_before.copy()
-    edit_mix = changed * (0.40 + 0.60 * profile.edit_strength) * np.clip(local, 0.0, 1.0)
+    action_boost = 0.25 * action_strength if action_targeted else 0.0
+    edit_mix = changed * (0.35 + 0.55 * profile.edit_strength + action_boost) * np.clip(local, 0.0, 1.0)
     for c in range(3):
         after[..., c] = np.clip(after[..., c] + edit_mix * (tone[c] + warm_bias[c] * 0.15), 0.0, 1.0)
     if isinstance(reference_rgb, np.ndarray) and reference_rgb.shape == roi_before.shape:
@@ -1948,6 +2040,7 @@ def _build_targets(
     region_type: str,
     reference_rgb: np.ndarray | None = None,
     reference_validity: np.ndarray | None = None,
+    i2v_action_cond: dict[str, object] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     h, w, _ = roi_before.shape
     geometry = _geometry_priors(h, w, region_type, profile)
@@ -1958,7 +2051,36 @@ def _build_targets(
         memory_cond,
         geometry,
     )
-    roi_after = _bootstrap_roi_after(roi_before, profile, appearance_cond, memory_cond, geometry, changed_mask, reference_rgb, reference_validity)
+    if isinstance(i2v_action_cond, dict) and bool(i2v_action_cond.get("i2v_action_active", False)):
+        action_phase = str(i2v_action_cond.get("i2v_action_phase", ""))
+        region_action_mode = str(i2v_action_cond.get("i2v_region_action_mode", ""))
+        gain = _safe_float(i2v_action_cond.get("i2v_action_strength"), 0.0)
+        action_targeted = _i2v_action_targets_region(action_phase, region_type, region_action_mode)
+        if action_targeted and action_phase == "arm_raise":
+            changed_mask = np.clip(changed_mask + 0.28 * geometry["upper_band"][..., None] * gain, 0.0, 1.0)
+            blend_hint = np.clip(blend_hint + 0.18 * geometry["lateral"][..., None] * gain, 0.0, 1.0)
+        elif action_targeted and action_phase == "expression_smile":
+            changed_mask = np.clip(changed_mask + 0.22 * geometry["expression_hotspot"][..., None] * gain, 0.0, 1.0)
+            blend_hint = np.clip(blend_hint + 0.15 * geometry["expression_hotspot"][..., None] * gain, 0.0, 1.0)
+        elif action_targeted and action_phase == "head_turn":
+            changed_mask = np.clip(changed_mask + 0.16 * geometry["lateral"][..., None] * gain, 0.0, 1.0)
+        elif action_targeted and action_phase == "torso_shift":
+            changed_mask = np.clip(changed_mask + 0.14 * geometry["surface_band"][..., None] * gain, 0.0, 1.0)
+        elif action_targeted and action_phase == "garment_reveal_or_adjust":
+            changed_mask = np.clip(changed_mask + 0.2 * geometry["vertical_split"][..., None] * gain, 0.0, 1.0)
+            blend_hint = np.clip(blend_hint + 0.2 * geometry["surface_band"][..., None] * gain, 0.0, 1.0)
+    roi_after = _bootstrap_roi_after(
+        roi_before,
+        profile,
+        appearance_cond,
+        memory_cond,
+        geometry,
+        changed_mask,
+        reference_rgb,
+        reference_validity,
+        region_type=region_type,
+        i2v_action_cond=i2v_action_cond,
+    )
     return roi_after, changed_mask, blend_hint, alpha_target, uncertainty_target, preservation_mask, seam_prior
 
 
@@ -2052,6 +2174,15 @@ def summarize_patch_batch(batch: PatchBatch) -> dict[str, object]:
         "roi_source": batch.conditioning_summary.get("roi_source", "unknown"),
         "source_node_type": batch.conditioning_summary.get("source_node_type", "unknown"),
         "mask_kind": batch.conditioning_summary.get("mask_kind", ""),
+        "i2v_action_phase": batch.conditioning_summary.get("i2v_action_phase", "stable_idle"),
+        "i2v_action_active": bool(batch.conditioning_summary.get("i2v_action_active", False)),
+        "i2v_region_action_mode": batch.conditioning_summary.get("i2v_region_action_mode", ""),
+        "i2v_action_strength": _safe_float(batch.conditioning_summary.get("i2v_action_strength")),
+        "i2v_motion_direction_x": _safe_float(batch.conditioning_summary.get("i2v_motion_direction_x")),
+        "i2v_motion_direction_y": _safe_float(batch.conditioning_summary.get("i2v_motion_direction_y")),
+        "i2v_expression_bias": _safe_float(batch.conditioning_summary.get("i2v_expression_bias")),
+        "i2v_pose_bias": _safe_float(batch.conditioning_summary.get("i2v_pose_bias")),
+        "i2v_garment_bias": _safe_float(batch.conditioning_summary.get("i2v_garment_bias")),
     }
 
 
@@ -2087,6 +2218,7 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
     delta_cond, planner_cond = _delta_features(request, profile)
     graph_cond = _graph_features(request)
     bundle_cond = extract_memory_bundle_conditioning(request)
+    i2v_action_cond = extract_i2v_action_conditioning(request)
     memory_cond, appearance_cond = _memory_and_appearance_features(request, roi_before, profile)
     material_cond = extract_reference_material_conditioning(request.transition_context if isinstance(request.transition_context, dict) else {}, request=request)
     reference_rgb, reference_mask, reference_validity = _reference_material_tensors(request, roi_before, material_cond)
@@ -2111,6 +2243,7 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
         region_type,
         reference_rgb,
         reference_validity,
+        i2v_action_cond=i2v_action_cond,
     )
     if bundle_cond["memory_bundle_low_evidence_newly_revealed"]:
         uncertainty_target = np.clip(uncertainty_target + 0.08 * changed_mask, 0.0, 1.0).astype(np.float32)
@@ -2209,6 +2342,8 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
         "roi_source": metadata_cond["roi_source"],
         "source_node_type": metadata_cond["source_node_type"],
         "mask_kind": metadata_cond["mask_kind"],
+        **i2v_action_cond,
+        "i2v_region_id": request.region.region_id,
     }
     return PatchBatch(
         roi_before=roi_before,
@@ -2375,6 +2510,15 @@ def output_from_prediction(
         "reference_tensor_zero_fallback": bool(conditioning_summary.get("reference_tensor_zero_fallback", True)),
         "memory_bundle_present": bool(conditioning_summary.get("memory_bundle_present", memory_bundle_trace.get("memory_bundle_present", False))),
         "memory_support_level": conditioning_summary.get("memory_support_level", memory_bundle_trace.get("memory_support_level", "none")),
+        "i2v_action_phase": conditioning_summary.get("i2v_action_phase", "stable_idle"),
+        "i2v_action_active": bool(conditioning_summary.get("i2v_action_active", False)),
+        "i2v_region_action_mode": conditioning_summary.get("i2v_region_action_mode", ""),
+        "i2v_action_strength": _safe_float(conditioning_summary.get("i2v_action_strength")),
+        "i2v_motion_direction_x": _safe_float(conditioning_summary.get("i2v_motion_direction_x")),
+        "i2v_motion_direction_y": _safe_float(conditioning_summary.get("i2v_motion_direction_y")),
+        "i2v_expression_bias": _safe_float(conditioning_summary.get("i2v_expression_bias")),
+        "i2v_pose_bias": _safe_float(conditioning_summary.get("i2v_pose_bias")),
+        "i2v_garment_bias": _safe_float(conditioning_summary.get("i2v_garment_bias")),
         "alpha_semantics": "blend_probability_for_true_changed_region_with_seam_support",
         "uncertainty_semantics": "local_synthesis_ambiguity_map_for_compositor_and_confidence",
         "confidence_semantics": "patch_reliability_summary_after_preservation_and_ambiguity_checks",
@@ -2444,6 +2588,15 @@ def output_from_prediction(
             "accessory_reference_blocked": bool(conditioning_summary.get("accessory_reference_blocked", False)),
             "memory_bundle_present": bool(conditioning_summary.get("memory_bundle_present", memory_bundle_trace.get("memory_bundle_present", False))),
             "memory_support_level": conditioning_summary.get("memory_support_level", memory_bundle_trace.get("memory_support_level", "none")),
+            "i2v_action_phase": conditioning_summary.get("i2v_action_phase", "stable_idle"),
+            "i2v_action_active": bool(conditioning_summary.get("i2v_action_active", False)),
+            "i2v_region_action_mode": conditioning_summary.get("i2v_region_action_mode", ""),
+            "i2v_action_strength": _safe_float(conditioning_summary.get("i2v_action_strength")),
+            "i2v_motion_direction_x": _safe_float(conditioning_summary.get("i2v_motion_direction_x")),
+            "i2v_motion_direction_y": _safe_float(conditioning_summary.get("i2v_motion_direction_y")),
+            "i2v_expression_bias": _safe_float(conditioning_summary.get("i2v_expression_bias")),
+            "i2v_pose_bias": _safe_float(conditioning_summary.get("i2v_pose_bias")),
+            "i2v_garment_bias": _safe_float(conditioning_summary.get("i2v_garment_bias")),
             "reference_payload_present": bool(conditioning_summary.get("reference_payload_present", False)),
             "expected_reference_payload_present": bool(conditioning_summary.get("expected_reference_payload_present", False)),
             "expected_reference_payload_kind": conditioning_summary.get("expected_reference_payload_kind", ""),
