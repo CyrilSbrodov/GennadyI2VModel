@@ -485,8 +485,12 @@ class RendererTrainer:
         return filtered_train, filtered_val
 
     def build_datasets(self, config: TrainingConfig) -> tuple[RendererDataset, RendererDataset]:
+        supervised_only_mode = str(getattr(config, "renderer_target_role_policy", "") or "") == "supervised_only"
         if config.learned_dataset_path:
-            payload = json.loads(Path(config.learned_dataset_path).read_text(encoding="utf-8"))
+            manifest_path = Path(config.learned_dataset_path)
+            if not manifest_path.exists():
+                raise ValueError(f"Renderer learned dataset path does not exist: {config.learned_dataset_path}")
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
             is_video_manifest = payload.get("manifest_type") == "video_transition_manifest"
             manifest_ds = RendererDataset.from_video_transition_manifest(config.learned_dataset_path, strict=False) if is_video_manifest else RendererDataset.from_renderer_manifest(config.learned_dataset_path, strict=False)
             if len(manifest_ds) > 1:
@@ -499,15 +503,24 @@ class RendererTrainer:
                 self.dataset_diagnostics = getattr(manifest_ds, "diagnostics", {})
                 return self._apply_target_role_policy(train_ds, val_ds, config.renderer_target_role_policy)
             if len(manifest_ds) == 1:
-                self.dataset_source = "manifest_video_renderer_primary_with_synthetic_val_fallback" if is_video_manifest else "manifest_paired_roi_primary_with_synthetic_val_fallback"
+                self.dataset_source = "manifest_video_renderer_primary_single_sample_train_val_reuse" if is_video_manifest else "manifest_paired_roi_primary_single_sample_train_val_reuse"
                 self.dataset_diagnostics = getattr(manifest_ds, "diagnostics", {})
-                return self._apply_target_role_policy(manifest_ds, RendererDataset.synthetic(max(1, config.val_size)), config.renderer_target_role_policy)
+                train_ds, val_ds = self._apply_target_role_policy(manifest_ds, RendererDataset(samples=list(manifest_ds.samples)), config.renderer_target_role_policy)
+                self.dataset_diagnostics["single_sample_train_val_reuse"] = True
+                return train_ds, val_ds
             self.dataset_source = "synthetic_bootstrap_fallback_manifest_empty"
             self.dataset_diagnostics = getattr(manifest_ds, "diagnostics", {})
+            raise ValueError("renderer manifest has zero valid records")
         else:
             self.dataset_source = "synthetic_bootstrap"
             self.dataset_diagnostics = {}
-        return self._apply_target_role_policy(RendererDataset.synthetic(config.train_size), RendererDataset.synthetic(config.val_size), config.renderer_target_role_policy)
+        if supervised_only_mode:
+            raise ValueError("renderer supervised training requires learned dataset manifest")
+        return self._apply_target_role_policy(
+            RendererDataset.synthetic(config.train_size),
+            RendererDataset.synthetic(config.val_size),
+            config.renderer_target_role_policy,
+        )
 
     @staticmethod
     def load_model_from_checkpoint(checkpoint_path: str):
@@ -526,6 +539,7 @@ class RendererTrainer:
         if not batches:
             return {"reconstruction_mae": 1.0, "alpha_mae": 1.0, "uncertainty_calibration_mae": 1.0, "contract_validity": 0.0, "fallback_free_happy_path_ratio": 0.0, "face_family_score": 0.0, "torso_family_score": 0.0, "sleeve_family_score": 0.0, "usable_sample_count": 0.0, "invalid_records": float((diagnostics or {}).get("invalid_records", 0)), "skipped_records": float((diagnostics or {}).get("skipped_records", 0)), "learned_contract_usage_ratio": 0.0, "weak_contract_usage_ratio": 1.0, "temporal_to_renderer_mode_consistency": 0.0, "temporal_to_renderer_target_profile_consistency": 0.0, "target_supervised_external_ratio": 0.0, "target_bootstrap_self_generated_ratio": 0.0, "target_weak_unknown_ratio": 0.0, "score": 0.0}
         eval_entries = [model.eval_step(b) for b in batches]
+        total_loss = float(sum(float(e.get("total_loss", e.get("mae", 0.0))) for e in eval_entries) / len(eval_entries))
         recon_mae = float(sum(float(e.get("mae", e.get("total_loss", 0.0))) for e in eval_entries) / len(eval_entries))
         alpha_mae = float(sum(float(e.get("alpha_mae", 0.0)) for e in eval_entries) / len(eval_entries))
         unc_mae = float(sum(float(e.get("uncertainty_calibration_loss", e.get("uncertainty_mean", 0.0))) for e in eval_entries) / len(eval_entries))
@@ -611,6 +625,7 @@ class RendererTrainer:
         score = max(0.0, 1.0 - (recon_mae + 0.5 * alpha_mae + 0.35 * unc_mae))
         metrics = {
             "reconstruction_mae": recon_mae,
+            "total_loss": total_loss,
             "alpha_mae": alpha_mae,
             "uncertainty_calibration_mae": unc_mae,
             "contract_validity": contract_validity,
@@ -628,6 +643,8 @@ class RendererTrainer:
             "fallback_used": 1.0 if fallback_used else 0.0,
             "invalid_records": float((diagnostics or {}).get("invalid_records", 0)),
             "skipped_records": float((diagnostics or {}).get("skipped_records", 0)),
+            "skipped_record_count": float((diagnostics or {}).get("skipped_records", 0)),
+            "supervised_record_count": float((diagnostics or {}).get("supervised_record_count", 0)),
             "learned_contract_usage_ratio": float(learned_usage / len(batches)),
             "weak_contract_usage_ratio": float(weak_usage / len(batches)),
             "memory_bundle_conditioning_present": float(memory_bundle_conditioning_present),
@@ -803,6 +820,14 @@ class RendererTrainer:
         effective_target_role_policy = str(self.dataset_diagnostics.get("effective_target_role_policy", requested_target_role_policy) or "unknown")
         target_quality_counts = last_train.get("target_quality_counts", {}) if isinstance(last_train.get("target_quality_counts", {}), dict) else {}
         target_training_role_counts = last_train.get("target_training_role_counts", {}) if isinstance(last_train.get("target_training_role_counts", {}), dict) else {}
+        metadata_training_source = self.dataset_source or "unknown"
+        supervised_metadata_count = int(self.dataset_diagnostics.get("supervised_record_count", 0) or 0)
+        if effective_target_role_policy == "supervised_only" and supervised_metadata_count > 0:
+            metadata_training_source = "observed_pair_supervised"
+        elif str(self.dataset_source).startswith("synthetic_bootstrap"):
+            metadata_training_source = "synthetic_bootstrap"
+        elif "manifest" in str(self.dataset_source):
+            metadata_training_source = "renderer_manifest"
         metadata = {
             "checkpoint_contract_version": RENDERER_CHECKPOINT_CONTRACT_VERSION,
             "stage": "renderer",
@@ -818,6 +843,10 @@ class RendererTrainer:
             "model_path": str(model_path),
             "created_by": "RendererTrainer",
             "training_dataset_source": self.dataset_source or "unknown",
+            "training_source": metadata_training_source,
+            "record_count": int(self.dataset_diagnostics.get("loaded_records", len(train_dataset) + len(val_dataset)) or 0),
+            "supervised_record_count": int(self.dataset_diagnostics.get("supervised_record_count", 0) or 0),
+            "skipped_record_count": int(self.dataset_diagnostics.get("skipped_records", 0) or 0),
             "renderer_target_role_policy": effective_target_role_policy,
             "requested_target_role_policy": requested_target_role_policy,
             "effective_target_role_policy": effective_target_role_policy,
@@ -846,6 +875,13 @@ class RendererTrainer:
             "fallback_used": bool(self.fallback_used),
             "fallback_reason": self.fallback_reason,
             "training_losses_last": last_train,
+            "dataset_diagnostics_summary": {
+                "total_records": int(self.dataset_diagnostics.get("total_records", 0) or 0),
+                "loaded_records": int(self.dataset_diagnostics.get("loaded_records", 0) or 0),
+                "supervised_record_count": int(self.dataset_diagnostics.get("supervised_record_count", 0) or 0),
+                "skipped_records": int(self.dataset_diagnostics.get("skipped_records", 0) or 0),
+                "single_sample_train_val_reuse": bool(self.dataset_diagnostics.get("single_sample_train_val_reuse", False)),
+            },
         }
         ckpt.write_text(
             json.dumps(
@@ -880,4 +916,9 @@ class RendererTrainer:
             ),
             encoding="utf-8",
         )
+        if not ckpt.exists():
+            raise RuntimeError("renderer checkpoint was not written")
+        _loaded_model, _loaded_backend, _loaded_metadata = load_renderer_model_from_checkpoint(str(ckpt))
+
+        last_train["dataset_diagnostics"] = dict(self.dataset_diagnostics)
         return StageResult(stage_name=self.stage_name, train_metrics=last_train, val_metrics=last_val, checkpoint_path=str(ckpt))

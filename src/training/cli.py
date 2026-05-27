@@ -38,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--observed-pairs-path", default="", help="Observed pairs JSON input path (renderer_observed_pair_manifest_input_v1).")
     parser.add_argument("--output-path", default="", help="Output manifest path for export-only stages.")
     parser.add_argument("--strict", action="store_true", help="Enable strict validation for export-only manifest builders.")
+    parser.add_argument("--strict-dataset", action="store_true", help="Enable strict supervised dataset policy for renderer training.")
     return parser
 
 
@@ -50,6 +51,8 @@ def main() -> None:
         checkpoint_dir=args.checkpoint_dir,
         learned_dataset_path=args.learned_dataset_path,
     )
+    if args.strict_dataset:
+        config.renderer_target_role_policy = "supervised_only"
 
     if args.stage == "renderer_manifest_from_observed_pairs":
         if not args.observed_pairs_path:
@@ -64,8 +67,13 @@ def main() -> None:
         results = train_pipeline(config)
         payload = [{"stage": r.stage_name, "val": r.val_metrics, "checkpoint": r.checkpoint_path} for r in results]
     else:
+        if args.stage == "renderer" and args.strict_dataset and not args.learned_dataset_path:
+            raise ValueError("--learned-dataset-path is required for supervised renderer training")
         result = train_stage(args.stage, config)
-        payload = [{"stage": result.stage_name, "val": result.val_metrics, "checkpoint": result.checkpoint_path}]
+        row = {"stage": result.stage_name, "val": result.val_metrics, "checkpoint": result.checkpoint_path}
+        if args.stage == "renderer":
+            row["dataset_diagnostics"] = result.train_metrics.get("dataset_diagnostics", {})
+        payload = [row]
 
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 

@@ -369,3 +369,40 @@ Recommended tests:
 ```bash
 pytest -q tests/test_renderer_video_manifest_builder.py tests/test_renderer_observed_pairs_builder.py
 ```
+
+## Supervised renderer training baseline
+
+Observed-pair manifests are the **primary supervised renderer training path** in this baseline.
+Runtime-generated targets are debug/distillation-only signals and **not supervised ground truth**.
+This sprint trains the current baseline renderer, not production-quality video generation.
+Saved renderer checkpoints are only as good as observed-pair data quality and current baseline model capacity.
+
+1. Prepare observed pairs (template): `examples/observed_pairs.example.json`.
+2. Build observed-pair manifest:
+
+```bash
+python -m training.cli --stage renderer_manifest_from_observed_pairs \
+  --observed-pairs-path examples/observed_pairs.example.json \
+  --output-path artifacts/renderer_observed_pairs.json \
+  --strict
+```
+
+3. Train renderer:
+
+```bash
+python -m training.cli --stage renderer \
+  --epochs 1 \
+  --learned-dataset-path artifacts/renderer_observed_pairs.json \
+  --checkpoint-dir artifacts/checkpoints \
+  --strict-dataset
+```
+
+4. Run strict runtime with explicit checkpoints:
+
+```bash
+python -m runtime.cli \
+  --runtime-mode strict_learned \
+  --dynamics-checkpoint-path artifacts/checkpoints/dynamics/dynamics_weights.json \
+  --patch-checkpoint-path artifacts/checkpoints/renderer/<saved_renderer_checkpoint>.json \
+  --temporal-checkpoint-path artifacts/checkpoints/temporal/<saved_temporal_checkpoint>.json
+```
