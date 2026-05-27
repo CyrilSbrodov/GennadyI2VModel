@@ -213,6 +213,9 @@ class PatchBatch:
     preservation_mask: np.ndarray | None = None
     uncertainty_target: np.ndarray | None = None
     seam_prior: np.ndarray | None = None
+    i2v_flow_x: np.ndarray | None = None
+    i2v_flow_y: np.ndarray | None = None
+    i2v_deformation_mask: np.ndarray | None = None
     transition_mode: str = "stable"
     profile_role: str = "primary"
     conditioning_summary: dict[str, object] = field(default_factory=dict)
@@ -2123,7 +2126,7 @@ def _build_targets(
     reference_rgb: np.ndarray | None = None,
     reference_validity: np.ndarray | None = None,
     i2v_action_cond: dict[str, object] | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, object]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, object]]:
     h, w, _ = roi_before.shape
     geometry = _geometry_priors(h, w, region_type, profile)
     changed_mask, blend_hint, alpha_target, uncertainty_target, preservation_mask, seam_prior = _compose_region_priors(
@@ -2176,7 +2179,10 @@ def _build_targets(
         "i2v_flow_y_mean": float(np.mean(motion.get("flow_y", np.zeros((h, w), dtype=np.float32)))),
         "i2v_warp_amount": warp_amount,
     }
-    return roi_after, changed_mask, blend_hint, alpha_target, uncertainty_target, preservation_mask, seam_prior, motion_trace
+    i2v_flow_x = map_to_shape(np.asarray(motion.get("flow_x", np.zeros((h, w), dtype=np.float32)), dtype=np.float32), (h, w), fill=0.0)[..., None]
+    i2v_flow_y = map_to_shape(np.asarray(motion.get("flow_y", np.zeros((h, w), dtype=np.float32)), dtype=np.float32), (h, w), fill=0.0)[..., None]
+    i2v_deformation_mask = map_to_shape(np.asarray(motion.get("deformation_mask", np.zeros((h, w), dtype=np.float32)), dtype=np.float32), (h, w), fill=0.0)[..., None]
+    return roi_after, changed_mask, blend_hint, alpha_target, uncertainty_target, preservation_mask, seam_prior, i2v_flow_x, i2v_flow_y, i2v_deformation_mask, motion_trace
 
 
 def summarize_patch_batch(batch: PatchBatch) -> dict[str, object]:
@@ -2285,6 +2291,9 @@ def summarize_patch_batch(batch: PatchBatch) -> dict[str, object]:
         "i2v_flow_x_mean": _safe_float(batch.conditioning_summary.get("i2v_flow_x_mean")),
         "i2v_flow_y_mean": _safe_float(batch.conditioning_summary.get("i2v_flow_y_mean")),
         "i2v_warp_amount": _safe_float(batch.conditioning_summary.get("i2v_warp_amount")),
+        "i2v_motion_input_channels": int(batch.conditioning_summary.get("i2v_motion_input_channels", 0) or 0),
+        "i2v_motion_tensor_used": bool(batch.conditioning_summary.get("i2v_motion_tensor_used", False)),
+        "i2v_motion_tensor_zero_fallback": bool(batch.conditioning_summary.get("i2v_motion_tensor_zero_fallback", True)),
     }
 
 
@@ -2335,7 +2344,19 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
         ],
         dtype=np.float32,
     )
-    roi_after, changed_mask, blend_hint, alpha_target, uncertainty_target, preservation_mask, seam_prior, motion_trace = _build_targets(
+    (
+        roi_after,
+        changed_mask,
+        blend_hint,
+        alpha_target,
+        uncertainty_target,
+        preservation_mask,
+        seam_prior,
+        i2v_flow_x,
+        i2v_flow_y,
+        i2v_deformation_mask,
+        motion_trace,
+    ) = _build_targets(
         roi_before,
         profile,
         delta_cond,
@@ -2355,6 +2376,11 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
         region_type,
         float(bundle_cond.get("identity_reference_strength", 0.0)),
         bool(bundle_cond.get("identity_reference_blocked", False)),
+    )
+    i2v_motion_tensor_used = bool(
+        np.any(np.abs(i2v_flow_x) > 1e-8)
+        or np.any(np.abs(i2v_flow_y) > 1e-8)
+        or np.any(i2v_deformation_mask > 1e-8)
     )
     conditioning_summary = {
         "transition_mode": profile.transition_mode,
@@ -2408,6 +2434,12 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
         "reference_tensor_input_channels": 5,
         "reference_tensor_input_used": bool(material_cond["reference_patch_material_used"] and np.any(reference_validity > 0.0)),
         "reference_tensor_zero_fallback": bool(not (material_cond["reference_patch_material_used"] and np.any(reference_validity > 0.0))),
+        "i2v_motion_input_channels": 3,
+        "i2v_motion_tensor_used": i2v_motion_tensor_used,
+        "i2v_motion_tensor_zero_fallback": bool(not i2v_motion_tensor_used),
+        "i2v_flow_x_mean": float(np.mean(i2v_flow_x)),
+        "i2v_flow_y_mean": float(np.mean(i2v_flow_y)),
+        "i2v_deformation_mask_mean": float(np.mean(i2v_deformation_mask)),
         "identity_sensitive_region": region_type in IDENTITY_SENSITIVE_REGIONS,
         "core_identity_region": region_type in CORE_IDENTITY_REGIONS,
         "identity_reference_used": bundle_cond["identity_reference_used"],
@@ -2448,6 +2480,13 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
         **motion_trace,
         "i2v_region_id": request.region.region_id,
     }
+    if isinstance(request.transition_context, dict):
+        existing_contract = request.transition_context.get("renderer_batch_contract")
+        contract = dict(existing_contract) if isinstance(existing_contract, dict) else {}
+        contract["i2v_flow_x"] = i2v_flow_x.tolist()
+        contract["i2v_flow_y"] = i2v_flow_y.tolist()
+        contract["i2v_deformation_mask"] = i2v_deformation_mask.tolist()
+        request.transition_context["renderer_batch_contract"] = contract
     return PatchBatch(
         roi_before=roi_before,
         roi_after=roi_after,
@@ -2469,6 +2508,9 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
         preservation_mask=preservation_mask,
         uncertainty_target=uncertainty_target,
         seam_prior=seam_prior,
+        i2v_flow_x=i2v_flow_x,
+        i2v_flow_y=i2v_flow_y,
+        i2v_deformation_mask=i2v_deformation_mask,
         transition_mode=profile.transition_mode,
         profile_role=profile.profile_role,
         conditioning_summary=conditioning_summary,
@@ -2523,6 +2565,18 @@ def output_from_prediction(
 
     memory_bundle_trace = summarize_memory_bundle_trace(request.transition_context)
 
+
+    i2v_motion_diag = {
+        "i2v_motion_input_channels": int(pred.get("i2v_motion_input_channels", conditioning_summary.get("i2v_motion_input_channels", 0)) or 0),
+        "i2v_motion_tensor_used": bool(pred.get("i2v_motion_tensor_used", conditioning_summary.get("i2v_motion_tensor_used", False))),
+        "i2v_motion_tensor_zero_fallback": bool(pred.get("i2v_motion_tensor_zero_fallback", conditioning_summary.get("i2v_motion_tensor_zero_fallback", True))),
+        "i2v_flow_x_mean": _safe_float(pred.get("i2v_flow_x_mean", conditioning_summary.get("i2v_flow_x_mean"))),
+        "i2v_flow_y_mean": _safe_float(pred.get("i2v_flow_y_mean", conditioning_summary.get("i2v_flow_y_mean"))),
+        "i2v_deformation_mask_mean": _safe_float(pred.get("i2v_deformation_mask_mean", conditioning_summary.get("i2v_deformation_mask_mean"))),
+        "i2v_warp_amount": _safe_float(pred.get("i2v_warp_amount", conditioning_summary.get("i2v_warp_amount"))),
+        "i2v_motion_region_reconstruction_loss": _safe_float(pred.get("i2v_motion_region_reconstruction_loss", conditioning_summary.get("i2v_motion_region_reconstruction_loss"))),
+        "i2v_motion_preservation_penalty": _safe_float(pred.get("i2v_motion_preservation_penalty", conditioning_summary.get("i2v_motion_preservation_penalty"))),
+    }
     material_diag = {
         "material_gate_mean": _safe_float(pred.get("material_gate_mean")),
         "material_gate_max": _safe_float(pred.get("material_gate_max")),
@@ -2629,6 +2683,7 @@ def output_from_prediction(
         "i2v_flow_x_mean": _safe_float(conditioning_summary.get("i2v_flow_x_mean")),
         "i2v_flow_y_mean": _safe_float(conditioning_summary.get("i2v_flow_y_mean")),
         "i2v_warp_amount": _safe_float(conditioning_summary.get("i2v_warp_amount")),
+        **i2v_motion_diag,
         "alpha_semantics": "blend_probability_for_true_changed_region_with_seam_support",
         "uncertainty_semantics": "local_synthesis_ambiguity_map_for_compositor_and_confidence",
         "confidence_semantics": "patch_reliability_summary_after_preservation_and_ambiguity_checks",

@@ -152,6 +152,53 @@ def test_torch_local_patch_generator_upgrades_v2_9_channel_stem_checkpoint(tmp_p
     assert torch.allclose(weight[:, :BASE_LOCAL_INPUT_CHANNELS], legacy.stem.net[0].weight.detach().cpu())
     assert torch.count_nonzero(weight[:, BASE_LOCAL_INPUT_CHANNELS:]) == 0
     assert loaded.checkpoint_compatibility["checkpoint_reference_channel_upgrade"] is True
+    assert loaded.checkpoint_compatibility["checkpoint_motion_channel_upgrade_from_9"] is True
+    assert loaded.checkpoint_compatibility["checkpoint_i2v_motion_channel_upgrade"] is True
+
+
+def test_torch_local_patch_generator_upgrades_v2_14_channel_checkpoint(tmp_path: Path) -> None:
+    import pytest
+
+    torch = pytest.importorskip("torch")
+    from rendering.patch_conditioning_contract import GLOBAL_COND_DIM
+    from rendering.torch_local_patch_generator import BASE_LOCAL_INPUT_CHANNELS, LOCAL_INPUT_CHANNELS, REFERENCE_TENSOR_INPUT_CHANNELS, TorchLocalPatchGenerator, TorchLocalPatchGeneratorNet
+
+    legacy_in = BASE_LOCAL_INPUT_CHANNELS + REFERENCE_TENSOR_INPUT_CHANNELS
+    legacy = TorchLocalPatchGeneratorNet(global_dim=GLOBAL_COND_DIM, input_channels=legacy_in)
+    with torch.no_grad():
+        legacy.stem.net[0].weight.copy_(torch.arange(legacy.stem.net[0].weight.numel(), dtype=legacy.stem.net[0].weight.dtype).reshape_as(legacy.stem.net[0].weight))
+    checkpoint = tmp_path / "legacy_14_channel.pt"
+    torch.save({"state_dict": legacy.state_dict(), "local_input_channels": legacy_in}, str(checkpoint))
+
+    loaded = TorchLocalPatchGenerator.load(str(checkpoint))
+    weight = loaded.net.stem.net[0].weight.detach().cpu()
+
+    assert loaded.net.input_channels == LOCAL_INPUT_CHANNELS
+    assert torch.allclose(weight[:, :legacy_in], legacy.stem.net[0].weight.detach().cpu())
+    assert torch.count_nonzero(weight[:, legacy_in:]) == 0
+    assert loaded.checkpoint_compatibility["checkpoint_reference_channel_upgrade"] is False
+    assert loaded.checkpoint_compatibility["checkpoint_i2v_motion_channel_upgrade"] is True
+    assert loaded.checkpoint_compatibility["checkpoint_motion_channel_upgrade_from_9"] is False
+
+
+def test_torch_local_patch_generator_loads_native_v3_checkpoint_without_upgrade(tmp_path: Path) -> None:
+    import pytest
+
+    pytest.importorskip("torch")
+    from rendering.torch_local_patch_generator import LOCAL_INPUT_CHANNELS, TorchLocalPatchGenerator
+
+    path = tmp_path / "native_v3.pt"
+    model = TorchLocalPatchGenerator(seed=21)
+    model.save(str(path))
+    loaded = TorchLocalPatchGenerator.load(str(path))
+
+    compat = loaded.checkpoint_compatibility
+    assert compat["checkpoint_reference_channel_upgrade"] is False
+    assert compat["checkpoint_i2v_motion_channel_upgrade"] is False
+    assert compat["checkpoint_motion_channel_upgrade_from_9"] is False
+    assert compat["checkpoint_local_input_channels"] == LOCAL_INPUT_CHANNELS
+    assert compat["runtime_local_input_channels"] == LOCAL_INPUT_CHANNELS
+    assert compat["patch_batch_contract_version"] == "patch_batch_v3_i2v_motion_guidance"
 
 
 def test_torch_local_patch_generator_rejects_incomplete_checkpoint(tmp_path: Path) -> None:
@@ -237,11 +284,38 @@ def test_torch_local_patch_generator_local_tensor_layout_contract() -> None:
     gen = TorchLocalPatchGenerator()
     batch = _torch_batch_with_reference(16, 16, validity=1.0, mask=1.0)
     tb = gen._to_torch_batch(batch)
-    assert tb.local_maps.shape[1] == LOCAL_INPUT_CHANNELS == 14
+    assert tb.local_maps.shape[1] == LOCAL_INPUT_CHANNELS == 17
     assert np.allclose(tb.local_maps[0, 9:12].cpu().numpy(), 0.0)
     assert float(tb.local_maps[0, 13:14].mean().item()) > 0.0
+    assert np.allclose(tb.local_maps[0, 14:15].cpu().numpy(), batch.i2v_flow_x.transpose(2, 0, 1))
+    assert np.allclose(tb.local_maps[0, 15:16].cpu().numpy(), batch.i2v_flow_y.transpose(2, 0, 1))
+    assert np.allclose(tb.local_maps[0, 16:17].cpu().numpy(), batch.i2v_deformation_mask.transpose(2, 0, 1))
     assert batch.conditioning_summary["reference_tensor_input_used"] is True
     assert batch.conditioning_summary["reference_tensor_zero_fallback"] is False
+
+
+def test_torch_infer_and_eval_report_i2v_motion_metrics() -> None:
+    import pytest
+    pytest.importorskip("torch")
+    from rendering.torch_local_patch_generator import TorchLocalPatchGenerator
+
+    gen = TorchLocalPatchGenerator(seed=13)
+    batch = _torch_batch_with_reference(16, 16, validity=1.0, mask=1.0)
+    batch.i2v_flow_y = -0.2 * np.ones((16, 16, 1), dtype=np.float32)
+    batch.i2v_deformation_mask = 0.6 * np.ones((16, 16, 1), dtype=np.float32)
+    inf = gen.infer(batch)
+    assert inf["i2v_motion_tensor_used"] is True
+    assert inf["i2v_motion_tensor_zero_fallback"] is False
+    assert "i2v_motion_region_reconstruction_loss" in inf
+    assert "i2v_motion_preservation_penalty" in inf
+
+    zero_batch = _torch_batch_with_reference(16, 16, validity=1.0, mask=1.0)
+    zero_batch.i2v_flow_x = np.zeros((16, 16, 1), dtype=np.float32)
+    zero_batch.i2v_flow_y = np.zeros((16, 16, 1), dtype=np.float32)
+    zero_batch.i2v_deformation_mask = np.zeros((16, 16, 1), dtype=np.float32)
+    eval_metrics = gen.eval_step(zero_batch)
+    assert np.isfinite(eval_metrics["i2v_motion_region_reconstruction_loss"])
+    assert np.isfinite(eval_metrics["i2v_motion_preservation_penalty"])
 
 
 def test_torch_local_patch_generator_material_gate_cold_start_and_caps() -> None:

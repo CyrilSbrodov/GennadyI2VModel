@@ -34,7 +34,8 @@ from learned.interfaces import PatchSynthesisRequest
 from training.rollout_eval import evaluate_rollout_modes_on_video_manifest
 from rendering.target_provenance_policy import classify_target_training_role, target_quality_warning, target_supervision_summary
 from rendering.renderer_checkpoint_loader import RENDERER_CHECKPOINT_CONTRACT_VERSION, load_renderer_model_from_checkpoint
-from rendering.torch_local_patch_generator import LOCAL_INPUT_CHANNELS, REFERENCE_TENSOR_INPUT_CHANNELS, TorchBackendUnavailableError, TorchLocalPatchGenerator
+from rendering.patch_tensor_utils import map_to_shape
+from rendering.torch_local_patch_generator import I2V_MOTION_INPUT_CHANNELS, LOCAL_INPUT_CHANNELS, REFERENCE_TENSOR_INPUT_CHANNELS, TorchBackendUnavailableError, TorchLocalPatchGenerator
 from training.datasets import RendererDataset
 from training.types import StageResult, TrainingConfig
 
@@ -142,6 +143,21 @@ class RendererBatchAdapter:
             occlusion_score=float(ttarget.get("occlusion_score", 0.0)),
             support_contact_score=float(ttarget.get("support_contact_score", 0.0)),
         )
+
+
+    @staticmethod
+    def _motion_tensor_from_contract(contract: dict[str, object], key: str, h: int, w: int) -> np.ndarray:
+        value = contract.get(key)
+        if value is None:
+            return np.zeros((h, w, 1), dtype=np.float32)
+        arr = np.asarray(value, dtype=np.float32)
+        if arr.ndim == 2:
+            arr = arr[..., None]
+        if arr.ndim == 3 and arr.shape[2] != 1:
+            arr = np.mean(arr, axis=2, keepdims=True)
+        if arr.ndim != 3:
+            return np.zeros((h, w, 1), dtype=np.float32)
+        return map_to_shape(arr, (h, w), fill=0.0)
 
     @staticmethod
     def _semantic_from_family(family: str) -> list[float]:
@@ -258,6 +274,11 @@ class RendererBatchAdapter:
             blend_hint = np.mean(blend_hint, axis=2, keepdims=True)
         if alpha_target.shape[-1] == 3:
             alpha_target = np.mean(alpha_target, axis=2, keepdims=True)
+
+        i2v_flow_x = self._motion_tensor_from_contract(contract, "i2v_flow_x", b.shape[0], b.shape[1])
+        i2v_flow_y = self._motion_tensor_from_contract(contract, "i2v_flow_y", b.shape[0], b.shape[1])
+        i2v_deformation_mask = np.clip(self._motion_tensor_from_contract(contract, "i2v_deformation_mask", b.shape[0], b.shape[1]), 0.0, 1.0)
+        i2v_used = bool(np.any(np.abs(i2v_flow_x) > 1e-8) or np.any(np.abs(i2v_flow_y) > 1e-8) or np.any(i2v_deformation_mask > 1e-8))
         temporal_window = sample.get("temporal_roi_window", {}) if isinstance(sample.get("temporal_roi_window", {}), dict) else {}
         prev_roi = temporal_window.get("roi_t_minus_1", b)
         prev_np = self._np3(prev_roi)
@@ -306,6 +327,7 @@ class RendererBatchAdapter:
                 }
             )
         conditioning_summary.update(reference_tensor_summary)
+        conditioning_summary.update({"i2v_motion_input_channels": I2V_MOTION_INPUT_CHANNELS, "i2v_motion_tensor_used": bool(i2v_used), "i2v_motion_tensor_zero_fallback": bool(not i2v_used), "i2v_flow_x_mean": float(np.mean(i2v_flow_x)), "i2v_flow_y_mean": float(np.mean(i2v_flow_y)), "i2v_deformation_mask_mean": float(np.mean(i2v_deformation_mask))})
         conditioning_summary.update(provenance_summary)
         conditioning_summary.update(target_role_summary)
         return PatchBatch(
@@ -328,6 +350,9 @@ class RendererBatchAdapter:
             preservation_mask=preservation_mask,
             uncertainty_target=uncertainty_target,
             seam_prior=seam_prior,
+            i2v_flow_x=i2v_flow_x,
+            i2v_flow_y=i2v_flow_y,
+            i2v_deformation_mask=i2v_deformation_mask,
             previous_roi=prev_np if temporal_mode else None,
             predicted_family=selected.predicted_family,
             predicted_phase=selected.predicted_phase,

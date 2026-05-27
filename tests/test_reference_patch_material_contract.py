@@ -723,6 +723,35 @@ def test_manifest_loader_restores_expected_payload_from_renderer_batch_contract(
     assert loaded_batch.conditioning_summary["reference_patch_material_trusted"] is True
 
 
+def test_manifest_i2v_dense_motion_tensors_stay_in_renderer_batch_contract() -> None:
+    req = _request({"i2v_action_phase": "arm_raise", "i2v_region_transition_mode": {"p1:left_arm": "arm_raise"}}, region_id="p1:left_arm")
+    batch = build_patch_batch(req, np.full((8, 8, 3), 0.2, dtype=np.float32))
+    out = output_from_prediction(req, {"rgb": batch.roi_after, "alpha": batch.alpha_target[..., 0], "uncertainty": batch.uncertainty_target[..., 0], "confidence": 0.9}, "learned_primary", {}, batch)
+    record = RendererManifestRecordExporter().build_record(request=req, output=out, roi_before=batch.roi_before, roi_after=batch.roi_after, step_index=0, frame_index=0)
+    assert "i2v_flow_x" in record["renderer_batch_contract"]
+    assert "i2v_flow_y" in record["renderer_batch_contract"]
+    assert "i2v_deformation_mask" in record["renderer_batch_contract"]
+    assert "i2v_flow_x" not in record["transition_context_summary"]
+
+
+def test_renderer_batch_adapter_restores_motion_and_overwrites_stale_summary() -> None:
+    flow_y = (-0.3 * np.ones((4, 4, 1), dtype=np.float32)).tolist()
+    deform = (0.7 * np.ones((4, 4, 1), dtype=np.float32)).tolist()
+    sample = {
+        "region_id": "p1:left_arm",
+        "roi_pairs": [[np.zeros((4, 4, 3), dtype=np.float32).tolist(), np.zeros((4, 4, 3), dtype=np.float32).tolist()]],
+        "renderer_batch_contract": {
+            "i2v_flow_x": np.zeros((4, 4, 1), dtype=np.float32).tolist(),
+            "i2v_flow_y": flow_y,
+            "i2v_deformation_mask": deform,
+            "conditioning_summary": {"i2v_motion_tensor_used": False, "i2v_deformation_mask_mean": 0.0},
+        },
+    }
+    adapted = RendererBatchAdapter().adapt(sample)
+    assert float(np.mean(adapted.i2v_deformation_mask)) > 0.0
+    assert adapted.conditioning_summary["i2v_motion_tensor_used"] is True
+
+
 
 
 def test_manifest_loader_restores_top_level_expected_payload_without_renderer_contract() -> None:

@@ -474,9 +474,23 @@ def _renderer_batch_contract(
         "material_gate_invalidity_penalty",
         "material_gate_area_penalty",
         "material_gate_suppressed_by_preservation",
+        "i2v_motion_input_channels",
+        "i2v_motion_tensor_used",
+        "i2v_motion_tensor_zero_fallback",
+        "i2v_flow_x_mean",
+        "i2v_flow_y_mean",
+        "i2v_deformation_mask_mean",
+        "i2v_warp_amount",
+        "i2v_motion_region_reconstruction_loss",
+        "i2v_motion_preservation_penalty",
     ):
         if key in trace:
             contract[key] = _safe_json(trace[key])
+    for key in ("i2v_flow_x", "i2v_flow_y", "i2v_deformation_mask"):
+        if key in existing:
+            contract[key] = _safe_json(existing[key])
+        elif key in ctx:
+            contract[key] = _safe_json(ctx[key])
     if "conditioning_summary" not in contract:
         summary = trace.get("conditioning_summary") or ctx.get("conditioning_summary")
         if summary is not None:
