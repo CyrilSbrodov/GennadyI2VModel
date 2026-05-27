@@ -332,3 +332,40 @@ python -m training.cli --stage renderer --epochs 1 --learned-dataset-path artifa
 - Если `runtime_mode` = `strict_learned` или `production_eval`, fallback forbidden (`fallback_forbidden=true`).
 - Отсутствие checkpoints означает отсутствие learned-runtime claim.
 - Bootstrap/legacy paths сохраняются только для `debug_stub`/`trainable_stub` и отмечаются в metadata как fallback/bootstrap.
+
+
+## Observed-pair renderer dataset builder
+
+Primary supervised renderer path uses **observed source/target frame pairs** and exports `renderer_patch_manifest_v2` with external ground-truth ROI targets.
+
+- Input contract: `renderer_observed_pair_manifest_input_v1`
+- Required per pair: `record_id`, `source_frame`, `target_frame`, `regions[]` (`region_id`, normalized `bbox`), optional `prompt`, `transition_context`, `region_metadata`.
+- Every exported supervised record is enforced as:
+  - `target_source = "provided_ground_truth_roi"`
+  - `training_target_quality = "external_or_observed_target"`
+  - `target_training_role = "supervised_external"`
+
+Runtime-generated renderer outputs are debug/distillation artifacts only and are **not supervised ground truth**.
+
+CLI:
+
+```bash
+python -m training.cli --stage renderer_manifest_from_observed_pairs \
+  --observed-pairs-path data/observed_pairs.json \
+  --output-path artifacts/renderer_observed_pairs.json \
+  --strict
+```
+
+Strict mode fail-fast behavior:
+- missing/unreadable `source_frame` or `target_frame`
+- source/target shape mismatch
+- missing/invalid regions or invalid bbox
+- zero exported supervised records
+
+Non-strict mode skips invalid pairs and writes diagnostics, but still never emits self-generated runtime targets as supervised records.
+
+Recommended tests:
+
+```bash
+pytest -q tests/test_renderer_video_manifest_builder.py tests/test_renderer_observed_pairs_builder.py
+```
