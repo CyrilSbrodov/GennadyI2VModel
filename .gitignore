@@ -7,3 +7,6 @@ output/
 note.txt
 yolo11n-pose.pt
 yolo11n-seg.pt
+__pycache__/
+*.pyc
+.pytest_cache/

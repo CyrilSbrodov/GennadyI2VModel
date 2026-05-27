@@ -9,7 +9,8 @@ from rendering.patch_conditioning_contract import GLOBAL_COND_DIM, MODE_DIM, ROL
 
 BASE_LOCAL_INPUT_CHANNELS = 9
 REFERENCE_TENSOR_INPUT_CHANNELS = 5
-LOCAL_INPUT_CHANNELS = BASE_LOCAL_INPUT_CHANNELS + REFERENCE_TENSOR_INPUT_CHANNELS
+I2V_MOTION_INPUT_CHANNELS = 3
+LOCAL_INPUT_CHANNELS = BASE_LOCAL_INPUT_CHANNELS + REFERENCE_TENSOR_INPUT_CHANNELS + I2V_MOTION_INPUT_CHANNELS
 MATERIAL_GATE_MAX = 0.35
 MATERIAL_GATE_INIT_BIAS = -3.0
 from rendering.patch_tensor_utils import map_to_shape
@@ -91,6 +92,14 @@ class TorchBackendUnavailableError(RuntimeError):
 
 
 class TorchLocalPatchGenerator:
+    @staticmethod
+    def _i2v_tensor_used_np(flow_x: np.ndarray, flow_y: np.ndarray, deformation_mask: np.ndarray, eps: float = 1e-8) -> bool:
+        return bool(np.any(np.abs(flow_x) > eps) or np.any(np.abs(flow_y) > eps) or np.any(deformation_mask > eps))
+
+    @staticmethod
+    def _i2v_tensor_used_torch(flow_x: "torch.Tensor", flow_y: "torch.Tensor", deformation_mask: "torch.Tensor", eps: float = 1e-8) -> bool:
+        return bool(bool((flow_x.abs() > eps).any().detach().cpu().item()) or bool((flow_y.abs() > eps).any().detach().cpu().item()) or bool((deformation_mask > eps).any().detach().cpu().item()))
+
     def __init__(self, device: str | None = None, seed: int = 11) -> None:
         if torch is None:
             raise TorchBackendUnavailableError("TorchLocalPatchGenerator requires torch, but torch is unavailable")
@@ -133,6 +142,15 @@ class TorchLocalPatchGenerator:
             raise RuntimeError(f"Global conditioning dim mismatch: expected {GLOBAL_COND_DIM}, got {out.shape[0]}")
         return out
 
+    @staticmethod
+    def _i2v_motion_inputs(batch: "PatchBatch", shape_hw: tuple[int, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+        h, w = shape_hw
+        fx = map_to_shape(getattr(batch, "i2v_flow_x", None), (h, w), 0.0)
+        fy = map_to_shape(getattr(batch, "i2v_flow_y", None), (h, w), 0.0)
+        dm = map_to_shape(getattr(batch, "i2v_deformation_mask", None), (h, w), 0.0)
+        used = TorchLocalPatchGenerator._i2v_tensor_used_np(fx, fy, dm)
+        return fx, fy, dm, used
+
     def _to_torch_batch(self, batch: "PatchBatch") -> _TorchBatch:
         h, w, _ = batch.roi_before.shape
         if h < 4 or w < 4:
@@ -146,7 +164,8 @@ class TorchLocalPatchGenerator:
             map_to_shape(batch.seam_prior, (h, w), 0.0),
         ]
         reference_rgb, reference_mask, reference_validity, reference_used = self._reference_inputs(batch, (h, w))
-        local = np.concatenate([batch.roi_before.astype(np.float32), *maps, reference_rgb, reference_mask, reference_validity], axis=2)
+        i2v_flow_x, i2v_flow_y, i2v_deformation_mask, i2v_used = self._i2v_motion_inputs(batch, (h, w))
+        local = np.concatenate([batch.roi_before.astype(np.float32), *maps, reference_rgb, reference_mask, reference_validity, i2v_flow_x, i2v_flow_y, i2v_deformation_mask], axis=2)
         if isinstance(batch.conditioning_summary, dict):
             batch.conditioning_summary.update(
                 {
@@ -156,6 +175,12 @@ class TorchLocalPatchGenerator:
                     "local_tensor_input_channels": int(local.shape[2]),
                     "reference_validity_mean": float(np.mean(reference_validity)),
                     "reference_mask_mean": float(np.mean(reference_mask)),
+                    "i2v_motion_input_channels": I2V_MOTION_INPUT_CHANNELS,
+                    "i2v_motion_tensor_used": bool(i2v_used),
+                    "i2v_motion_tensor_zero_fallback": bool(not i2v_used),
+                    "i2v_flow_x_mean": float(np.mean(i2v_flow_x)),
+                    "i2v_flow_y_mean": float(np.mean(i2v_flow_y)),
+                    "i2v_deformation_mask_mean": float(np.mean(i2v_deformation_mask)),
                 }
             )
         return _TorchBatch(
@@ -171,6 +196,7 @@ class TorchLocalPatchGenerator:
         changed, blend, alpha_target = tb.local_maps[:, 3:4], tb.local_maps[:, 4:5], tb.local_maps[:, 5:6]
         preservation, uncertainty_target, seam = tb.local_maps[:, 6:7], tb.local_maps[:, 7:8], tb.local_maps[:, 8:9]
         reference_rgb, reference_mask, reference_validity = tb.local_maps[:, 9:12], tb.local_maps[:, 12:13], tb.local_maps[:, 13:14]
+        i2v_flow_x, i2v_flow_y, i2v_deformation_mask = tb.local_maps[:, 14:15], tb.local_maps[:, 15:16], tb.local_maps[:, 16:17]
         edit_strength = torch.clamp(0.6 * changed + 0.4 * blend, 0.0, 1.0)
         edit_gate = torch.clamp(edit_strength * (1.0 - 0.95 * preservation), 0.0, 1.0)
         rgb_base = torch.clamp(tb.roi_before + 0.35 * out["rgb_residual"] * edit_gate, 0.0, 1.0)
@@ -204,6 +230,12 @@ class TorchLocalPatchGenerator:
             "reference_mask_mean": float(reference_mask.mean().item()),
             "material_gate_mean": float(material_gate.mean().item()),
             "suppressed_gate_mean": float(suppressed.mean().item()),
+            "i2v_motion_input_channels": I2V_MOTION_INPUT_CHANNELS,
+            "i2v_motion_tensor_used": self._i2v_tensor_used_torch(i2v_flow_x, i2v_flow_y, i2v_deformation_mask),
+            "i2v_motion_tensor_zero_fallback": bool(not self._i2v_tensor_used_torch(i2v_flow_x, i2v_flow_y, i2v_deformation_mask)),
+            "i2v_flow_x_mean": float(i2v_flow_x.mean().item()),
+            "i2v_flow_y_mean": float(i2v_flow_y.mean().item()),
+            "i2v_deformation_mask_mean": float(i2v_deformation_mask.mean().item()),
         }
 
     def infer(self, batch: "PatchBatch") -> dict[str, np.ndarray | float]:
@@ -214,7 +246,7 @@ class TorchLocalPatchGenerator:
         alpha = pred["alpha"][0, 0].cpu().numpy().astype(np.float32)
         uncertainty = pred["uncertainty"][0, 0].cpu().numpy().astype(np.float32)
         drift = float(np.mean(np.abs(rgb - batch.roi_before) * map_to_shape(batch.preservation_mask, alpha.shape, 0.0)))
-        return {"rgb": rgb, "alpha": alpha, "uncertainty": uncertainty, "confidence": float(np.clip(1.0 - float(np.mean(uncertainty)) - drift, 0.0, 1.0)), "residual_mean": float(np.mean(np.abs(rgb - batch.roi_before))), "alpha_mean": float(np.mean(alpha)), "uncertainty_mean": float(np.mean(uncertainty)), "preservation_drift": drift, "memory_cond_norm": float(np.linalg.norm(batch.memory_cond)), "appearance_cond_norm": float(np.linalg.norm(batch.appearance_cond)), "reference_tensor_input_channels": REFERENCE_TENSOR_INPUT_CHANNELS, "reference_tensor_input_used": bool(pred.get("reference_tensor_input_used", False)), "reference_tensor_zero_fallback": bool(pred.get("reference_tensor_zero_fallback", True)), "material_gate_mean": float(pred.get("material_gate_mean", 0.0)), "material_gate_max": float(pred.get("material_gate_max", 0.0)), "material_gate_cap": float(pred.get("material_gate_cap", MATERIAL_GATE_MAX)), "material_gate_suppressed_by_preservation": float(pred.get("material_gate_suppressed_by_preservation", 0.0)), "reference_validity_mean": float(pred.get("reference_validity_mean", 0.0)), "reference_mask_mean": float(pred.get("reference_mask_mean", 0.0))}
+        return {"rgb": rgb, "alpha": alpha, "uncertainty": uncertainty, "confidence": float(np.clip(1.0 - float(np.mean(uncertainty)) - drift, 0.0, 1.0)), "residual_mean": float(np.mean(np.abs(rgb - batch.roi_before))), "alpha_mean": float(np.mean(alpha)), "uncertainty_mean": float(np.mean(uncertainty)), "preservation_drift": drift, "memory_cond_norm": float(np.linalg.norm(batch.memory_cond)), "appearance_cond_norm": float(np.linalg.norm(batch.appearance_cond)), "reference_tensor_input_channels": REFERENCE_TENSOR_INPUT_CHANNELS, "reference_tensor_input_used": bool(pred.get("reference_tensor_input_used", False)), "reference_tensor_zero_fallback": bool(pred.get("reference_tensor_zero_fallback", True)), "material_gate_mean": float(pred.get("material_gate_mean", 0.0)), "material_gate_max": float(pred.get("material_gate_max", 0.0)), "material_gate_cap": float(pred.get("material_gate_cap", MATERIAL_GATE_MAX)), "material_gate_suppressed_by_preservation": float(pred.get("material_gate_suppressed_by_preservation", 0.0)), "reference_validity_mean": float(pred.get("reference_validity_mean", 0.0)), "reference_mask_mean": float(pred.get("reference_mask_mean", 0.0)), "i2v_motion_input_channels": float(pred.get("i2v_motion_input_channels", I2V_MOTION_INPUT_CHANNELS)), "i2v_motion_tensor_used": bool(pred.get("i2v_motion_tensor_used", False)), "i2v_motion_tensor_zero_fallback": bool(pred.get("i2v_motion_tensor_zero_fallback", True)), "i2v_flow_x_mean": float(pred.get("i2v_flow_x_mean", 0.0)), "i2v_flow_y_mean": float(pred.get("i2v_flow_y_mean", 0.0)), "i2v_deformation_mask_mean": float(pred.get("i2v_deformation_mask_mean", 0.0)), "i2v_motion_region_reconstruction_loss": float(pred.get("i2v_motion_region_reconstruction_loss", 0.0)), "i2v_motion_preservation_penalty": float(pred.get("i2v_motion_preservation_penalty", 0.0))}
 
     def train_step(self, batch: "PatchBatch", lr: float = 1e-4) -> dict[str, float]:
         for g in self.optim.param_groups:
@@ -224,6 +256,7 @@ class TorchLocalPatchGenerator:
         tb = pred["tb"]
         changed = tb.local_maps[:, 3:4]
         preservation = tb.local_maps[:, 6:7]
+        i2v_deformation_mask = tb.local_maps[:, 16:17]
         seam = tb.local_maps[:, 8:9]
         blend = tb.local_maps[:, 4:5]
         uncertainty_target, alpha_target = tb.local_maps[:, 7:8], tb.local_maps[:, 5:6]
@@ -243,6 +276,8 @@ class TorchLocalPatchGenerator:
         valid_scalar = torch.clamp(ref_validity.mean(), 0.0, 1.0)
         material_gate_area_penalty = torch.clamp(pred["material_gate"].mean() - 0.22, min=0.0) * valid_scalar
         material_gate_regularization = material_gate_preservation_penalty + material_gate_invalidity_penalty + material_gate_area_penalty
+        i2v_motion_region_reconstruction_loss = (((pred["rgb"] - tb.roi_after) ** 2) * i2v_deformation_mask).mean()
+        i2v_motion_preservation_penalty = (torch.abs(pred["rgb"] - tb.roi_before) * (1.0 - i2v_deformation_mask) * preservation).mean()
         total = (
             reconstruction_loss
             + 0.3 * alpha_loss
@@ -252,6 +287,8 @@ class TorchLocalPatchGenerator:
             + 0.1 * drift_penalty
             + 0.2 * material_consistency_loss
             + 0.1 * material_gate_regularization
+            + 0.15 * i2v_motion_region_reconstruction_loss
+            + 0.1 * i2v_motion_preservation_penalty
         )
         self.optim.zero_grad()
         total.backward()
@@ -279,6 +316,11 @@ class TorchLocalPatchGenerator:
             "reference_validity_mean": float(pred.get("reference_validity_mean", 0.0)),
             "reference_tensor_input_used": float(pred.get("reference_tensor_input_used", False)),
             "reference_tensor_zero_fallback": float(pred.get("reference_tensor_zero_fallback", True)),
+            "i2v_motion_region_reconstruction_loss": float(i2v_motion_region_reconstruction_loss.item()),
+            "i2v_motion_preservation_penalty": float(i2v_motion_preservation_penalty.item()),
+            "i2v_motion_input_channels": float(I2V_MOTION_INPUT_CHANNELS),
+            "i2v_motion_tensor_used": float(pred.get("i2v_motion_tensor_used", False)),
+            "i2v_motion_tensor_zero_fallback": float(pred.get("i2v_motion_tensor_zero_fallback", True)),
         }
 
     def eval_step(self, batch: "PatchBatch") -> dict[str, float]:
@@ -289,7 +331,10 @@ class TorchLocalPatchGenerator:
             mat_region = pred["reference_validity"] * pred["reference_mask"] * (1.0 - tb.local_maps[:, 6:7])
             mat_denom = torch.clamp(mat_region.sum(), min=1e-6)
             mat_consistency = (torch.abs(pred["rgb"] - tb.local_maps[:, 9:12]) * mat_region).sum() / (mat_denom * 3.0)
-            total = ((pred["rgb"] - tb.roi_after) ** 2).mean() + ((pred["alpha"] - tb.local_maps[:, 5:6]) ** 2).mean() + 0.2 * mat_consistency
+            i2v_deformation_mask = tb.local_maps[:, 16:17]
+            i2v_motion_region_reconstruction_loss = (((pred["rgb"] - tb.roi_after) ** 2) * i2v_deformation_mask).mean()
+            i2v_motion_preservation_penalty = (torch.abs(pred["rgb"] - tb.roi_before) * (1.0 - i2v_deformation_mask) * tb.local_maps[:, 6:7]).mean()
+            total = ((pred["rgb"] - tb.roi_after) ** 2).mean() + ((pred["alpha"] - tb.local_maps[:, 5:6]) ** 2).mean() + 0.2 * mat_consistency + 0.15 * i2v_motion_region_reconstruction_loss + 0.1 * i2v_motion_preservation_penalty
         return {
             "total_loss": float(total.item()),
             "alpha_mae": float(torch.abs(pred["alpha"] - tb.local_maps[:, 5:6]).mean().item()),
@@ -301,10 +346,15 @@ class TorchLocalPatchGenerator:
             "reference_validity_mean": float(pred.get("reference_validity_mean", 0.0)),
             "reference_mask_mean": float(pred.get("reference_mask_mean", 0.0)),
             "material_gate_suppressed_by_preservation": float(pred.get("material_gate_suppressed_by_preservation", 0.0)),
+            "i2v_motion_region_reconstruction_loss": float(i2v_motion_region_reconstruction_loss.item()),
+            "i2v_motion_preservation_penalty": float(i2v_motion_preservation_penalty.item()),
+            "i2v_motion_tensor_used": float(pred.get("i2v_motion_tensor_used", False)),
+            "i2v_motion_tensor_zero_fallback": float(pred.get("i2v_motion_tensor_zero_fallback", True)),
+            "i2v_deformation_mask_mean": float(pred.get("i2v_deformation_mask_mean", 0.0)),
         }
 
     def save(self, path: str) -> None:
-        torch.save({"state_dict": self.net.state_dict(), "local_input_channels": LOCAL_INPUT_CHANNELS, "reference_tensor_input_channels": REFERENCE_TENSOR_INPUT_CHANNELS}, str(path))
+        torch.save({"state_dict": self.net.state_dict(), "local_input_channels": LOCAL_INPUT_CHANNELS, "reference_tensor_input_channels": REFERENCE_TENSOR_INPUT_CHANNELS, "i2v_motion_input_channels": I2V_MOTION_INPUT_CHANNELS, "patch_batch_contract_version": "patch_batch_v3_i2v_motion_guidance"}, str(path))
 
     @classmethod
     def load(cls, path: str, device: str | None = None) -> "TorchLocalPatchGenerator":
@@ -313,7 +363,9 @@ class TorchLocalPatchGenerator:
         state = data.get("state_dict", data) if isinstance(data, dict) else data
         if not isinstance(state, dict):
             raise ValueError("torch local patch checkpoint missing state_dict")
-        upgraded = False
+        checkpoint_reference_channel_upgrade = False
+        checkpoint_i2v_motion_channel_upgrade = False
+        checkpoint_motion_channel_upgrade_from_9 = False
         current = inst.net.state_dict()
         load_state = dict(state)
         if "encoder.0.weight" in load_state:
@@ -322,15 +374,18 @@ class TorchLocalPatchGenerator:
             old_weight = load_state["stem.net.0.weight"]
             new_weight = current["stem.net.0.weight"].clone()
             if (
-                int(old_weight.shape[1]) == BASE_LOCAL_INPUT_CHANNELS
+                int(old_weight.shape[1]) in {BASE_LOCAL_INPUT_CHANNELS + REFERENCE_TENSOR_INPUT_CHANNELS, BASE_LOCAL_INPUT_CHANNELS}
                 and int(new_weight.shape[1]) == LOCAL_INPUT_CHANNELS
                 and old_weight.shape[0] == new_weight.shape[0]
                 and old_weight.shape[2:] == new_weight.shape[2:]
             ):
                 new_weight.zero_()
-                new_weight[:, :BASE_LOCAL_INPUT_CHANNELS, :, :] = old_weight
+                old_channels = int(old_weight.shape[1])
+                new_weight[:, :old_channels, :, :] = old_weight
                 load_state["stem.net.0.weight"] = new_weight
-                upgraded = True
+                checkpoint_reference_channel_upgrade = old_channels == BASE_LOCAL_INPUT_CHANNELS
+                checkpoint_i2v_motion_channel_upgrade = old_channels in {BASE_LOCAL_INPUT_CHANNELS + REFERENCE_TENSOR_INPUT_CHANNELS, BASE_LOCAL_INPUT_CHANNELS}
+                checkpoint_motion_channel_upgrade_from_9 = old_channels == BASE_LOCAL_INPUT_CHANNELS
             else:
                 raise ValueError(f"TorchLocalPatchGenerator checkpoint first conv input channel mismatch: checkpoint_shape={tuple(old_weight.shape)}, runtime_shape={tuple(new_weight.shape)}")
         incompatible = [(k, tuple(v.shape), tuple(current[k].shape)) for k, v in load_state.items() if k in current and tuple(v.shape) != tuple(current[k].shape)]
@@ -341,11 +396,14 @@ class TorchLocalPatchGenerator:
         if missing or unexpected:
             raise ValueError(f"TorchLocalPatchGenerator checkpoint key mismatch after reference-channel upgrade: missing={list(missing)}, unexpected={list(unexpected)}")
         inst.checkpoint_compatibility = {
-            "checkpoint_reference_channel_upgrade": bool(upgraded),
+            "checkpoint_reference_channel_upgrade": bool(checkpoint_reference_channel_upgrade),
+            "checkpoint_i2v_motion_channel_upgrade": bool(checkpoint_i2v_motion_channel_upgrade),
+            "checkpoint_motion_channel_upgrade_from_9": bool(checkpoint_motion_channel_upgrade_from_9),
             "checkpoint_local_input_channels": int(data.get("local_input_channels", BASE_LOCAL_INPUT_CHANNELS))
             if isinstance(data, dict)
             else BASE_LOCAL_INPUT_CHANNELS,
             "runtime_local_input_channels": LOCAL_INPUT_CHANNELS,
+            "patch_batch_contract_version": str(data.get("patch_batch_contract_version", "")) if isinstance(data, dict) else "",
             "missing_keys": list(missing),
             "unexpected_keys": list(unexpected),
         }

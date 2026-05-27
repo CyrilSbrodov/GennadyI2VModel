@@ -242,6 +242,21 @@ def test_i2v_motion_field_arm_raise_targets_arm_only() -> None:
     assert face.conditioning_summary["i2v_motion_field_targeted"] is False
 
 
+def test_i2v_dense_motion_tensor_shapes_and_zero_fallback() -> None:
+    arm = build_patch_batch(_i2v_request("p1:left_arm", "arm_raise"), np.full((16, 16, 3), 0.3, dtype=np.float32))
+    face = build_patch_batch(_i2v_request("p1:face", "arm_raise"), np.full((16, 16, 3), 0.3, dtype=np.float32))
+    assert arm.conditioning_summary["i2v_motion_input_channels"] == 3
+    assert arm.conditioning_summary["i2v_motion_tensor_used"] is True
+    assert arm.conditioning_summary["i2v_motion_tensor_zero_fallback"] is False
+    assert arm.i2v_deformation_mask is not None and arm.i2v_deformation_mask.shape == (16, 16, 1)
+    assert arm.i2v_flow_y is not None and float(np.max(np.abs(arm.i2v_flow_y))) > 0.0
+    assert face.conditioning_summary["i2v_motion_tensor_used"] is False
+    assert face.conditioning_summary["i2v_motion_tensor_zero_fallback"] is True
+    assert np.allclose(face.i2v_flow_x, 0.0)
+    assert np.allclose(face.i2v_flow_y, 0.0)
+    assert np.allclose(face.i2v_deformation_mask, 0.0)
+
+
 def test_i2v_head_turn_has_bounded_identity_motion() -> None:
     face = build_patch_batch(_i2v_request("p1:face", "head_turn"), np.full((16, 16, 3), 0.3, dtype=np.float32))
     assert face.conditioning_summary["i2v_motion_field_targeted"] is True
@@ -264,9 +279,15 @@ def test_i2v_motion_trace_reaches_output_metadata() -> None:
     batch = build_patch_batch(req, np.full((16, 16, 3), 0.3, dtype=np.float32))
     pred = {"rgb": batch.roi_after, "alpha": batch.alpha_target[..., 0], "uncertainty": batch.uncertainty_target[..., 0], "confidence": 0.8}
     out = output_from_prediction(req, pred, "learned_primary", {}, batch)
-    keys = {"i2v_motion_field_active", "i2v_motion_field_targeted", "i2v_motion_field_intensity", "i2v_deformation_mask_mean", "i2v_flow_x_mean", "i2v_flow_y_mean", "i2v_warp_amount"}
+    keys = {"i2v_motion_field_active", "i2v_motion_field_targeted", "i2v_motion_field_intensity", "i2v_deformation_mask_mean", "i2v_flow_x_mean", "i2v_flow_y_mean", "i2v_warp_amount", "i2v_motion_input_channels", "i2v_motion_tensor_used", "i2v_motion_tensor_zero_fallback", "i2v_motion_region_reconstruction_loss", "i2v_motion_preservation_penalty"}
     assert keys.issubset(out.execution_trace.keys())
     assert keys.issubset(out.metadata.keys())
+    assert out.execution_trace["i2v_motion_input_channels"] == 3
+    assert out.execution_trace["i2v_motion_tensor_used"] is True
+    assert out.execution_trace["i2v_motion_tensor_zero_fallback"] is False
+    assert out.metadata["i2v_motion_input_channels"] == 3
+    assert out.metadata["i2v_motion_tensor_used"] is True
+    assert out.metadata["i2v_motion_tensor_zero_fallback"] is False
 
 
 def test_i2v_non_targeted_action_does_not_change_profile_or_motion() -> None:
