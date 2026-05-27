@@ -6,6 +6,7 @@ from core.schema import BBox, GraphDelta, RegionRef, RuntimeSemanticTransition, 
 from core.semantic_roi import SemanticROIHelper
 from dynamics.model import FAMILIES, DynamicsModelContractError, DynamicsModelError, decode_prediction, featurize_runtime
 from dynamics.runtime_bundle import DynamicsRuntimeBundle
+from runtime.modes import normalize_runtime_mode, runtime_forbids_fallbacks
 from dynamics.transition_contracts import (
     ExpressionTransitionIntent,
     GarmentTransitionIntent,
@@ -72,13 +73,30 @@ class DynamicsMetrics:
 class GraphDeltaPredictor:
     """Пошаговый движок эволюции scene-state для single-image сценария."""
 
-    def __init__(self, *, strict_mode: bool = False, runtime_bundle: DynamicsRuntimeBundle | None = None, allow_random_init_for_dev: bool = False) -> None:
-        self.runtime_bundle = runtime_bundle or DynamicsRuntimeBundle(allow_random_init_for_dev=allow_random_init_for_dev)
-        self.runtime_bundle.load_checkpoint()
+    def __init__(self, *, strict_mode: bool = False, runtime_mode: str = "trainable_stub", checkpoint_path: str = "", strict_checkpoint: bool = False, runtime_bundle: DynamicsRuntimeBundle | None = None, allow_random_init_for_dev: bool = False) -> None:
+        self.runtime_mode = normalize_runtime_mode(runtime_mode)
+        fallback_forbidden = runtime_forbids_fallbacks(self.runtime_mode)
+        self.runtime_bundle = runtime_bundle or DynamicsRuntimeBundle(checkpoint_path=checkpoint_path, allow_random_init_for_dev=(allow_random_init_for_dev and not fallback_forbidden))
+        self._runtime_status = self.runtime_bundle.load_checkpoint()
         self.model = self.runtime_bundle.model
         self.roi = SemanticROIHelper()
         self.legacy_mode = False
-        self.strict_mode = strict_mode
+        self.strict_mode = strict_mode or strict_checkpoint or fallback_forbidden
+        if self.strict_mode and not self._runtime_status.usable_for_inference:
+            raise RuntimeError(f"strict learned dynamics runtime requires loadable checkpoint at init (status={self._runtime_status.checkpoint_status})")
+
+    def checkpoint_status(self) -> dict[str, object]:
+        status = self.runtime_bundle.runtime_status()
+        return {
+            "checkpoint_requested": bool(status.details.get("checkpoint_path")),
+            "checkpoint_status": status.checkpoint_status,
+            "usable_for_inference": status.usable_for_inference,
+            "fallback_forbidden": self.strict_mode,
+            "runtime_mode": self.runtime_mode,
+            "checkpoint_path": status.details.get("checkpoint_path", ""),
+            "error": status.details.get("error", ""),
+            "fallback_reason": status.fallback_reason,
+        }
 
     def _serialize_graph(self, scene_graph: SceneGraph) -> str:
         return f"f={scene_graph.frame_index};p={len(scene_graph.persons)};o={len(scene_graph.objects)};" + ";".join(sorted(p.person_id for p in scene_graph.persons))
@@ -116,6 +134,8 @@ class GraphDeltaPredictor:
         )
         runtime_status = self.runtime_bundle.runtime_status()
         if not runtime_status.usable_for_inference:
+            if self.strict_mode:
+                raise RuntimeError(f"strict learned dynamics runtime requires loadable checkpoint (status={runtime_status.checkpoint_status})")
             delta, metrics = self._predict_legacy(scene_graph, target_state, planner_context, memory)
             if "visibility_transition" in label_families and "visibility_transition" not in delta.semantic_reasons:
                 delta.semantic_reasons.append("visibility_transition")
@@ -128,6 +148,9 @@ class GraphDeltaPredictor:
                     "backend_status": "fallback_only" if runtime_status.checkpoint_status != "torch_unavailable" else "torch_unavailable",
                     "usable_for_inference": False,
                     "fallback_reason": runtime_status.fallback_reason,
+                    "runtime_mode": self.runtime_mode,
+                    "fallback_forbidden": self.strict_mode,
+                    "checkpoint_path": runtime_status.details.get("checkpoint_path", ""),
                     **family_resolution_diagnostics,
                 }
             )
@@ -150,6 +173,9 @@ class GraphDeltaPredictor:
                 "checkpoint_status": runtime_status.checkpoint_status,
                 "backend_status": "checkpoint_loaded",
                 "usable_for_inference": True,
+                "runtime_mode": self.runtime_mode,
+                "fallback_forbidden": self.strict_mode,
+                "checkpoint_path": runtime_status.details.get("checkpoint_path", ""),
                 **family_resolution_diagnostics,
                 "family_contribution": {
                     "pose": sum(abs(v) for v in delta.pose_deltas.values()),

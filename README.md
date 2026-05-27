@@ -319,3 +319,16 @@ Train on the resulting manifest the same way as runtime v2 exports:
 PYTHONPATH=src pytest tests/test_renderer_video_manifest_builder.py
 python -m training.cli --stage renderer --epochs 1 --learned-dataset-path artifacts/renderer_observed_pairs.json
 ```
+
+## Runtime readiness modes
+
+- `debug_stub`: допускает builtin/bootstrap/fallback пути; только для smoke/debug.
+- `trainable_stub`: trainable backend'ы могут стартовать с bootstrap весами без production-checkpoint, это **не** claim learned production runtime.
+- `strict_learned`: requires valid **explicit checkpoint paths** for dynamics + renderer patch + temporal; при missing/invalid/unloadable checkpoint runtime падает fail-fast без silent fallback.
+- `production_eval`: strict runtime policy for honest evaluation and also requires explicit checkpoint paths (silent fallback запрещен).
+
+### Checkpoint honesty contract
+
+- Если `runtime_mode` = `strict_learned` или `production_eval`, fallback forbidden (`fallback_forbidden=true`).
+- Отсутствие checkpoints означает отсутствие learned-runtime claim.
+- Bootstrap/legacy paths сохраняются только для `debug_stub`/`trainable_stub` и отмечаются в metadata как fallback/bootstrap.

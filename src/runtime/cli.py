@@ -10,7 +10,10 @@ from runtime.orchestrator import GennadyEngine
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the Gennady image-to-video scene engine demo.")
+    parser.add_argument("--runtime-mode", default="trainable_stub", choices=["debug_stub","trainable_stub","strict_learned","production_eval"], help="Runtime readiness mode.")
+    parser.add_argument("--dynamics-checkpoint-path", default="", help="Dynamics checkpoint file.")
     parser.add_argument("--patch-checkpoint-path", default="", help="Renderer patch checkpoint JSON to load for runtime inference.")
+    parser.add_argument("--temporal-checkpoint-path", default="", help="Temporal checkpoint file.")
     parser.add_argument("--patch-strict-mode", action="store_true", help="Raise renderer inference errors instead of using legacy runtime fallback.")
     parser.add_argument(
         "--allow-patch-checkpoint-fallback",
@@ -25,7 +28,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def backend_config_from_args(args: argparse.Namespace) -> BackendConfig:
     return BackendConfig(
+        runtime_mode=str(args.runtime_mode),
+        dynamics_checkpoint_path=str(args.dynamics_checkpoint_path or ""),
         patch_checkpoint_path=str(args.patch_checkpoint_path or ""),
+        temporal_checkpoint_path=str(args.temporal_checkpoint_path or ""),
+        dynamics_strict_checkpoint=str(args.runtime_mode) in {"strict_learned","production_eval"},
+        temporal_strict_checkpoint=str(args.runtime_mode) in {"strict_learned","production_eval"},
         patch_strict_mode=bool(args.patch_strict_mode),
         patch_strict_checkpoint=not bool(args.allow_patch_checkpoint_fallback),
     )

@@ -1265,8 +1265,35 @@ class GennadyEngine:
                     "source_mode": "image_grounded" if first_frame else "debug_fallback",
                 },
                 "learned_ready": {
+                    "runtime_mode": str(self.backends.backend_names.get("runtime_mode", "trainable_stub")),
+                    "strict_runtime": bool(self.backends.backend_names.get("fallback_forbidden", False)),
+                    "fallback_forbidden": bool(self.backends.backend_names.get("fallback_forbidden", False)),
                     "backend_selection": self.backends.backend_names,
                     "backend_config": asdict(self.backend_config),
+                    "dynamics_readiness": self.backends.dynamics_backend.checkpoint_status() if hasattr(self.backends.dynamics_backend, "checkpoint_status") else {},
+                    "patch_readiness": self.backends.patch_backend.checkpoint_status() if hasattr(self.backends.patch_backend, "checkpoint_status") else {},
+                    "temporal_readiness": self.backends.temporal_backend.checkpoint_status() if hasattr(self.backends.temporal_backend, "checkpoint_status") else {},
+                    "any_fallback_used": bool(
+                        fallback_log
+                        or (
+                            hasattr(self.backends.dynamics_backend, "checkpoint_status")
+                            and not bool((self.backends.dynamics_backend.checkpoint_status() or {}).get("usable_for_inference", True))
+                        )
+                        or (
+                            hasattr(self.backends.patch_backend, "checkpoint_status")
+                            and (
+                                not bool((self.backends.patch_backend.checkpoint_status() or {}).get("checkpoint_loaded", True))
+                                or bool((self.backends.patch_backend.checkpoint_status() or {}).get("fallback_used", False))
+                                or bool((self.backends.patch_backend.checkpoint_status() or {}).get("checkpoint_fallback_used", False))
+                            )
+                        )
+                        or (
+                            str(self.backends.backend_names.get("temporal_backend", "")) in {"trainable_temporal", "learned_primary"}
+                            and hasattr(self.backends.temporal_backend, "checkpoint_status")
+                            and not bool((self.backends.temporal_backend.checkpoint_status() or {}).get("temporal_checkpoint_loaded", True))
+                        )
+                    ),
+                    "fallback_violations": list(fallback_log) if bool(self.backends.backend_names.get("fallback_forbidden", False)) else [],
                     "graph_encoder_used": True,
                     "identity_encoder_used": True,
                     "graph_encoding_confidence": graph_encoding.confidence,

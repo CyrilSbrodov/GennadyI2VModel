@@ -24,10 +24,13 @@ class TransitionPrediction:
 class LearnedDynamicsTransitionModel(DynamicsTransitionModel):
     """Primary runtime dynamics backend: learned graph-delta predictor."""
 
-    def __init__(self, *, strict_mode: bool = False) -> None:
-        self.predictor = GraphDeltaPredictor(strict_mode=strict_mode)
+    def __init__(self, *, strict_mode: bool = False, runtime_mode: str = "trainable_stub", checkpoint_path: str = "", strict_checkpoint: bool = False) -> None:
+        self.predictor = GraphDeltaPredictor(strict_mode=strict_mode, runtime_mode=runtime_mode, checkpoint_path=checkpoint_path, strict_checkpoint=strict_checkpoint)
         self.temporal_transition_encoder = TemporalTransitionEncoder()
         self.human_state_transition_model = HumanStateTransitionModel()
+
+    def checkpoint_status(self) -> dict[str, object]:
+        return self.predictor.checkpoint_status()
 
     @staticmethod
     def _transition_feature_vector(graph_state: SceneGraph, delta: GraphDelta, step_index: int) -> list[float]:
@@ -225,8 +228,8 @@ class LearnedDynamicsTransitionModel(DynamicsTransitionModel):
 class LegacyHeuristicDynamicsTransitionModel(DynamicsTransitionModel):
     """Explicit legacy fallback backend for debug only."""
 
-    def __init__(self, *, strict_mode: bool = False) -> None:
-        self.predictor = GraphDeltaPredictor(strict_mode=strict_mode)
+    def __init__(self, *, strict_mode: bool = False, runtime_mode: str = "trainable_stub", checkpoint_path: str = "", strict_checkpoint: bool = False) -> None:
+        self.predictor = GraphDeltaPredictor(strict_mode=strict_mode, runtime_mode=runtime_mode, checkpoint_path=checkpoint_path, strict_checkpoint=strict_checkpoint)
 
     def predict_transition(self, request: DynamicsTransitionRequest) -> DynamicsTransitionOutput:
         labels = request.text_action_summary.structured_action_tokens or ["micro_adjust"]

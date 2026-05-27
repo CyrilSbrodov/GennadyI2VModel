@@ -34,10 +34,11 @@ class DynamicsRuntimeStatus:
 class DynamicsRuntimeBundle:
     """Centralized runtime/readiness policy for dynamics learned backend."""
 
-    def __init__(self, *, checkpoint_dir: str = "artifacts/checkpoints/dynamics", checkpoint_file: str = "dynamics_weights.json", allow_random_init_for_dev: bool = False) -> None:
+    def __init__(self, *, checkpoint_dir: str = "artifacts/checkpoints/dynamics", checkpoint_file: str = "dynamics_weights.json", checkpoint_path: str = "", allow_random_init_for_dev: bool = False) -> None:
         self.checkpoint_dir = checkpoint_dir
         self.checkpoint_file = checkpoint_file
         self.allow_random_init_for_dev = allow_random_init_for_dev
+        self.checkpoint_path = checkpoint_path
         self.torch_available = torch is not None
         self.model = DynamicsModel()
         self.checkpoint_status: DynamicsCheckpointStatus = "torch_unavailable" if not self.torch_available else "bootstrap_only"
@@ -54,6 +55,7 @@ class DynamicsRuntimeBundle:
                 **self.checkpoint_details,
                 "checkpoint_dir": self.checkpoint_dir,
                 "checkpoint_file": str(Path(self.checkpoint_dir) / self.checkpoint_file),
+                "checkpoint_path": self.checkpoint_path,
                 "allow_random_init_for_dev": self.allow_random_init_for_dev,
                 "torch_available": self.torch_available,
             },
@@ -64,12 +66,12 @@ class DynamicsRuntimeBundle:
             self.checkpoint_status = "torch_unavailable"
             self.checkpoint_details = {"reason": "torch_unavailable"}
             return self.runtime_status()
-        root = Path(self.checkpoint_dir)
+        path = Path(self.checkpoint_path) if self.checkpoint_path else Path(self.checkpoint_dir) / self.checkpoint_file
+        root = path.parent
         if not root.exists():
             self.checkpoint_status = "checkpoint_directory_missing"
             self.checkpoint_details = {"reason": "checkpoint_directory_missing"}
             return self.runtime_status()
-        path = root / self.checkpoint_file
         if not path.exists():
             self.checkpoint_status = "checkpoint_file_missing"
             self.checkpoint_details = {"reason": "checkpoint_file_missing"}
@@ -87,9 +89,9 @@ class DynamicsRuntimeBundle:
     def save_checkpoint(self) -> str:
         if not self.torch_available:
             raise DynamicsModelError("torch_unavailable")
-        root = Path(self.checkpoint_dir)
+        path = Path(self.checkpoint_path) if self.checkpoint_path else Path(self.checkpoint_dir) / self.checkpoint_file
+        root = path.parent
         root.mkdir(parents=True, exist_ok=True)
-        path = root / self.checkpoint_file
         self.model.save(str(path))
         self.checkpoint_status = "checkpoint_loaded"
         self.checkpoint_details = {"reason": "checkpoint_saved", "path": str(path)}

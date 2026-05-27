@@ -67,10 +67,42 @@ class TrainableTemporalConsistencyBackend(TemporalConsistencyModel):
         model: TrainableTemporalConsistencyModel | None = None,
         fallback: LegacyBaselineTemporalConsistencyModel | None = None,
         strict_mode: bool = False,
+        checkpoint_path: str = "",
+        checkpoint_requested: bool = False,
+        checkpoint_loaded: bool = False,
+        checkpoint_load_error: str = "",
     ) -> None:
         self.model = model or TrainableTemporalConsistencyModel()
         self.fallback = fallback or LegacyBaselineTemporalConsistencyModel()
         self.strict_mode = strict_mode
+        self.checkpoint_path = checkpoint_path
+        self.checkpoint_requested = checkpoint_requested
+        self.checkpoint_loaded = checkpoint_loaded
+        self.checkpoint_load_error = checkpoint_load_error
+
+    @classmethod
+    def from_checkpoint_policy(cls, *, checkpoint_path: str, strict_checkpoint: bool, strict_mode: bool) -> "TrainableTemporalConsistencyBackend":
+        if checkpoint_path:
+            try:
+                model = TrainableTemporalConsistencyModel.load(checkpoint_path)
+                return cls(model=model, strict_mode=strict_mode, checkpoint_path=checkpoint_path, checkpoint_requested=True, checkpoint_loaded=True)
+            except Exception as exc:
+                if strict_checkpoint:
+                    raise RuntimeError(f"strict learned temporal runtime requires valid checkpoint: {checkpoint_path}; error={exc}") from exc
+                return cls(strict_mode=strict_mode, checkpoint_path=checkpoint_path, checkpoint_requested=True, checkpoint_loaded=False, checkpoint_load_error=str(exc))
+        if strict_checkpoint:
+            raise RuntimeError("strict learned temporal runtime requires temporal checkpoint")
+        return cls(strict_mode=strict_mode, checkpoint_requested=False, checkpoint_loaded=False)
+
+    def checkpoint_status(self) -> dict[str, object]:
+        return {
+            "temporal_checkpoint_requested": self.checkpoint_requested,
+            "temporal_checkpoint_path": self.checkpoint_path,
+            "temporal_checkpoint_loaded": self.checkpoint_loaded,
+            "temporal_checkpoint_load_error": self.checkpoint_load_error,
+            "temporal_runtime_loadable": self.checkpoint_loaded,
+            "temporal_model_family": "trainable_temporal_checkpoint" if self.checkpoint_loaded else "trainable_temporal_bootstrap",
+        }
 
     def refine_temporal(self, request: TemporalRefinementRequest) -> TemporalRefinementOutput:
         try:
@@ -80,10 +112,12 @@ class TrainableTemporalConsistencyBackend(TemporalConsistencyModel):
             return output_from_temporal_prediction(
                 request,
                 pred,
-                temporal_path="learned_primary",
+                temporal_path="learned_primary" if self.checkpoint_loaded else "trainable_stub",
                 metadata={
                     "fallback_used": False,
+                    "bootstrap_used": not self.checkpoint_loaded,
                     "strict_mode": self.strict_mode,
+                    **self.checkpoint_status(),
                     "history_used": history_frame is not None,
                     "conditioning": {
                         "transition_cond_mean": float(batch.transition_cond.mean()),
@@ -106,6 +140,7 @@ class TrainableTemporalConsistencyBackend(TemporalConsistencyModel):
                     "fallback_reason": type(err).__name__,
                     "fallback_message": str(err),
                     "strict_mode": self.strict_mode,
+                    **self.checkpoint_status(),
                 }
             )
             usage = dict(fb.metadata.get("learned_ready_usage", {}))
