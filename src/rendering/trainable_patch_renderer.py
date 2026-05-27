@@ -79,6 +79,78 @@ def _i2v_action_targets_region(action_phase: str, region_type: str, region_actio
         return False
     return region_type in ACTION_PHASE_TARGETS.get(phase, set())
 
+
+def _warp_roi_nearest(roi: np.ndarray, flow_x: np.ndarray, flow_y: np.ndarray, amount: float) -> np.ndarray:
+    h, w, c = roi.shape
+    if h <= 0 or w <= 0 or c != 3 or amount <= 1e-6:
+        return np.clip(roi, 0.0, 1.0).astype(np.float32)
+    ys = np.arange(h, dtype=np.float32)[:, None]
+    xs = np.arange(w, dtype=np.float32)[None, :]
+    sample_x = np.clip(np.rint(xs - flow_x.astype(np.float32) * float(amount) * max(w - 1, 1)), 0, max(w - 1, 0)).astype(np.int32)
+    sample_y = np.clip(np.rint(ys - flow_y.astype(np.float32) * float(amount) * max(h - 1, 1)), 0, max(h - 1, 0)).astype(np.int32)
+    warped = roi[sample_y, sample_x]
+    return np.clip(warped, 0.0, 1.0).astype(np.float32)
+
+
+def _i2v_action_motion_field(
+    h: int,
+    w: int,
+    region_type: str,
+    geometry: dict[str, np.ndarray],
+    i2v_action_cond: dict[str, object] | None,
+) -> dict[str, np.ndarray | float | bool | str]:
+    zeros = np.zeros((h, w), dtype=np.float32)
+    cond = i2v_action_cond if isinstance(i2v_action_cond, dict) else {}
+    phase = str(cond.get("i2v_action_phase", "stable_idle")).strip().lower()
+    mode = str(cond.get("i2v_region_action_mode", "")).strip().lower()
+    targeted = _i2v_action_targets_region(phase, region_type, mode)
+    intensity = float(np.clip(_safe_float(cond.get("i2v_action_strength"), 0.0), 0.0, 1.0))
+    if not targeted:
+        return {"active": False, "action_phase": phase, "targeted": False, "flow_x": zeros, "flow_y": zeros, "deformation_mask": zeros, "intensity": intensity}
+
+    lateral = np.clip(geometry.get("lateral", zeros), 0.0, 1.0)
+    center = np.clip(geometry.get("center", zeros), 0.0, 1.0)
+    upper_band = np.clip(geometry.get("upper_band", zeros), 0.0, 1.0)
+    lower_band = np.clip(geometry.get("lower_band", zeros), 0.0, 1.0)
+    expr = np.clip(geometry.get("expression_hotspot", zeros), 0.0, 1.0)
+    surface = np.clip(geometry.get("surface_band", zeros), 0.0, 1.0)
+    split = np.clip(geometry.get("vertical_split", zeros), 0.0, 1.0)
+    flow_x = zeros.copy()
+    flow_y = zeros.copy()
+    deform = zeros.copy()
+
+    if phase == "head_turn":
+        flow_x = (0.20 * lateral + 0.10 * center).astype(np.float32)
+        deform = (0.20 * lateral + 0.08 * center).astype(np.float32)
+    elif phase == "expression_smile":
+        smile_hot = np.clip(0.75 * expr + 0.25 * lower_band, 0.0, 1.0)
+        flow_y = (-0.22 * smile_hot).astype(np.float32)
+        flow_x = (0.08 * lateral * smile_hot).astype(np.float32)
+        deform = (0.42 * smile_hot).astype(np.float32)
+    elif phase == "arm_raise":
+        arm_band = np.clip(0.62 * upper_band + 0.38 * lateral, 0.0, 1.0)
+        flow_y = (-0.55 * arm_band).astype(np.float32)
+        deform = (0.58 * arm_band).astype(np.float32)
+    elif phase == "torso_shift":
+        torso_band = np.clip(0.70 * surface + 0.30 * lateral, 0.0, 1.0)
+        flow_x = (0.24 * torso_band).astype(np.float32)
+        deform = (0.34 * torso_band).astype(np.float32)
+    elif phase == "garment_reveal_or_adjust":
+        g = np.clip(0.58 * split + 0.42 * surface, 0.0, 1.0)
+        flow_y = (-0.30 * g).astype(np.float32)
+        flow_x = (0.12 * lateral * g).astype(np.float32)
+        deform = (0.52 * g).astype(np.float32)
+
+    return {
+        "active": True,
+        "action_phase": phase,
+        "targeted": True,
+        "flow_x": np.clip(flow_x, -1.0, 1.0).astype(np.float32),
+        "flow_y": np.clip(flow_y, -1.0, 1.0).astype(np.float32),
+        "deformation_mask": np.clip(deform, 0.0, 1.0).astype(np.float32),
+        "intensity": intensity,
+    }
+
 ROI_FAMILIES = {
     "face_expression": {"face", "head", "mouth", "eyes", "cheek", "neck", "hair"},
     "torso_reveal": {"torso", "inner_garment", "innerwear", "chest", "pelvis"},
@@ -1981,6 +2053,7 @@ def _bootstrap_roi_after(
     action_strength = _safe_float(i2v_action_cond.get("i2v_action_strength"), 0.2)
     region_action_mode = str(i2v_action_cond.get("i2v_region_action_mode", "")).strip().lower()
     action_targeted = _i2v_action_targets_region(action_phase, region_type, region_action_mode)
+    motion = _i2v_action_motion_field(roi_before.shape[0], roi_before.shape[1], region_type, geometry, i2v_action_cond)
     if action_targeted and action_phase == "head_turn":
         tone = np.array([0.025, 0.018, 0.012], dtype=np.float32) * (0.6 + 0.4 * action_strength)
         local = 0.72 * geometry["lateral"] + 0.28 * geometry["center"]
@@ -2027,6 +2100,15 @@ def _bootstrap_roi_after(
         support = np.clip(validity[..., 0] * changed * np.clip(local, 0.0, 1.0), 0.0, 1.0)
         material_mix = support * (0.06 + 0.10 * profile.preservation_strength)
         after = np.clip(after * (1.0 - material_mix[..., None]) + reference_rgb * material_mix[..., None], 0.0, 1.0)
+    if bool(motion.get("targeted", False)):
+        identity_sensitive = region_type in IDENTITY_SENSITIVE_REGIONS
+        max_amount = 0.09 if identity_sensitive else 0.26
+        warp_amount = float(np.clip((0.02 + 0.20 * float(motion["intensity"])) * (0.7 + 0.3 * profile.edit_strength), 0.0, max_amount))
+        warped = _warp_roi_nearest(roi_before, motion["flow_x"], motion["flow_y"], warp_amount)
+        deform = np.clip(motion["deformation_mask"] * changed, 0.0, 1.0)
+        preserve_gate = 1.0 - np.clip(profile.preservation_strength * (0.82 if identity_sensitive else 0.55), 0.0, 0.95)
+        mix = np.clip(deform * preserve_gate, 0.0, 0.35 if identity_sensitive else 0.62)
+        after = np.clip(after * (1.0 - mix[..., None]) + warped * mix[..., None], 0.0, 1.0)
     return after.astype(np.float32)
 
 
@@ -2041,7 +2123,7 @@ def _build_targets(
     reference_rgb: np.ndarray | None = None,
     reference_validity: np.ndarray | None = None,
     i2v_action_cond: dict[str, object] | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, object]]:
     h, w, _ = roi_before.shape
     geometry = _geometry_priors(h, w, region_type, profile)
     changed_mask, blend_hint, alpha_target, uncertainty_target, preservation_mask, seam_prior = _compose_region_priors(
@@ -2069,6 +2151,10 @@ def _build_targets(
         elif action_targeted and action_phase == "garment_reveal_or_adjust":
             changed_mask = np.clip(changed_mask + 0.2 * geometry["vertical_split"][..., None] * gain, 0.0, 1.0)
             blend_hint = np.clip(blend_hint + 0.2 * geometry["surface_band"][..., None] * gain, 0.0, 1.0)
+    motion = _i2v_action_motion_field(h, w, region_type, geometry, i2v_action_cond)
+    identity_sensitive = region_type in IDENTITY_SENSITIVE_REGIONS
+    max_amount = 0.09 if identity_sensitive else 0.26
+    warp_amount = float(np.clip((0.02 + 0.20 * float(motion.get("intensity", 0.0))) * (0.7 + 0.3 * profile.edit_strength), 0.0, max_amount)) if bool(motion.get("targeted", False)) else 0.0
     roi_after = _bootstrap_roi_after(
         roi_before,
         profile,
@@ -2081,7 +2167,16 @@ def _build_targets(
         region_type=region_type,
         i2v_action_cond=i2v_action_cond,
     )
-    return roi_after, changed_mask, blend_hint, alpha_target, uncertainty_target, preservation_mask, seam_prior
+    motion_trace = {
+        "i2v_motion_field_active": bool(motion.get("active", False)),
+        "i2v_motion_field_targeted": bool(motion.get("targeted", False)),
+        "i2v_motion_field_intensity": float(motion.get("intensity", 0.0) or 0.0),
+        "i2v_deformation_mask_mean": float(np.mean(motion.get("deformation_mask", np.zeros((h, w), dtype=np.float32)))),
+        "i2v_flow_x_mean": float(np.mean(motion.get("flow_x", np.zeros((h, w), dtype=np.float32)))),
+        "i2v_flow_y_mean": float(np.mean(motion.get("flow_y", np.zeros((h, w), dtype=np.float32)))),
+        "i2v_warp_amount": warp_amount,
+    }
+    return roi_after, changed_mask, blend_hint, alpha_target, uncertainty_target, preservation_mask, seam_prior, motion_trace
 
 
 def summarize_patch_batch(batch: PatchBatch) -> dict[str, object]:
@@ -2183,6 +2278,13 @@ def summarize_patch_batch(batch: PatchBatch) -> dict[str, object]:
         "i2v_expression_bias": _safe_float(batch.conditioning_summary.get("i2v_expression_bias")),
         "i2v_pose_bias": _safe_float(batch.conditioning_summary.get("i2v_pose_bias")),
         "i2v_garment_bias": _safe_float(batch.conditioning_summary.get("i2v_garment_bias")),
+        "i2v_motion_field_active": bool(batch.conditioning_summary.get("i2v_motion_field_active", False)),
+        "i2v_motion_field_targeted": bool(batch.conditioning_summary.get("i2v_motion_field_targeted", False)),
+        "i2v_motion_field_intensity": _safe_float(batch.conditioning_summary.get("i2v_motion_field_intensity")),
+        "i2v_deformation_mask_mean": _safe_float(batch.conditioning_summary.get("i2v_deformation_mask_mean")),
+        "i2v_flow_x_mean": _safe_float(batch.conditioning_summary.get("i2v_flow_x_mean")),
+        "i2v_flow_y_mean": _safe_float(batch.conditioning_summary.get("i2v_flow_y_mean")),
+        "i2v_warp_amount": _safe_float(batch.conditioning_summary.get("i2v_warp_amount")),
     }
 
 
@@ -2233,7 +2335,7 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
         ],
         dtype=np.float32,
     )
-    roi_after, changed_mask, blend_hint, alpha_target, uncertainty_target, preservation_mask, seam_prior = _build_targets(
+    roi_after, changed_mask, blend_hint, alpha_target, uncertainty_target, preservation_mask, seam_prior, motion_trace = _build_targets(
         roi_before,
         profile,
         delta_cond,
@@ -2343,6 +2445,7 @@ def build_patch_batch(request: PatchSynthesisRequest, roi_before: np.ndarray) ->
         "source_node_type": metadata_cond["source_node_type"],
         "mask_kind": metadata_cond["mask_kind"],
         **i2v_action_cond,
+        **motion_trace,
         "i2v_region_id": request.region.region_id,
     }
     return PatchBatch(
@@ -2519,6 +2622,13 @@ def output_from_prediction(
         "i2v_expression_bias": _safe_float(conditioning_summary.get("i2v_expression_bias")),
         "i2v_pose_bias": _safe_float(conditioning_summary.get("i2v_pose_bias")),
         "i2v_garment_bias": _safe_float(conditioning_summary.get("i2v_garment_bias")),
+        "i2v_motion_field_active": bool(conditioning_summary.get("i2v_motion_field_active", False)),
+        "i2v_motion_field_targeted": bool(conditioning_summary.get("i2v_motion_field_targeted", False)),
+        "i2v_motion_field_intensity": _safe_float(conditioning_summary.get("i2v_motion_field_intensity")),
+        "i2v_deformation_mask_mean": _safe_float(conditioning_summary.get("i2v_deformation_mask_mean")),
+        "i2v_flow_x_mean": _safe_float(conditioning_summary.get("i2v_flow_x_mean")),
+        "i2v_flow_y_mean": _safe_float(conditioning_summary.get("i2v_flow_y_mean")),
+        "i2v_warp_amount": _safe_float(conditioning_summary.get("i2v_warp_amount")),
         "alpha_semantics": "blend_probability_for_true_changed_region_with_seam_support",
         "uncertainty_semantics": "local_synthesis_ambiguity_map_for_compositor_and_confidence",
         "confidence_semantics": "patch_reliability_summary_after_preservation_and_ambiguity_checks",

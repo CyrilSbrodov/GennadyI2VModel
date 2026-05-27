@@ -134,6 +134,15 @@ def _i2v_request(region_id: str, phase: str) -> PatchSynthesisRequest:
     )
 
 
+def _gradient_roi(h: int = 16, w: int = 16) -> np.ndarray:
+    yy, xx = np.meshgrid(
+        np.linspace(0.0, 1.0, h, dtype=np.float32),
+        np.linspace(0.0, 1.0, w, dtype=np.float32),
+        indexing="ij",
+    )
+    return np.stack([xx, yy, 0.5 * xx + 0.5 * yy], axis=2).astype(np.float32)
+
+
 def test_i2v_head_turn_face_batch_exposes_phase_and_nonzero_masks() -> None:
     req = _i2v_request("p1:face", "head_turn")
     batch = build_patch_batch(req, np.full((16, 16, 3), 0.3, dtype=np.float32))
@@ -211,9 +220,93 @@ def test_i2v_garment_phase_traces_output_and_reference_fallback() -> None:
         "i2v_expression_bias",
         "i2v_pose_bias",
         "i2v_garment_bias",
+        "i2v_motion_field_active",
+        "i2v_motion_field_targeted",
+        "i2v_motion_field_intensity",
+        "i2v_deformation_mask_mean",
+        "i2v_flow_x_mean",
+        "i2v_flow_y_mean",
+        "i2v_warp_amount",
     }
     assert out.execution_trace["i2v_action_phase"] == "garment_reveal_or_adjust"
     assert out.metadata["i2v_action_phase"] == "garment_reveal_or_adjust"
     assert expected_fields.issubset(set(out.execution_trace.keys()))
     assert expected_fields.issubset(set(out.metadata.keys()))
     assert "reference_tensor_zero_fallback" in out.execution_trace
+
+
+def test_i2v_motion_field_arm_raise_targets_arm_only() -> None:
+    arm = build_patch_batch(_i2v_request("p1:left_arm", "arm_raise"), np.full((16, 16, 3), 0.3, dtype=np.float32))
+    face = build_patch_batch(_i2v_request("p1:face", "arm_raise"), np.full((16, 16, 3), 0.3, dtype=np.float32))
+    assert arm.conditioning_summary["i2v_motion_field_targeted"] is True
+    assert face.conditioning_summary["i2v_motion_field_targeted"] is False
+
+
+def test_i2v_head_turn_has_bounded_identity_motion() -> None:
+    face = build_patch_batch(_i2v_request("p1:face", "head_turn"), np.full((16, 16, 3), 0.3, dtype=np.float32))
+    assert face.conditioning_summary["i2v_motion_field_targeted"] is True
+    assert float(face.conditioning_summary["i2v_warp_amount"]) > 0.0
+    assert float(face.conditioning_summary["preservation_strength"]) >= 0.90
+
+
+def test_i2v_expression_smile_changes_lower_face_more_than_idle() -> None:
+    idle = build_patch_batch(_i2v_request("p1:face", "stable_idle"), np.full((16, 16, 3), 0.3, dtype=np.float32))
+    smile = build_patch_batch(_i2v_request("p1:face", "expression_smile"), np.full((16, 16, 3), 0.3, dtype=np.float32))
+    h = smile.roi_before.shape[0]
+    lower = slice(h // 2, h)
+    idle_delta = float(np.mean(np.abs(idle.roi_after[lower, :, :] - idle.roi_before[lower, :, :])))
+    smile_delta = float(np.mean(np.abs(smile.roi_after[lower, :, :] - smile.roi_before[lower, :, :])))
+    assert smile_delta > idle_delta
+
+
+def test_i2v_motion_trace_reaches_output_metadata() -> None:
+    req = _i2v_request("p1:left_arm", "arm_raise")
+    batch = build_patch_batch(req, np.full((16, 16, 3), 0.3, dtype=np.float32))
+    pred = {"rgb": batch.roi_after, "alpha": batch.alpha_target[..., 0], "uncertainty": batch.uncertainty_target[..., 0], "confidence": 0.8}
+    out = output_from_prediction(req, pred, "learned_primary", {}, batch)
+    keys = {"i2v_motion_field_active", "i2v_motion_field_targeted", "i2v_motion_field_intensity", "i2v_deformation_mask_mean", "i2v_flow_x_mean", "i2v_flow_y_mean", "i2v_warp_amount"}
+    assert keys.issubset(out.execution_trace.keys())
+    assert keys.issubset(out.metadata.keys())
+
+
+def test_i2v_non_targeted_action_does_not_change_profile_or_motion() -> None:
+    idle = build_patch_batch(_i2v_request("p1:face", "stable_idle"), np.full((16, 16, 3), 0.3, dtype=np.float32))
+    face_arm_raise = build_patch_batch(_i2v_request("p1:face", "arm_raise"), np.full((16, 16, 3), 0.3, dtype=np.float32))
+    assert abs(float(face_arm_raise.conditioning_summary["edit_strength"]) - float(idle.conditioning_summary["edit_strength"])) <= 0.02
+    assert abs(float(np.mean(face_arm_raise.changed_mask)) - float(np.mean(idle.changed_mask))) <= 0.02
+    roi_delta = float(np.mean(np.abs(face_arm_raise.roi_after - idle.roi_after)))
+    assert roi_delta <= 0.02
+    assert face_arm_raise.conditioning_summary["i2v_motion_field_targeted"] is False
+
+
+def test_i2v_head_turn_warp_changes_non_uniform_face_spatial_content() -> None:
+    before = _gradient_roi(16, 16)
+    idle = build_patch_batch(_i2v_request("p1:face", "stable_idle"), before)
+    batch = build_patch_batch(_i2v_request("p1:face", "head_turn"), before)
+    assert batch.conditioning_summary["i2v_motion_field_targeted"] is True
+    assert float(batch.conditioning_summary["i2v_warp_amount"]) > 0.0
+    assert float(np.mean(np.abs(batch.roi_after - before))) > 0.001
+    assert float(batch.conditioning_summary["preservation_strength"]) >= 0.90
+    assert float(np.mean(batch.changed_mask)) > 0.0
+    assert float(np.mean(batch.changed_mask)) > float(np.mean(idle.changed_mask))
+
+
+def test_i2v_arm_raise_warp_changes_non_uniform_arm_more_than_idle() -> None:
+    before = _gradient_roi(16, 16)
+    idle = build_patch_batch(_i2v_request("p1:left_arm", "stable_idle"), before)
+    raised = build_patch_batch(_i2v_request("p1:left_arm", "arm_raise"), before)
+    assert raised.conditioning_summary["i2v_motion_field_targeted"] is True
+    assert float(raised.conditioning_summary["i2v_warp_amount"]) > 0.0
+    raised_delta = float(np.mean(np.abs(raised.roi_after - before)))
+    idle_delta = float(np.mean(np.abs(idle.roi_after - before)))
+    assert raised_delta > idle_delta
+    assert float(np.mean(np.abs(raised.roi_after - idle.roi_after))) > 0.001
+
+
+def test_i2v_non_targeted_action_has_zero_warp_on_gradient_roi() -> None:
+    before = _gradient_roi(16, 16)
+    face_arm_raise = build_patch_batch(_i2v_request("p1:face", "arm_raise"), before)
+    face_idle = build_patch_batch(_i2v_request("p1:face", "stable_idle"), before)
+    assert face_arm_raise.conditioning_summary["i2v_motion_field_targeted"] is False
+    assert float(face_arm_raise.conditioning_summary["i2v_warp_amount"]) == 0.0
+    assert float(np.mean(np.abs(face_arm_raise.roi_after - face_idle.roi_after))) <= 0.02
