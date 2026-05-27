@@ -88,11 +88,11 @@ def _safe_mean(values: list[float]) -> float:
 def _backend_config_for_mode(mode: str) -> BackendConfig:
     normalized = mode.strip().lower()
     if normalized in {"learned_primary", "learned", "primary"}:
-        return BackendConfig(dynamics_backend="learned_primary", patch_backend="learned_primary", temporal_backend="learned_primary")
+        return BackendConfig(dynamics_backend="learned_primary", patch_backend="learned_primary", temporal_backend="learned_primary", runtime_mode="strict_learned")
     if normalized in {"legacy", "fallback", "baseline"}:
-        return BackendConfig(dynamics_backend="baseline", patch_backend="baseline", temporal_backend="baseline")
+        return BackendConfig(dynamics_backend="baseline", patch_backend="baseline", temporal_backend="baseline", runtime_mode="debug_stub")
     if normalized in {"hybrid"}:
-        return BackendConfig(dynamics_backend="learned_primary", patch_backend="baseline", temporal_backend="trainable_temporal")
+        return BackendConfig(dynamics_backend="learned_primary", patch_backend="baseline", temporal_backend="trainable_temporal", runtime_mode="trainable_stub")
     raise ValueError(f"Unsupported backend mode: {mode}")
 
 
