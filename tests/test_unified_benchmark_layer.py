@@ -119,3 +119,22 @@ def test_report_writer_persists_regression_oriented_json(tmp_path: Path) -> None
 
     loaded = json.loads(Path(saved).read_text(encoding="utf-8"))
     assert loaded["regression_summary"]["warnings"]["learned_primary"] == ["low_scenario_success"]
+
+
+def test_benchmark_metrics_include_region_mask_diagnostics(tmp_path: Path) -> None:
+    img = tmp_path / "seed.ppm"
+    _write_ppm(img)
+    report = run_benchmark_suite(backend_modes=["legacy"], image_path=str(img))
+    scenario = report["runs"]["legacy"]["scenarios"][0]
+    metrics = scenario["metrics"]
+    for key in [
+        "mask_observation_coverage",
+        "generated_mask_evidence_ratio",
+        "carry_forward_ratio",
+        "fallback_region_observation_ratio",
+        "stale_region_ratio",
+        "mean_region_drift_score",
+        "max_region_drift_score",
+        "missing_changed_region_mask_evidence_count",
+    ]:
+        assert key in metrics
