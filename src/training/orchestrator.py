@@ -101,8 +101,10 @@ def train_learned_stage(stage_name: str, config: TrainingConfig, backend: str = 
 
 
 def train_stage(stage_name: str, config: TrainingConfig) -> StageResult:
-    if stage_name in {"text_encoder", "dynamics_transition", "patch_synthesis"}:
+    if stage_name in {"text_encoder", "patch_synthesis"}:
         return train_learned_stage(stage_name, config)
+    if stage_name in {"dynamics_transition", "dynamics"}:
+        return DynamicsTrainer().train(config)
     trainers = _build_stage_trainers()
     if stage_name not in trainers:
         known = ", ".join(sorted(trainers))

@@ -38,6 +38,8 @@ class TrainingConfig:
     renderer_backend: str = "numpy_local"
     renderer_temporal_mode: str = "auto"
     renderer_target_role_policy: str = "supervised_plus_bootstrap"
+    temporal_target_role_policy: str = "supervised_plus_bootstrap"
+    dynamics_target_role_policy: str = "supervised_plus_bootstrap"
 
     def __post_init__(self) -> None:
         allowed_backends = {"numpy_local", "torch_local", "legacy_local_renderer", "temporal_local_renderer"}

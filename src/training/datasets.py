@@ -236,6 +236,8 @@ class DynamicsDataset(BaseStageDataset):
     @classmethod
     def from_video_transition_manifest(cls, manifest_path: str, strict: bool = False) -> "DynamicsDataset":
         payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        if payload.get("manifest_type") == "dynamics_graph_delta_manifest":
+            return cls._from_observed_graph_delta_manifest(payload, manifest_path=manifest_path, strict=strict)
         records = payload.get("records", [])
         out: list[TrainingSample] = []
         diagnostics: dict[str, object] = {
@@ -412,6 +414,8 @@ class DynamicsDataset(BaseStageDataset):
     @classmethod
     def from_transition_manifest(cls, manifest_path: str, strict: bool = False) -> "DynamicsDataset":
         payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        if payload.get("manifest_type") == "dynamics_graph_delta_manifest":
+            return cls._from_observed_graph_delta_manifest(payload, manifest_path=manifest_path, strict=strict)
         records = payload.get("records", [])
         out: list[TrainingSample] = []
         diagnostics: dict[str, object] = {
@@ -1799,6 +1803,71 @@ class RendererDataset(BaseStageDataset):
             }
             out.append(sample)
         return cls(samples=out)
+
+    @classmethod
+    def _from_observed_graph_delta_manifest(cls, payload: dict[str, object], manifest_path: str, strict: bool = False) -> "DynamicsDataset":
+        records = payload.get("records", []) if isinstance(payload.get("records", []), list) else []
+        out: list[TrainingSample] = []
+        diagnostics: dict[str, object] = {
+            "source": "manifest_dynamics_graph_delta_supervised",
+            "manifest_path": manifest_path,
+            "strict": bool(strict),
+            "total_records": len(records),
+            "supervised_dynamics_records": 0,
+            "skipped_records": 0,
+            "skipped_by_reason": {},
+            "rejected_runtime_or_heuristic_targets": 0,
+            "transition_family_counts": {},
+            "affected_region_counts": {},
+        }
+        for idx, rec in enumerate(records):
+            try:
+                if not isinstance(rec, dict):
+                    raise ValueError("record must be object")
+                ts = str(rec.get("target_source", ""))
+                tq = str(rec.get("training_target_quality", ""))
+                tr = str(rec.get("target_training_role", ""))
+                if ts in {"heuristic_runtime_prediction", "legacy_graph_delta_fallback", "self_generated_runtime_target"}:
+                    diagnostics["rejected_runtime_or_heuristic_targets"] = int(diagnostics["rejected_runtime_or_heuristic_targets"]) + 1
+                    raise ValueError("runtime_or_heuristic_target_forbidden")
+                if ts != "provided_ground_truth_graph_transition" or tq != "external_or_observed_graph_transition" or tr != "supervised_dynamics_external":
+                    raise ValueError("invalid_supervised_dynamics_target_policy")
+                gb = rec.get("graph_before")
+                td = rec.get("target_delta")
+                if not isinstance(gb, dict):
+                    raise ValueError("missing_graph_before")
+                if not isinstance(td, dict):
+                    raise ValueError("missing_target_delta")
+                before = _deserialize_graph(gb)
+                delta = GraphDelta(
+                    pose_deltas={str(k): float(v) for k, v in (td.get("pose_deltas", {}) or {}).items()},
+                    garment_deltas={str(k): float(v) for k, v in (td.get("garment_deltas", {}) or {}).items()},
+                    visibility_deltas={str(k): str(v) for k, v in (td.get("visibility_deltas", {}) or {}).items()},
+                    expression_deltas={str(k): float(v) for k, v in (td.get("expression_deltas", {}) or {}).items()},
+                    interaction_deltas={str(k): float(v) for k, v in (td.get("interaction_deltas", {}) or {}).items()},
+                    affected_entities=[str(x) for x in td.get("affected_entities", ["scene"])],
+                    affected_regions=[str(x) for x in td.get("affected_regions", rec.get("affected_regions", []))],
+                    semantic_reasons=[str(x) for x in td.get("semantic_reasons", [str((rec.get("transition_context", {}) or {}).get("family", "pose_transition"))])],
+                    region_transition_mode={str(k): str(v) for k, v in (td.get("region_transition_mode", {}) or {}).items()},
+                )
+                if not (delta.pose_deltas or delta.garment_deltas or delta.visibility_deltas or delta.expression_deltas or delta.interaction_deltas):
+                    raise ValueError("empty_target_delta_groups")
+                fam = str((rec.get("transition_context", {}) or {}).get("family", "pose_transition"))
+                diagnostics["transition_family_counts"][fam] = int(diagnostics["transition_family_counts"].get(fam, 0)) + 1
+                for r in rec.get("affected_regions", []) if isinstance(rec.get("affected_regions", []), list) else []:
+                    diagnostics["affected_region_counts"][str(r)] = int(diagnostics["affected_region_counts"].get(str(r), 0)) + 1
+                out.append({"graphs": [before, apply_delta(before, delta)], "actions": [ActionStep(type=fam, priority=1)], "deltas": [delta], "source": "manifest_dynamics_graph_delta_supervised", "graph_transition_contract": {"metadata": {"transition_family": fam}}, "target_source": ts, "training_target_quality": tq, "target_training_role": tr})
+                diagnostics["supervised_dynamics_records"] = int(diagnostics["supervised_dynamics_records"]) + 1
+            except Exception as exc:
+                if strict:
+                    raise
+                diagnostics["skipped_records"] = int(diagnostics["skipped_records"]) + 1
+                diagnostics["skipped_by_reason"][str(exc)] = int(diagnostics["skipped_by_reason"].get(str(exc), 0)) + 1
+        if not out:
+            raise ValueError("no supervised_dynamics_external records")
+        ds = cls(samples=out)
+        ds.diagnostics = diagnostics
+        return ds
 
 
 class TemporalDataset(BaseStageDataset):
