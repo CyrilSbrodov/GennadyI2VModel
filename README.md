@@ -404,5 +404,44 @@ python -m runtime.cli \
   --runtime-mode strict_learned \
   --dynamics-checkpoint-path artifacts/checkpoints/dynamics/dynamics_weights.json \
   --patch-checkpoint-path artifacts/checkpoints/renderer/<saved_renderer_checkpoint>.json \
-  --temporal-checkpoint-path artifacts/checkpoints/temporal/<saved_temporal_checkpoint>.json
+  --temporal-checkpoint-path artifacts/checkpoints/temporal_refinement/latest.json
 ```
+
+## Supervised temporal refinement training baseline
+
+Observed temporal sequences are the **primary supervised temporal refinement training path**. Runtime/generated frames are **not** temporal supervised ground truth.
+
+1. Prepare temporal observed sequences:
+
+`examples/temporal_sequences.example.json`
+
+2. Build temporal manifest:
+
+```bash
+python -m training.cli --stage temporal_manifest_from_observed_sequences \
+  --observed-sequences-path examples/temporal_sequences.example.json \
+  --output-path artifacts/temporal_observed_sequences.json \
+  --strict
+```
+
+3. Train temporal refinement baseline model:
+
+```bash
+python -m training.cli --stage temporal_refinement \
+  --epochs 1 \
+  --learned-dataset-path artifacts/temporal_observed_sequences.json \
+  --checkpoint-dir artifacts/checkpoints \
+  --strict-dataset
+```
+
+4. Use checkpoint in strict runtime (`strict_learned` requires explicit temporal checkpoint path):
+
+```bash
+python -m runtime.cli \
+  --runtime-mode strict_learned \
+  --dynamics-checkpoint-path artifacts/checkpoints/dynamics/dynamics_weights.json \
+  --patch-checkpoint-path artifacts/checkpoints/renderer/<saved_renderer_checkpoint>.json \
+  --temporal-checkpoint-path artifacts/checkpoints/temporal_refinement/latest.json
+```
+
+This trains the current baseline temporal refinement model and is **not** production-quality video generation.

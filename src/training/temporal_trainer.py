@@ -112,18 +112,18 @@ class TemporalTrainer:
 
     def build_datasets(self, config: TrainingConfig) -> tuple[TemporalDataset, TemporalDataset]:
         if config.learned_dataset_path:
-            manifest_ds = TemporalDataset.from_temporal_manifest(config.learned_dataset_path, strict=False)
+            manifest_ds = TemporalDataset.from_temporal_manifest(config.learned_dataset_path, strict=bool(config.renderer_target_role_policy=="supervised_only"))
             if len(manifest_ds) > 1:
                 split = max(1, int(0.8 * len(manifest_ds)))
                 train_ds = TemporalDataset(samples=manifest_ds.samples[:split])
                 val_ds = TemporalDataset(samples=manifest_ds.samples[split:])
                 train_ds.diagnostics = dict(getattr(manifest_ds, "diagnostics", {}), split="train")
                 val_ds.diagnostics = dict(getattr(manifest_ds, "diagnostics", {}), split="val")
-                self.dataset_source = "manifest_temporal_primary"
+                self.dataset_source = "observed_sequence_supervised"
                 self.dataset_diagnostics = getattr(manifest_ds, "diagnostics", {})
                 return train_ds, val_ds
             if len(manifest_ds) == 1:
-                self.dataset_source = "manifest_temporal_primary_single_sample_reused_for_val"
+                self.dataset_source = "observed_sequence_supervised_single_sample_reused_for_val"
                 self.dataset_diagnostics = getattr(manifest_ds, "diagnostics", {})
                 return manifest_ds, TemporalDataset(samples=list(manifest_ds.samples))
             self.dataset_source = "synthetic_temporal_fallback_manifest_empty"
@@ -166,7 +166,10 @@ class TemporalTrainer:
         tag_coverage = float(len((diagnostics.get("tag_counts") or {}).keys()))
         scenario_coverage = float(len((diagnostics.get("scenario_counts") or {}).keys()))
         score = float(max(0.0, 1.0 - (recon_mae + 0.7 * flicker_mae + 0.4 * region_mae + 0.12 * seam_mae + 0.08 * conf_align_mae)))
+        supervised_count = float(diagnostics.get("supervised_temporal_records", 0))
+        skipped_count = float(diagnostics.get("skipped_records", 0))
         return {
+            "total_loss": float(sum(e["total_loss"] for e in entries) / len(entries)),
             "reconstruction_mae": recon_mae,
             "flicker_delta_mae": flicker_mae,
             "region_consistency_mae": region_mae,
@@ -180,9 +183,14 @@ class TemporalTrainer:
             "tag_coverage": tag_coverage,
             "scenario_coverage": scenario_coverage,
             "score": score,
+            "supervised_temporal_record_count": supervised_count,
+            "skipped_record_count": skipped_count,
+            "target_supervised_temporal_external_ratio": float(supervised_count / max(1.0, supervised_count + skipped_count)),
         }
 
     def train(self, config: TrainingConfig) -> StageResult:
+        if config.renderer_target_role_policy == "supervised_only" and not config.learned_dataset_path:
+            raise ValueError("strict temporal supervised training requires learned dataset manifest")
         train_dataset, val_dataset = self.build_datasets(config)
         stage_dir = Path(config.checkpoint_dir) / self.stage_name
         stage_dir.mkdir(parents=True, exist_ok=True)
@@ -217,16 +225,38 @@ class TemporalTrainer:
         model_path = stage_dir / "temporal_model.json"
         self.model.save(str(model_path))
         ckpt = stage_dir / "latest.json"
+        from rendering.temporal_bridge import TrainableTemporalConsistencyBackend
+        backend = TrainableTemporalConsistencyBackend.from_checkpoint_policy(checkpoint_path=str(model_path), strict_checkpoint=True, strict_mode=True)
         ckpt.write_text(
             json.dumps(
                 {
+                    "checkpoint_contract_version": "temporal_refinement_checkpoint_v1",
                     "stage": self.stage_name,
                     "config": asdict(config),
                     "history": history,
                     "final_train": last_train,
                     "final_val": last_val,
-                    "model_path": str(model_path),
+                    "model_path": model_path.name,
                     "eval": last_val,
+                    "runtime_loadable": True,
+                    "model_family": "trainable_temporal_checkpoint",
+                    "training_source": self.dataset_source,
+                    "supervised_temporal_record_count": int(self.dataset_diagnostics.get("supervised_temporal_records", 0)),
+                    "skipped_record_count": int(self.dataset_diagnostics.get("skipped_records", 0)),
+                    "target_policy": (
+                        {
+                            "target_source": "provided_ground_truth_temporal_frame",
+                            "training_target_quality": "external_or_observed_temporal_target",
+                            "target_training_role": "supervised_temporal_external",
+                        }
+                        if self.dataset_source.startswith("observed_sequence_supervised")
+                        else {
+                            "target_source": "synthetic_temporal_bootstrap",
+                            "training_target_quality": "synthetic_bootstrap",
+                            "target_training_role": "bootstrap_temporal_target",
+                        }
+                    ),
+                    "checkpoint_reloadable": bool(backend.checkpoint_status().get("temporal_checkpoint_loaded", False)),
                     "dataset_profile": {
                         "source": self.dataset_source,
                         "train_samples": len(train_dataset),
@@ -238,4 +268,5 @@ class TemporalTrainer:
             ),
             encoding="utf-8",
         )
+        last_train["dataset_diagnostics"] = dict(self.dataset_diagnostics)
         return StageResult(stage_name=self.stage_name, train_metrics=last_train, val_metrics=last_val, checkpoint_path=str(ckpt))
