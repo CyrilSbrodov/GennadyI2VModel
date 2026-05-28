@@ -15,6 +15,7 @@ from training.base_trainer import BaseTrainer
 from training.datasets import DynamicsDataset, TrainingSample
 from training.rollout_eval import evaluate_rollout_modes_on_video_manifest
 from training.types import StageResult, TrainingConfig
+from dynamics.runtime_bundle import DynamicsRuntimeBundle
 from training.dynamics_family_training import DynamicsDatasetSurface, DynamicsTrainingSample, FamilyAwareDynamicsTrainingModule
 
 
@@ -171,7 +172,7 @@ class DynamicsDatasetAdapter:
 
 
 class DynamicsTrainer(BaseTrainer):
-    stage_name = "dynamics"
+    stage_name = "dynamics_transition"
     dataset_source: str = "synthetic_dynamics_bootstrap"
     dataset_diagnostics: dict[str, object] = {}
 
@@ -191,10 +192,14 @@ class DynamicsTrainer(BaseTrainer):
     def build_datasets(self, config: TrainingConfig) -> tuple[DynamicsDataset, DynamicsDataset]:
         self.dataset_source = "synthetic_dynamics_bootstrap"
         self.dataset_diagnostics = {}
+        strict_ds = getattr(config, "dynamics_target_role_policy", "supervised_plus_bootstrap") == "supervised_only"
+        if strict_ds and not config.learned_dataset_path:
+            raise ValueError("--learned-dataset-path is required for strict supervised dynamics training")
         if config.learned_dataset_path:
             payload = json.loads(Path(config.learned_dataset_path).read_text(encoding="utf-8"))
             is_video_manifest = payload.get("manifest_type") == "video_transition_manifest"
-            manifest_ds = DynamicsDataset.from_video_transition_manifest(config.learned_dataset_path, strict=False) if is_video_manifest else DynamicsDataset.from_transition_manifest(config.learned_dataset_path, strict=False)
+            strict_ds = getattr(config, "dynamics_target_role_policy", "supervised_plus_bootstrap") == "supervised_only"
+            manifest_ds = DynamicsDataset.from_video_transition_manifest(config.learned_dataset_path, strict=strict_ds) if is_video_manifest else DynamicsDataset.from_transition_manifest(config.learned_dataset_path, strict=strict_ds)
             self.dataset_diagnostics = getattr(manifest_ds, "diagnostics", {})
             if len(manifest_ds) > 1:
                 split = max(1, int(0.8 * len(manifest_ds)))
@@ -205,7 +210,15 @@ class DynamicsTrainer(BaseTrainer):
                 val_ds.diagnostics = dict(self.dataset_diagnostics, split="val")
                 return train_ds, val_ds
             if len(manifest_ds) == 1:
-                self.dataset_source = "manifest_video_dynamics_primary_with_synthetic_val_fallback" if is_video_manifest else "manifest_dynamics_primary_with_synthetic_val_fallback"
+                self.dataset_source = "manifest_single_sample_train_val_reuse"
+                if strict_ds:
+                    self.dataset_diagnostics = dict(self.dataset_diagnostics, split_strategy="single_sample_train_val_reuse")
+                    train_ds = DynamicsDataset(samples=manifest_ds.samples)
+                    val_ds = DynamicsDataset(samples=manifest_ds.samples)
+                    train_ds.diagnostics = dict(self.dataset_diagnostics, split="train")
+                    val_ds.diagnostics = dict(self.dataset_diagnostics, split="val")
+                    return train_ds, val_ds
+                self.dataset_source = "manifest_dynamics_primary_with_synthetic_val_fallback"
                 return manifest_ds, DynamicsDataset.synthetic(max(1, config.val_size))
             self.dataset_source = "synthetic_dynamics_bootstrap_fallback_manifest_empty"
         train = DynamicsDataset.synthetic(config.train_size)
@@ -341,6 +354,8 @@ class DynamicsTrainer(BaseTrainer):
             for fam in FAMILIES:
                 train_metrics[f"{fam}_batch_ratio"] = round(sum(1.0 for b in train_batches if b.targets.family == fam) / denom, 6)
 
+        train_metrics["dataset_diagnostics"] = dict(self.dataset_diagnostics) if isinstance(self.dataset_diagnostics, dict) else {}
+
         val_metrics = self._evaluate(model, val_batches)
         val_metrics.update(self.family_trainer.validate_epoch(model, val_surface))
         val_metrics["score"] = round(max(0.0, 1.0 - val_metrics["pose_mse"]), 6)
@@ -368,11 +383,23 @@ class DynamicsTrainer(BaseTrainer):
                 6,
             )
 
+        supervised_count = int(self.dataset_diagnostics.get("supervised_dynamics_records", 0)) if isinstance(self.dataset_diagnostics, dict) else 0
+        skipped_count = int(self.dataset_diagnostics.get("skipped_records", 0)) if isinstance(self.dataset_diagnostics, dict) else 0
+        val_metrics["supervised_dynamics_record_count"] = float(supervised_count)
+        val_metrics["skipped_record_count"] = float(skipped_count)
+        val_metrics["graph_delta_loss"] = float(val_metrics.get("pose_mse", 0.0) + val_metrics.get("garment_mse", 0.0) + val_metrics.get("visibility_mse", 0.0) + val_metrics.get("expression_mse", 0.0) + val_metrics.get("interaction_mse", 0.0) + val_metrics.get("region_mse", 0.0))
+        val_metrics["total_loss"] = float(val_metrics["graph_delta_loss"])
+
         stage_dir = Path(config.checkpoint_dir) / self.stage_name
         stage_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_path = stage_dir / "latest.json"
         weights_path = stage_dir / "dynamics_weights.json"
         model.save(str(weights_path))
+        bundle = DynamicsRuntimeBundle(checkpoint_path=str(weights_path))
+        status = bundle.load_checkpoint()
+        if not status.usable_for_inference:
+            raise ValueError("saved dynamics checkpoint is not strict-loadable")
+        val_metrics["checkpoint_reloadable"] = 1.0
         checkpoint_path.write_text(
             json.dumps(
                 {
@@ -383,6 +410,17 @@ class DynamicsTrainer(BaseTrainer):
                     "weights_path": str(weights_path),
                     "runtime_compatible": True,
                     "checkpoint_status": "trained",
+                    "training_source": "observed_graph_transition_supervised" if supervised_count > 0 else "synthetic_dynamics_bootstrap",
+                    "supervised_dynamics_record_count": supervised_count,
+                    "skipped_record_count": skipped_count,
+                    "target_policy": {
+                        "target_source": "provided_ground_truth_graph_transition",
+                        "training_target_quality": "external_or_observed_graph_transition",
+                        "target_training_role": "supervised_dynamics_external",
+                    } if supervised_count > 0 else {"mode": "synthetic_bootstrap"},
+                    "transition_family_counts": (self.dataset_diagnostics.get("transition_family_counts", {}) if isinstance(self.dataset_diagnostics, dict) else {}),
+                    "affected_region_counts": (self.dataset_diagnostics.get("affected_region_counts", {}) if isinstance(self.dataset_diagnostics, dict) else {}),
+                    "checkpoint_reloadable": bool(status.usable_for_inference),
                     "dataset_profile": {
                         "surface_type": "DynamicsDatasetSurface",
                         "train_samples": len(train_dataset),
@@ -401,4 +439,4 @@ class DynamicsTrainer(BaseTrainer):
             ),
             encoding="utf-8",
         )
-        return StageResult(stage_name=self.stage_name, train_metrics=train_metrics, val_metrics=val_metrics, checkpoint_path=str(checkpoint_path))
+        return StageResult(stage_name=self.stage_name, train_metrics=train_metrics, val_metrics=val_metrics, checkpoint_path=str(weights_path))

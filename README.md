@@ -463,3 +463,39 @@ Runtime debug now includes:
 - propagation policy and violations summary.
 
 This is a **diagnostics + contract correctness** layer. It conservatively propagates known mask evidence, detects and reports region/mask drift, and prevents generated/fallback evidence from being mistaken for input-frame observation. It is **not** a new segmentation model.
+
+## Supervised dynamics graph-delta training baseline
+
+Observed/annotated graph transitions are the primary supervised path for dynamics training. Runtime heuristic graph deltas are **not** supervised ground truth. In strict runtime (`strict_learned`) you must provide an explicit dynamics checkpoint.
+
+1. Prepare observed transitions input (example): `examples/dynamics_transitions.example.json`
+2. Build supervised dynamics manifest:
+
+```bash
+python -m training.cli --stage dynamics_manifest_from_observed_transitions \
+  --observed-transitions-path examples/dynamics_transitions.example.json \
+  --output-path artifacts/dynamics_observed_transitions.json \
+  --strict
+```
+
+3. Train dynamics baseline checkpoint:
+
+```bash
+python -m training.cli --stage dynamics_transition \
+  --epochs 1 \
+  --learned-dataset-path artifacts/dynamics_observed_transitions.json \
+  --checkpoint-dir artifacts/checkpoints \
+  --strict-dataset
+```
+
+4. Use checkpoint in strict runtime:
+
+```bash
+python -m runtime.cli \
+  --runtime-mode strict_learned \
+  --dynamics-checkpoint-path artifacts/checkpoints/dynamics_transition/dynamics_weights.json \
+  --patch-checkpoint-path artifacts/checkpoints/renderer/<saved_renderer_checkpoint>.json \
+  --temporal-checkpoint-path artifacts/checkpoints/temporal_refinement/latest.json
+```
+
+Supervised manifest records must use `target_source=provided_ground_truth_graph_transition`.

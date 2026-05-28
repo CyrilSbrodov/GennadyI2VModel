@@ -1,0 +1,90 @@
+{
+  "contract_version": "dynamics_observed_transition_manifest_input_v1",
+  "transitions": [
+    {
+      "record_id": "example_smile_0001",
+      "prompt": "person smiles slightly",
+      "graph_before": {
+        "frame_index": 0,
+        "persons": [
+          {
+            "person_id": "person_1",
+            "track_id": "t1",
+            "bbox": {
+              "x": 0.1,
+              "y": 0.1,
+              "w": 0.7,
+              "h": 0.8
+            },
+            "body_parts": [
+              {
+                "part_id": "face_1",
+                "part_type": "face",
+                "bbox": {
+                  "x": 0.25,
+                  "y": 0.15,
+                  "w": 0.25,
+                  "h": 0.25
+                },
+                "visibility": "visible",
+                "confidence": 0.9
+              }
+            ],
+            "confidence": 0.9,
+            "expression_state": {
+              "label": "neutral",
+              "smile_intensity": 0.0
+            }
+          }
+        ],
+        "objects": []
+      },
+      "graph_after": {
+        "frame_index": 1,
+        "persons": [
+          {
+            "person_id": "person_1",
+            "track_id": "t1",
+            "bbox": {
+              "x": 0.1,
+              "y": 0.1,
+              "w": 0.7,
+              "h": 0.8
+            },
+            "body_parts": [
+              {
+                "part_id": "face_1",
+                "part_type": "face",
+                "bbox": {
+                  "x": 0.25,
+                  "y": 0.15,
+                  "w": 0.25,
+                  "h": 0.25
+                },
+                "visibility": "visible",
+                "confidence": 0.9
+              }
+            ],
+            "confidence": 0.9,
+            "expression_state": {
+              "label": "smile",
+              "smile_intensity": 0.75
+            }
+          }
+        ],
+        "objects": []
+      },
+      "transition_context": {
+        "summary": "observed expression transition",
+        "family": "expression_transition",
+        "action_family": "face_expression_change"
+      },
+      "affected_regions": [
+        "person_1:face"
+      ],
+      "target_source": "provided_ground_truth_graph_transition",
+      "training_target_quality": "external_or_observed_graph_transition",
+      "target_training_role": "supervised_dynamics_external"
+    }
+  ]
+}
