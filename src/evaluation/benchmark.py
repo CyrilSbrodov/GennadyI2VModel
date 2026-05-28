@@ -219,6 +219,17 @@ def _scenario_metrics(spec: ScenarioSpec, artifacts: object, *, record: Benchmar
 
     learned_ready = debug.get("learned_ready", {}) if isinstance(debug.get("learned_ready", {}), dict) else {}
     fallback_count = len(learned_ready.get("fallbacks", [])) if isinstance(learned_ready.get("fallbacks", []), list) else 0
+    propagation = debug.get("region_mask_propagation", []) if isinstance(debug.get("region_mask_propagation", []), list) else []
+    reconciliation = debug.get("graph_mask_reconciliation", []) if isinstance(debug.get("graph_mask_reconciliation", []), list) else []
+    total_obs = sum(len(p.get("observations", [])) for p in propagation if isinstance(p, dict))
+    gen_obs = sum(1 for p in propagation if isinstance(p, dict) for o in (p.get("observations", []) if isinstance(p.get("observations", []), list) else []) if isinstance(o, dict) and o.get("is_generated_evidence"))
+    carry_obs = sum(1 for p in propagation if isinstance(p, dict) for o in (p.get("observations", []) if isinstance(p.get("observations", []), list) else []) if isinstance(o, dict) and o.get("is_carry_forward"))
+    fallback_obs = sum(1 for p in propagation if isinstance(p, dict) for o in (p.get("observations", []) if isinstance(p.get("observations", []), list) else []) if isinstance(o, dict) and o.get("is_fallback_region"))
+    stale_obs = sum(1 for p in propagation if isinstance(p, dict) for o in (p.get("observations", []) if isinstance(p.get("observations", []), list) else []) if isinstance(o, dict) and float(o.get("stale_frame_count", 0)) > 0)
+    mask_coverage = sum(1 for p in propagation if isinstance(p, dict) for o in (p.get("observations", []) if isinstance(p.get("observations", []), list) else []) if isinstance(o, dict) and o.get("mask_ref")) / max(1, total_obs)
+    drift_means = [float(r.get("mean_drift_score", 0.0)) for r in reconciliation if isinstance(r, dict)]
+    drift_maxs = [float(r.get("max_drift_score", 0.0)) for r in reconciliation if isinstance(r, dict)]
+    missing_changed = sum(int((p.get("diagnostics", {}) or {}).get("missing_changed_region_mask_evidence_count", 0)) for p in propagation if isinstance(p, dict))
 
     contract_failures = int(stage_health["contracts"]["contract_failure_count"])
     parity_missing = int(stage_health["contracts"]["parity_missing_count"])
@@ -264,6 +275,14 @@ def _scenario_metrics(spec: ScenarioSpec, artifacts: object, *, record: Benchmar
             "fallback_free": 1.0 if fallback_count == 0 else 0.0,
             "contract_validity": 1.0 if contract_failures == 0 else 0.0,
             "scenario_success": 1.0 if scenario_success else 0.0,
+            "mask_observation_coverage": round(mask_coverage, 6),
+            "generated_mask_evidence_ratio": round(gen_obs / max(1, total_obs), 6),
+            "carry_forward_ratio": round(carry_obs / max(1, total_obs), 6),
+            "fallback_region_observation_ratio": round(fallback_obs / max(1, total_obs), 6),
+            "stale_region_ratio": round(stale_obs / max(1, total_obs), 6),
+            "mean_region_drift_score": round(_safe_mean(drift_means), 6),
+            "max_region_drift_score": round(max(drift_maxs) if drift_maxs else 0.0, 6),
+            "missing_changed_region_mask_evidence_count": int(missing_changed),
         },
         "stage_health": stage_health,
     }

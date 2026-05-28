@@ -488,3 +488,37 @@ class VideoMemory:
     hidden_region_slots: dict[str, HiddenRegionSlot] = field(default_factory=dict)
     canonical_region_memory: dict[str, CanonicalRegionMemoryEntry] = field(default_factory=dict)
     last_transition_context: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class FrameRegionObservation:
+    frame_index: int
+    region_id: str
+    bbox: BBox
+    mask_ref: str | None = None
+    mask_kind: str = "none"
+    mask_provenance: str = "fallback_no_mask"
+    observation_source: str = "unknown"
+    confidence: float = 0.0
+    evidence_strength_score: float = 0.0
+    metadata_completeness_score: float = 0.0
+    drift_score: float = 1.0
+    stale_frame_count: int = 0
+    is_generated_evidence: bool = False
+    is_carry_forward: bool = False
+    is_fallback_region: bool = False
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class RegionMaskPropagationResult:
+    frame_index: int
+    observations: list[FrameRegionObservation] = field(default_factory=list)
+    updated_mask_refs: dict[str, str] = field(default_factory=dict)
+    region_drift_summary: dict[str, Any] = field(default_factory=dict)
+    fallback_count: int = 0
+    carry_forward_count: int = 0
+    generated_evidence_count: int = 0
+    high_confidence_observation_count: int = 0
+    stale_region_count: int = 0
+    diagnostics: dict[str, Any] = field(default_factory=dict)

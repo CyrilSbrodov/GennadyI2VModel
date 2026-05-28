@@ -30,6 +30,7 @@ from runtime.profiles import PROFILES, RuntimeProfile
 from runtime.region_metadata import build_region_metadata
 from runtime.region_routing import CanonicalRegionRouter
 from runtime.i2v_frame_planner import I2VFramePlanEntry, plan_i2v_frames
+from runtime.region_mask_propagation import propagate_region_masks_for_frame, seed_input_region_observations
 from text.intent_parser import IntentParser
 from utils_tensor import shape, zeros
 from core.region_ids import make_region_id, parse_region_id
@@ -687,6 +688,9 @@ class GennadyEngine:
         dynamics_metrics_log: list[str] = []
         channel_usage_log: list[dict[str, object]] = []
         step_debug: list[dict[str, object]] = []
+        previous_region_observations = seed_input_region_observations(scene_graph, self.perception.mask_store)
+        propagation_debug: list[dict[str, object]] = []
+        reconciliation_debug: list[dict[str, object]] = []
         step_reference_coverages: list[dict[str, object]] = []
         hidden_recon_stats = {"known_hidden": 0, "unknown_hidden": 0, "hidden_reveal": 0, "steps_with_hidden_reconstruction": 0}
         hidden_recon_quality = {
@@ -1105,7 +1109,27 @@ class GennadyEngine:
             stable_frame = temporal_out.refined_frame if profile.temporal_refinement else composed
             stable_frame = self._normalize_frame_tensor(stable_frame, field_name="stable_frame")
 
-            scene_graph = apply_delta(scene_graph, delta)
+            next_scene_graph = apply_delta(scene_graph, delta)
+            propagation_result = propagate_region_masks_for_frame(
+                frame_index=planned_state.step_index,
+                stable_frame=np.asarray(stable_frame, dtype=np.float32),
+                previous_observations=previous_region_observations,
+                scene_graph=next_scene_graph,
+                changed_regions=[r.region_id for r in changed_regions],
+                patch_outputs=patches,
+                mask_store=self.perception.mask_store,
+                strict=profile.strict_checkpoint_requirements,
+            )
+            previous_region_observations = propagation_result.observations
+            propagation_debug.append({
+                "frame_index": propagation_result.frame_index,
+                "observations": [asdict(o) for o in propagation_result.observations],
+                "updated_mask_refs": propagation_result.updated_mask_refs,
+                "diagnostics": propagation_result.diagnostics,
+            })
+            reconciliation_debug.append(propagation_result.region_drift_summary)
+
+            scene_graph = next_scene_graph
             graph_encoding = self.backends.graph_encoder.encode(scene_graph)
             memory = self.memory_manager.update_from_graph(memory, scene_graph)
             transition_context = self._memory_update_context_for_generated_frame(
@@ -1160,7 +1184,7 @@ class GennadyEngine:
                         "unknown_hidden_count": hidden_recon_stats["unknown_hidden"],
                         "hidden_reveal_count": hidden_recon_stats["hidden_reveal"],
                     },
-                    "memory_update_provenance": memory_update_provenance,
+                    "memory_update_provenance": {**memory_update_provenance, "region_mask_propagation": propagation_result.diagnostics},
                     "temporal": {
                         "backend": self.backends.backend_names.get("temporal_backend", "unknown"),
                         "temporal_path": temporal_out.metadata.get("temporal_path", "unknown"),
@@ -1197,7 +1221,7 @@ class GennadyEngine:
                     "identity_encoder_used": bool(identity_embedding),
                     "graph_embedding_dim": len(graph_encoding.graph_embedding),
                     "dynamics_backend_usage": transition_output.metadata.get("learned_ready_usage", {}),
-                    "memory_update_provenance": memory_update_provenance,
+                    "memory_update_provenance": {**memory_update_provenance, "region_mask_propagation": propagation_result.diagnostics},
                     "reference_coverage": {
                         "identity_ratio": step_reference_coverage["used_counts"]["identity"] / max(1, step_reference_coverage["expected_family_counts"]["identity"]),
                         "body_shape_ratio": step_reference_coverage["used_counts"]["body_shape"] / max(1, step_reference_coverage["expected_family_counts"]["body_shape"]),
@@ -1238,6 +1262,10 @@ class GennadyEngine:
                 "overlay_log": overlay_log,
                 "dynamics_metrics": dynamics_metrics_log,
                 "step_execution": step_debug,
+                "region_mask_propagation": propagation_debug,
+                "graph_mask_reconciliation": reconciliation_debug,
+                "propagation_policy": {"strict": profile.strict_checkpoint_requirements},
+                "violations": [x for p in propagation_debug for x in p.get("diagnostics", {}).get("violations", [])],
                 "profile": {
                     "name": profile.name,
                     "internal_resolution": profile.internal_resolution,

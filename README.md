@@ -445,3 +445,21 @@ python -m runtime.cli \
 ```
 
 This trains the current baseline temporal refinement model and is **not** production-quality video generation.
+
+
+## Runtime region/mask propagation and graph-mask reconciliation
+
+After each generated/stable frame, runtime now records **FrameRegionObservation** entries per canonical graph region, including bbox/mask linkage, provenance, confidence, evidence strength, stale carry-forward counters, and drift diagnostics.
+
+Key guarantees:
+- generated patch alpha evidence is marked as generated (`generated_patch_alpha`) and is not treated as fresh input perception;
+- carry-forward observations are marked (`carry_forward_previous_frame`) and tracked as stale, not as fresh direct evidence;
+- graph-projection/fallback observations stay low-confidence and explicitly tagged;
+- strict mode reports violations (including missing changed-region mask evidence) instead of silently inventing high-confidence masks.
+
+Runtime debug now includes:
+- `region_mask_propagation`
+- `graph_mask_reconciliation`
+- propagation policy and violations summary.
+
+This is a **diagnostics + contract correctness** layer. It conservatively propagates known mask evidence, detects and reports region/mask drift, and prevents generated/fallback evidence from being mistaken for input-frame observation. It is **not** a new segmentation model.
