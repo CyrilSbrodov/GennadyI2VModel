@@ -264,6 +264,17 @@ class TrainableTemporalConsistencyModel:
     @classmethod
     def load(cls, path: str) -> "TrainableTemporalConsistencyModel":
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        if isinstance(payload, dict) and "model_path" in payload and "W_pixel" not in payload:
+            raw_ref = Path(str(payload["model_path"]))
+            candidates = [raw_ref, Path(path).parent / raw_ref, Path(path).parent / raw_ref.name]
+            resolved = None
+            for cand in candidates:
+                if cand.exists():
+                    resolved = cand
+                    break
+            if resolved is None:
+                raise FileNotFoundError(f"temporal model_path not found from checkpoint wrapper: {raw_ref}")
+            payload = json.loads(resolved.read_text(encoding="utf-8"))
         model = cls(pixel_dim=int(payload["pixel_dim"]), cond_dim=int(payload["cond_dim"]), hidden_dim=int(payload["hidden_dim"]))
         model.W_pixel = np.asarray(payload["W_pixel"], dtype=np.float32)
         model.W_cond = np.asarray(payload["W_cond"], dtype=np.float32)

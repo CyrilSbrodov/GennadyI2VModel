@@ -1865,6 +1865,12 @@ class TemporalDataset(BaseStageDataset):
         samples: list[TrainingSample] = []
         diagnostics: dict[str, object] = {
             "source": "manifest_temporal_consistency",
+            "strict": bool(strict),
+            "supervised_temporal_records": 0,
+            "rejected_self_generated_targets": 0,
+            "skipped_by_reason": {},
+            "sequence_count": 0,
+            "frame_shape_summary": {},
             "manifest_path": manifest_path,
             "total_records": len(records),
             "loaded_records": 0,
@@ -1889,6 +1895,19 @@ class TemporalDataset(BaseStageDataset):
             try:
                 if not isinstance(rec, dict):
                     raise ValueError("record must be a json object")
+                target_source = rec.get("target_source")
+                target_quality = rec.get("training_target_quality")
+                target_role = rec.get("target_training_role")
+                if target_source is None or target_quality is None or target_role is None:
+                    raise ValueError("missing target provenance fields")
+                target_source = str(target_source)
+                target_quality = str(target_quality)
+                target_role = str(target_role)
+                if target_source in {"self_generated_runtime_target", "runtime_generated_frame", "bootstrap_temporal_target"}:
+                    diagnostics["rejected_self_generated_targets"] = int(diagnostics["rejected_self_generated_targets"]) + 1
+                    raise ValueError("self/runtime generated temporal targets are forbidden")
+                if target_source != "provided_ground_truth_temporal_frame" or target_quality != "external_or_observed_temporal_target" or target_role != "supervised_temporal_external":
+                    raise ValueError("invalid supervised temporal target policy")
                 prev = cls._as_hw3_tensor(rec["previous_frame"], "previous_frame")
                 cur = cls._as_hw3_tensor(rec.get("current_composed_frame", rec.get("current_frame")), "current_composed_frame")
                 target = cls._as_hw3_tensor(rec.get("target_refined_frame", rec.get("target_frame", rec.get("current_composed_frame", rec.get("current_frame")))), "target_frame")
@@ -1959,6 +1978,11 @@ class TemporalDataset(BaseStageDataset):
                 samples.append({"frames": [prev, cur, target], "temporal_consistency_contract": contract, "source": rec.get("source", "temporal_manifest")})
                 diagnostics["loaded_records"] = int(diagnostics["loaded_records"]) + 1
                 diagnostics["usable_records"] = int(diagnostics["usable_records"]) + 1
+                diagnostics["supervised_temporal_records"] = int(diagnostics["supervised_temporal_records"]) + 1
+                seq_key = str(rec.get("sequence_id", "unknown"))
+                shape_key = str(np.asarray(cur, dtype=np.float32).shape)
+                diagnostics["frame_shape_summary"][shape_key] = int(diagnostics["frame_shape_summary"].get(shape_key, 0)) + 1
+                diagnostics.setdefault("_sequence_keys", set()).add(seq_key)
                 diagnostics["family_counts"]["frame_refinement"] = int(diagnostics["family_counts"]["frame_refinement"]) + 1
                 delta_prev_target = float(np.mean(np.abs(np.asarray(target, dtype=np.float32) - np.asarray(prev, dtype=np.float32))))
                 diagnostics["family_counts"]["flicker"] = int(diagnostics["family_counts"]["flicker"]) + (1 if delta_prev_target > 1e-6 else 0)
@@ -1977,10 +2001,16 @@ class TemporalDataset(BaseStageDataset):
                             diagnostics["tag_counts"][tk] = int(diagnostics["tag_counts"].get(tk, 0)) + 1
             except Exception as exc:
                 diagnostics["invalid_records"] = int(diagnostics["invalid_records"]) + 1
+                diagnostics["skipped_records"] = int(diagnostics["skipped_records"]) + 1
+                reason = str(exc)
+                diagnostics["skipped_by_reason"][reason] = int(diagnostics["skipped_by_reason"].get(reason, 0)) + 1
                 if len(diagnostics["invalid_examples"]) < 8:
                     diagnostics["invalid_examples"].append({"index": idx, "reason": str(exc)})
                 if strict:
                     raise
+        diagnostics["sequence_count"] = len(diagnostics.pop("_sequence_keys", set()))
+        if int(diagnostics.get("supervised_temporal_records", 0)) == 0:
+            raise ValueError("no valid supervised temporal records")
         ds = cls(samples=samples)
         ds.diagnostics = diagnostics
         return ds

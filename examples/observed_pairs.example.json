@@ -3,8 +3,8 @@
   "pairs": [
     {
       "record_id": "example_face_0001",
-      "source_frame": "examples/assets/source_0001.png",
-      "target_frame": "examples/assets/target_0001.png",
+      "source_frame": "examples/assets/source_0001.ppm",
+      "target_frame": "examples/assets/target_0001.ppm",
       "prompt": "person smiles slightly",
       "transition_context": {
         "summary": "observed paired-frame expression transition",

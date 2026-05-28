@@ -1,0 +1,33 @@
+{
+  "contract_version": "temporal_observed_sequence_manifest_input_v1",
+  "sequences": [
+    {
+      "sequence_id": "example_temporal_0001",
+      "prompt": "person smiles slightly",
+      "frames": [
+        "examples/assets/source_0001.ppm",
+        "examples/assets/target_0001.ppm",
+        "examples/assets/target_0002.ppm"
+      ],
+      "changed_regions": [
+        {
+          "region_id": "person_1:face",
+          "bbox": [0.25, 0.2, 0.3, 0.25],
+          "reason": "manual_or_parser_region"
+        }
+      ],
+      "transition_context": {
+        "summary": "observed temporal expression stabilization",
+        "family": "expression_transition"
+      },
+      "region_metadata": {
+        "person_1:face": {
+          "roi_source": "manual_or_parser_region",
+          "source_node_type": "body_part",
+          "metadata_completeness_score": 0.9,
+          "evidence_strength_score": 0.8
+        }
+      }
+    }
+  ]
+}
