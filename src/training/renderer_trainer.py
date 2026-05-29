@@ -819,6 +819,8 @@ class RendererTrainer:
         requested_target_role_policy = str(self.dataset_diagnostics.get("requested_target_role_policy", config.renderer_target_role_policy) or "unknown")
         effective_target_role_policy = str(self.dataset_diagnostics.get("effective_target_role_policy", requested_target_role_policy) or "unknown")
         target_quality_counts = last_train.get("target_quality_counts", {}) if isinstance(last_train.get("target_quality_counts", {}), dict) else {}
+        diagnostic_quality_counts = self.dataset_diagnostics.get("target_quality_counts", {}) if isinstance(self.dataset_diagnostics.get("target_quality_counts", {}), dict) else {}
+        target_quality_counts = {str(k): int(v) for k, v in diagnostic_quality_counts.items()} | {str(k): int(v) for k, v in target_quality_counts.items()}
         target_training_role_counts = last_train.get("target_training_role_counts", {}) if isinstance(last_train.get("target_training_role_counts", {}), dict) else {}
         metadata_training_source = self.dataset_source or "unknown"
         supervised_metadata_count = int(self.dataset_diagnostics.get("supervised_record_count", 0) or 0)

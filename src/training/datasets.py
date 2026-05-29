@@ -1444,6 +1444,8 @@ class RendererDataset(BaseStageDataset):
             "source_node_type_distribution": {},
             "mask_kind_distribution": {},
             "fallback_person_bbox_record_count": 0,
+            "external_roi_asset_records": 0,
+            "external_roi_asset_bytes_loaded": 0,
         }
         if manifest_type not in supported_manifest_types:
             diagnostics["unsupported_manifest_type"] = 1
@@ -1456,11 +1458,21 @@ class RendererDataset(BaseStageDataset):
             try:
                 if not isinstance(rec, dict):
                     raise ValueError("record must be a json object")
-                if "roi_before" not in rec or "roi_after" not in rec:
-                    raise ValueError("record requires roi_before and roi_after")
-
-                roi_before = cls._as_hw3_tensor(rec["roi_before"], "roi_before")
-                roi_after = cls._as_hw3_tensor(rec["roi_after"], "roi_after")
+                has_external_roi_assets = "roi_before_path" in rec or "roi_after_path" in rec
+                if has_external_roi_assets:
+                    if rec.get("target_source") != "provided_ground_truth_roi" or rec.get("training_target_quality") != "external_or_observed_target" or rec.get("source") != "observed_frame_pair":
+                        raise ValueError("external ROI asset records are only supported for supervised observed-pair targets")
+                    roi_before_arr, before_bytes = cls._load_external_roi_asset(rec.get("roi_before_path"), manifest_path, "roi_before_path")
+                    roi_after_arr, after_bytes = cls._load_external_roi_asset(rec.get("roi_after_path"), manifest_path, "roi_after_path")
+                    diagnostics["external_roi_asset_records"] = int(diagnostics.get("external_roi_asset_records", 0)) + 1
+                    diagnostics["external_roi_asset_bytes_loaded"] = int(diagnostics.get("external_roi_asset_bytes_loaded", 0)) + before_bytes + after_bytes
+                    roi_before = cls._as_hw3_tensor(roi_before_arr, "roi_before")
+                    roi_after = cls._as_hw3_tensor(roi_after_arr, "roi_after")
+                else:
+                    if "roi_before" not in rec or "roi_after" not in rec:
+                        raise ValueError("record requires roi_before and roi_after")
+                    roi_before = cls._as_hw3_tensor(rec["roi_before"], "roi_before")
+                    roi_after = cls._as_hw3_tensor(rec["roi_after"], "roi_after")
                 b = np.asarray(roi_before, dtype=np.float32)
                 a = np.asarray(roi_after, dtype=np.float32)
                 if b.shape != a.shape:
@@ -1490,7 +1502,11 @@ class RendererDataset(BaseStageDataset):
                     region_metadata = copy.deepcopy(patch_contract["region_metadata"])
                 if is_v2:
                     diagnostics["v2_record_count"] = int(diagnostics.get("v2_record_count", 0)) + 1
-                    required_v2 = {"record_id", "frame_index", "step_index", "region_id", "canonical_region", "entity_id", "roi_before", "roi_after", "alpha_mask", "region_metadata", "transition_context_summary", "selected_render_strategy", "synthesis_mode", "execution_trace_summary", "metadata_completeness_score", "evidence_strength_score", "roi_source", "source_node_type", "mask_kind", "mask_ref_present"}
+                    required_v2 = {"record_id", "frame_index", "step_index", "region_id", "canonical_region", "entity_id", "region_metadata", "transition_context_summary", "selected_render_strategy", "synthesis_mode", "execution_trace_summary", "metadata_completeness_score", "evidence_strength_score", "roi_source", "source_node_type", "mask_kind", "mask_ref_present"}
+                    if has_external_roi_assets:
+                        required_v2.update({"roi_before_path", "roi_after_path"})
+                    else:
+                        required_v2.update({"roi_before", "roi_after", "alpha_mask"})
                     missing_v2 = sorted(required_v2.difference(rec.keys()))
                     if missing_v2:
                         raise ValueError(f"renderer manifest v2 missing required fields: {missing_v2}")
@@ -1685,6 +1701,27 @@ class RendererDataset(BaseStageDataset):
         ds = cls(samples=samples)
         ds.diagnostics = diagnostics
         return ds
+
+    @staticmethod
+    def _load_external_roi_asset(path_value: object, manifest_path: str, field_name: str) -> tuple[np.ndarray, int]:
+        if not isinstance(path_value, str) or not path_value.strip():
+            raise ValueError(f"{field_name} must be a non-empty path")
+        raw_path = Path(path_value)
+        candidates = [raw_path] if raw_path.is_absolute() else [raw_path, Path(manifest_path).parent / raw_path]
+        asset_path = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
+        if not asset_path.exists():
+            raise FileNotFoundError(f"{field_name} does not exist: {path_value}")
+        if asset_path.suffix.lower() == ".npy":
+            arr = np.load(asset_path, allow_pickle=False)
+        elif asset_path.suffix.lower() == ".npz":
+            with np.load(asset_path, allow_pickle=False) as data:
+                key = "roi" if "roi" in data.files else (data.files[0] if data.files else "")
+                if not key:
+                    raise ValueError(f"{field_name} npz asset has no arrays: {path_value}")
+                arr = data[key]
+        else:
+            raise ValueError(f"{field_name} must point to .npy or .npz asset: {path_value}")
+        return np.asarray(arr, dtype=np.float32), int(asset_path.stat().st_size)
 
     @staticmethod
     def _safe_float(value: object, default: float = 0.0) -> float:
