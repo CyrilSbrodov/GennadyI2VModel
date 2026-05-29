@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -8,7 +10,7 @@ import numpy as np
 from PIL import Image
 
 from core.schema import BBox, RegionRef
-from training.renderer_video_manifest_builder import RendererVideoManifestBuilder
+from training.renderer_video_manifest_builder import _crop_region, _match_roi_shapes, _metadata_for_region
 
 
 @dataclass(slots=True)
@@ -18,6 +20,14 @@ class ObservedPairsBuildOutput:
 
 
 def build_renderer_manifest_from_observed_pairs(*, observed_pairs_path: str, output_path: str, strict: bool = True) -> ObservedPairsBuildOutput:
+    """Build a lightweight supervised renderer manifest from observed image pairs.
+
+    Observed-pair records intentionally externalize ROI tensors into .npy assets so
+    manifest JSON stays small and does not pass full frames/ROIs through the generic
+    renderer manifest exporter.
+    """
+
+    started = time.perf_counter()
     payload = json.loads(Path(observed_pairs_path).read_text(encoding="utf-8"))
     if str(payload.get("contract_version", "")).strip() != "renderer_observed_pair_manifest_input_v1":
         raise ValueError("observed pairs input must use contract_version='renderer_observed_pair_manifest_input_v1'")
@@ -25,10 +35,16 @@ def build_renderer_manifest_from_observed_pairs(*, observed_pairs_path: str, out
     if not isinstance(pairs, list):
         raise ValueError("observed pairs input field 'pairs' must be list")
 
-    builder = RendererVideoManifestBuilder()
+    output = Path(output_path)
+    asset_subdir = Path("renderer_roi_assets")
+    asset_dir = output.parent / asset_subdir
+    asset_dir.mkdir(parents=True, exist_ok=True)
+
     all_records: list[dict[str, object]] = []
     skipped_pairs = 0
     invalid_examples: list[dict[str, object]] = []
+    roi_asset_count = 0
+    roi_asset_total_bytes = 0
 
     for idx, pair in enumerate(pairs):
         try:
@@ -53,31 +69,85 @@ def build_renderer_manifest_from_observed_pairs(*, observed_pairs_path: str, out
             if isinstance(pair.get("tags"), list):
                 transition_context["tags"] = [str(x) for x in pair.get("tags", [])]
             pair_meta = dict(pair.get("region_metadata") or {})
-            out = builder.build_records(
-                source_frame=source_frame,
-                target_frame=target_frame,
-                regions=regions,
-                region_metadata=pair_meta,
-                transition_context=transition_context,
-                strict=strict,
-            )
-            for rec_idx, rec in enumerate(out.records):
-                region_id = str(rec.get("region_id", "")).strip() or f"region_{rec_idx}"
-                rec["source_pair_id"] = record_id
-                rec["record_id"] = f"{record_id}:{region_id}"
-                rec["target_source"] = "provided_ground_truth_roi"
-                rec["training_target_quality"] = "external_or_observed_target"
-                rec["target_training_role"] = "supervised_external"
-                rec.setdefault("diagnostics", {})
-                rec["diagnostics"].update({
-                    "source_frame_path": source_path,
-                    "target_frame_path": target_path,
-                    "region_source": rec.get("roi_source", "observed_region_ref"),
-                    "metadata_completeness_score": rec.get("metadata_completeness_score", 0.0),
-                    "evidence_strength_score": rec.get("evidence_strength_score", 0.0),
-                })
+
+            for rec_idx, region in enumerate(regions):
+                roi_before = _crop_region(source_frame, region.bbox, "source_frame", bbox_units="normalized")
+                roi_after = _crop_region(target_frame, region.bbox, "target_frame", bbox_units="normalized")
+                roi_before, roi_after = _match_roi_shapes(roi_before, roi_after)
+                metadata = _metadata_for_region(pair_meta, region, total_regions=len(regions))
+                region_id = region.region_id
+                full_record_id = f"{record_id}:{region_id}"
+                safe_stem = _safe_asset_stem(f"{record_id}_{rec_idx}_{region_id}")
+                before_asset_name = f"{safe_stem}_before.npy"
+                after_asset_name = f"{safe_stem}_after.npy"
+                before_path = asset_dir / before_asset_name
+                after_path = asset_dir / after_asset_name
+                before_rel_path = asset_subdir / before_asset_name
+                after_rel_path = asset_subdir / after_asset_name
+                np.save(before_path, np.asarray(roi_before, dtype=np.float32), allow_pickle=False)
+                np.save(after_path, np.asarray(roi_after, dtype=np.float32), allow_pickle=False)
+                before_bytes = before_path.stat().st_size
+                after_bytes = after_path.stat().st_size
+                roi_asset_count += 2
+                roi_asset_total_bytes += before_bytes + after_bytes
+
+                changed_ratio = float(np.mean(np.any(np.abs(roi_after - roi_before) > 1.0 / 255.0, axis=2))) if roi_before.size else 0.0
+                mean_abs_delta = float(np.mean(np.abs(roi_after - roi_before))) if roi_before.size else 0.0
+                rec: dict[str, object] = {
+                    "contract_version": "renderer_patch_manifest_v2",
+                    "record_id": full_record_id,
+                    "source_pair_id": record_id,
+                    "frame_index": int(transition_context.get("frame_index", 0) or 0),
+                    "step_index": int(transition_context.get("step_index", -1) if transition_context.get("step_index") is not None else -1),
+                    "region_id": region_id,
+                    "semantic_family": _semantic_family_for_region(region_id),
+                    "canonical_region": str(metadata.get("canonical_region", _region_type(region_id))),
+                    "entity_id": str(metadata.get("entity_id", _entity_id(region_id))),
+                    "bbox": [float(region.bbox.x), float(region.bbox.y), float(region.bbox.w), float(region.bbox.h)],
+                    "bbox_xywh": [float(region.bbox.x), float(region.bbox.y), float(region.bbox.w), float(region.bbox.h)],
+                    "bbox_units": "normalized",
+                    "roi_before_path": str(before_rel_path),
+                    "roi_after_path": str(after_rel_path),
+                    "roi_shape": [int(x) for x in roi_before.shape],
+                    "source_frame": source_path,
+                    "target_frame": target_path,
+                    "region_metadata": metadata,
+                    "transition_context_summary": transition_context,
+                    "selected_render_strategy": "SUPERVISED_EXTERNAL_OBSERVED_ROI",
+                    "synthesis_mode": "observed_frame_pair_roi_external_assets",
+                    "execution_trace_summary": {
+                        "renderer_path": "supervised_observed_frame_pair_external_assets",
+                        "external_roi_asset_mode": True,
+                    },
+                    "metadata_completeness_score": float(metadata.get("metadata_completeness_score", 0.0) or 0.0),
+                    "evidence_strength_score": float(metadata.get("evidence_strength_score", 0.0) or 0.0),
+                    "roi_source": str(metadata.get("roi_source", "observed_region_ref")),
+                    "source_node_type": str(metadata.get("source_node_type", "observed_context")),
+                    "mask_kind": str(metadata.get("mask_kind", "")),
+                    "mask_ref_present": bool(metadata.get("mask_ref")),
+                    "target_source": "provided_ground_truth_roi",
+                    "training_target_quality": "external_or_observed_target",
+                    "target_training_role": "supervised_external",
+                    "source": "observed_frame_pair",
+                    "supervised_quality": {
+                        "changed_ratio": changed_ratio,
+                        "mean_abs_delta": mean_abs_delta,
+                        "semantic_family": _semantic_family_for_region(region_id),
+                        "warnings": [],
+                    },
+                    "diagnostics": {
+                        "external_roi_asset_mode": True,
+                        "roi_before_bytes": before_bytes,
+                        "roi_after_bytes": after_bytes,
+                        "source_frame_path": source_path,
+                        "target_frame_path": target_path,
+                        "region_source": str(metadata.get("roi_source", "observed_region_ref")),
+                        "metadata_completeness_score": float(metadata.get("metadata_completeness_score", 0.0) or 0.0),
+                        "evidence_strength_score": float(metadata.get("evidence_strength_score", 0.0) or 0.0),
+                    },
+                }
                 _validate_supervised_observed_record_invariants(rec)
-            all_records.extend(out.records)
+                all_records.append(rec)
         except Exception as exc:
             skipped_pairs += 1
             if len(invalid_examples) < 16:
@@ -88,19 +158,46 @@ def build_renderer_manifest_from_observed_pairs(*, observed_pairs_path: str, out
     if not all_records:
         raise ValueError("no supervised records exported from observed pairs")
 
-    builder.write_manifest(
-        all_records,
-        output_path,
-        diagnostics={
-            "input_contract_version": "renderer_observed_pair_manifest_input_v1",
-            "total_pairs": len(pairs),
-            "exported_records": len(all_records),
-            "skipped_pairs": skipped_pairs,
-            "invalid_examples": invalid_examples,
-            "strict": bool(strict),
-        },
-    )
-    return ObservedPairsBuildOutput(manifest_path=output_path, diagnostics={"total_pairs": len(pairs), "exported_records": len(all_records), "skipped_pairs": skipped_pairs, "invalid_examples": invalid_examples})
+    diagnostics: dict[str, object] = {
+        "input_contract_version": "renderer_observed_pair_manifest_input_v1",
+        "external_roi_asset_mode": True,
+        "total_pairs": len(pairs),
+        "exported_records": len(all_records),
+        "skipped_pairs": skipped_pairs,
+        "invalid_examples": invalid_examples,
+        "strict": bool(strict),
+        "roi_asset_count": roi_asset_count,
+        "roi_asset_total_bytes": roi_asset_total_bytes,
+        "manifest_json_bytes": 0,
+        "build_timing_sec": 0.0,
+    }
+    manifest: dict[str, object] = {
+        "manifest_type": "renderer_patch_manifest",
+        "contract_version": "renderer_patch_manifest_v2",
+        "source": "observed_frame_pair",
+        "external_roi_asset_mode": True,
+        "record_count": len(all_records),
+        "records": all_records,
+        "builder_diagnostics": diagnostics,
+    }
+    text = _stable_manifest_json(manifest, diagnostics)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(text, encoding="utf-8")
+    diagnostics["build_timing_sec"] = round(time.perf_counter() - started, 6)
+    text = _stable_manifest_json(manifest, diagnostics)
+    output.write_text(text, encoding="utf-8")
+    return ObservedPairsBuildOutput(manifest_path=output_path, diagnostics=diagnostics)
+
+
+def _stable_manifest_json(manifest: dict[str, object], diagnostics: dict[str, object]) -> str:
+    text = ""
+    for _ in range(6):
+        text = json.dumps(manifest, ensure_ascii=False, indent=2)
+        byte_count = len(text.encode("utf-8"))
+        if diagnostics.get("manifest_json_bytes") == byte_count:
+            return text
+        diagnostics["manifest_json_bytes"] = byte_count
+    return json.dumps(manifest, ensure_ascii=False, indent=2)
 
 
 def _read_image(path: str, field: str) -> np.ndarray:
@@ -148,3 +245,25 @@ def _validate_supervised_observed_record_invariants(record: dict[str, object]) -
         raise ValueError("observed-pair record invariant failed: target_training_role must be 'supervised_external'")
     if record.get("target_source") == "self_generated_runtime_target":
         raise ValueError("observed-pair record invariant failed: self_generated_runtime_target is forbidden")
+
+
+def _safe_asset_stem(value: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
+    return stem[:160] or "observed_roi"
+
+
+def _entity_id(region_id: str) -> str:
+    return str(region_id).split(":", 1)[0] if ":" in str(region_id) else "unknown"
+
+
+def _region_type(region_id: str) -> str:
+    return str(region_id).split(":", 1)[1] if ":" in str(region_id) else str(region_id)
+
+
+def _semantic_family_for_region(region_id: str) -> str:
+    lower = str(region_id).lower()
+    if "face" in lower or "head" in lower:
+        return "face_expression"
+    if "torso" in lower or "inner" in lower:
+        return "torso_reveal"
+    return "sleeve_arm_transition"

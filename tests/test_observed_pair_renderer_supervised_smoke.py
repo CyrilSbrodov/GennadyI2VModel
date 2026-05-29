@@ -118,6 +118,7 @@ def test_mixed_manifest_supervised_only_skips_self_generated(tmp_path: Path) -> 
     payload["records"] = [
         valid,
         {
+            "contract_version": "legacy_renderer_embedded_roi",
             "roi_before": [[[0, 0, 0]]],
             "roi_after": [[[1, 1, 1]]],
             "target_source": "runtime_output_patch",

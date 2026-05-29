@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -39,9 +40,92 @@ def test_observed_pair_export_and_dataset_load(tmp_path: Path) -> None:
     assert rec["target_source"] == "provided_ground_truth_roi"
     assert rec["training_target_quality"] == "external_or_observed_target"
     assert rec["target_training_role"] == "supervised_external"
+    assert payload["external_roi_asset_mode"] is True
+    assert payload["builder_diagnostics"]["external_roi_asset_mode"] is True
+    assert payload["builder_diagnostics"]["roi_asset_count"] == 2
+    assert payload["builder_diagnostics"]["roi_asset_total_bytes"] > 0
+    assert payload["builder_diagnostics"]["manifest_json_bytes"] == len(out.read_bytes())
+    assert payload["builder_diagnostics"]["build_timing_sec"] >= 0.0
+    assert rec["roi_before_path"] == "renderer_roi_assets/sample_1_0_person_1_face_before.npy"
+    assert rec["roi_after_path"] == "renderer_roi_assets/sample_1_0_person_1_face_after.npy"
+    assert (out.parent / rec["roi_before_path"]).exists()
+    assert (out.parent / rec["roi_after_path"]).exists()
+    assert "roi_before" not in rec
+    assert "roi_after" not in rec
+    assert "alpha_mask" not in rec
+    manifest_text = out.read_text(encoding="utf-8")
+    assert "[[[" not in manifest_text
     ds = RendererDataset.from_renderer_manifest(str(out), strict=True)
+    assert ds.diagnostics["external_roi_asset_records"] == 1
+    assert ds.diagnostics["external_roi_asset_bytes_loaded"] > 0
     before, after = ds.samples[0]["roi_pairs"][0]
     assert np.mean(np.asarray(before)) < np.mean(np.asarray(after))
+
+
+def test_external_roi_manifest_can_move_with_asset_folder(tmp_path: Path) -> None:
+    src = tmp_path / "s.png"; tgt = tmp_path / "t.png"
+    _png(src, 0.2); _png(tgt, 0.9)
+    source_dir = tmp_path / "source_bundle"
+    source_dir.mkdir()
+    out = source_dir / "manifest.json"
+    build_renderer_manifest_from_observed_pairs(observed_pairs_path=str(_input(tmp_path, [_pair(str(src), str(tgt))])), output_path=str(out), strict=True)
+
+    moved_dir = tmp_path / "moved_bundle"
+    moved_dir.mkdir()
+    shutil.copy2(out, moved_dir / "manifest.json")
+    shutil.copytree(source_dir / "renderer_roi_assets", moved_dir / "renderer_roi_assets")
+
+    ds = RendererDataset.from_renderer_manifest(str(moved_dir / "manifest.json"), strict=True)
+    before, after = ds.samples[0]["roi_pairs"][0]
+    assert np.mean(np.asarray(before)) < np.mean(np.asarray(after))
+
+
+def test_manifest_level_v2_contract_version_loads_legacy_records_strict(tmp_path: Path) -> None:
+    path = tmp_path / "legacy_v2_manifest.json"
+    region_metadata = {
+        "region_id": "person_1:face",
+        "entity_id": "person_1",
+        "canonical_region": "face",
+        "bbox_xywh": [0.0, 0.0, 1.0, 1.0],
+        "roi_source": "parser_mask_bbox",
+        "source_node_type": "body_part",
+        "mask_kind": "semantic",
+        "metadata_completeness_score": 0.8,
+        "evidence_strength_score": 0.7,
+    }
+    record = {
+        "record_id": "legacy:person_1:face",
+        "frame_index": 0,
+        "step_index": 0,
+        "region_id": "person_1:face",
+        "semantic_family": "face_expression",
+        "canonical_region": "face",
+        "entity_id": "person_1",
+        "roi_before": [[[0.1, 0.1, 0.1]]],
+        "roi_after": [[[0.8, 0.8, 0.8]]],
+        "alpha_mask": [[1.0]],
+        "region_metadata": region_metadata,
+        "transition_context_summary": {"summary": "legacy manifest-level contract"},
+        "selected_render_strategy": "SUPERVISED_EXTERNAL_OBSERVED_ROI",
+        "synthesis_mode": "legacy_embedded_roi",
+        "execution_trace_summary": {},
+        "metadata_completeness_score": 0.8,
+        "evidence_strength_score": 0.7,
+        "roi_source": "parser_mask_bbox",
+        "source_node_type": "body_part",
+        "mask_kind": "semantic",
+        "mask_ref_present": False,
+        "target_source": "provided_ground_truth_roi",
+        "training_target_quality": "external_or_observed_target",
+    }
+    path.write_text(
+        json.dumps({"manifest_type": "renderer_patch_manifest", "contract_version": "renderer_patch_manifest_v2", "records": [record]}),
+        encoding="utf-8",
+    )
+
+    ds = RendererDataset.from_renderer_manifest(str(path), strict=True)
+    assert len(ds.samples) == 1
+    assert ds.samples[0]["target_training_role"] == "supervised_external"
 
 
 def test_strict_missing_source_raises(tmp_path: Path) -> None:
