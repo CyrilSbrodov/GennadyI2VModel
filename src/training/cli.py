@@ -45,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--strict", action="store_true", help="Enable strict validation for export-only manifest builders.")
     parser.add_argument("--strict-dataset", action="store_true", help="Enable strict supervised dataset policy.")
     parser.add_argument("--observed-transitions-path", default="", help="Observed graph transitions JSON input path (dynamics_observed_transition_manifest_input_v1).")
+    parser.add_argument("--renderer-backend", default="numpy_local", choices=["numpy_local", "torch_local"], help="Renderer training backend.")
     return parser
 
 
@@ -56,6 +57,7 @@ def main() -> None:
         val_size=args.val_size,
         checkpoint_dir=args.checkpoint_dir,
         learned_dataset_path=args.learned_dataset_path,
+        renderer_backend=args.renderer_backend,
     )
     if args.strict_dataset:
         config.renderer_target_role_policy = "supervised_only"

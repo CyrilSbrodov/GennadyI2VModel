@@ -62,10 +62,12 @@ def build_renderer_manifest_from_observed_pairs(*, observed_pairs_path: str, out
                 strict=strict,
             )
             for rec_idx, rec in enumerate(out.records):
-                _validate_supervised_observed_record_invariants(rec)
                 region_id = str(rec.get("region_id", "")).strip() or f"region_{rec_idx}"
                 rec["source_pair_id"] = record_id
                 rec["record_id"] = f"{record_id}:{region_id}"
+                rec["target_source"] = "provided_ground_truth_roi"
+                rec["training_target_quality"] = "external_or_observed_target"
+                rec["target_training_role"] = "supervised_external"
                 rec.setdefault("diagnostics", {})
                 rec["diagnostics"].update({
                     "source_frame_path": source_path,
@@ -74,6 +76,7 @@ def build_renderer_manifest_from_observed_pairs(*, observed_pairs_path: str, out
                     "metadata_completeness_score": rec.get("metadata_completeness_score", 0.0),
                     "evidence_strength_score": rec.get("evidence_strength_score", 0.0),
                 })
+                _validate_supervised_observed_record_invariants(rec)
             all_records.extend(out.records)
         except Exception as exc:
             skipped_pairs += 1

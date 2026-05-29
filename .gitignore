@@ -10,3 +10,5 @@ yolo11n-seg.pt
 __pycache__/
 *.pyc
 .pytest_cache/
+data/
+artifacts/

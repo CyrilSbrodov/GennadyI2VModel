@@ -7,6 +7,19 @@ from rendering.trainable_patch_renderer import TrainableLocalPatchModel
 
 RENDERER_CHECKPOINT_CONTRACT_VERSION = "renderer_checkpoint.v1"
 
+def _resolve_checkpoint_model_path(checkpoint_path: Path, model_path_value: str) -> Path:
+    model_ref = Path(model_path_value)
+    if model_ref.is_absolute():
+        return model_ref
+    candidates = [
+        model_ref,
+        checkpoint_path.parent / model_ref,
+        checkpoint_path.parent / model_ref.name,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[-1]
 
 def load_renderer_model_from_checkpoint(checkpoint_path: str) -> tuple[TrainableLocalPatchModel | object, str, dict[str, object]]:
     """Load a renderer model using the backend recorded in checkpoint metadata.
@@ -41,9 +54,7 @@ def load_renderer_model_from_checkpoint(checkpoint_path: str) -> tuple[Trainable
     if not model_path_value:
         raise ValueError("Renderer patch checkpoint missing model_path")
 
-    model_path = Path(model_path_value)
-    if not model_path.is_absolute():
-        model_path = checkpoint.parent / model_path
+    model_path = _resolve_checkpoint_model_path(checkpoint, model_path_value)
 
     if backend == "torch_local":
         from rendering.torch_local_patch_generator import TorchLocalPatchGenerator
