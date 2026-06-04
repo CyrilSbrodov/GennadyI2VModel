@@ -38,6 +38,16 @@
 
 ---
 
+## Architecture contract
+
+The architecture is locked by `src/core/pipeline_contract.py`. Runtime traces, training dispatch, and evaluation dispatch must preserve the canonical modular order:
+
+`input → perception → scene_graph → memory → intent → planning → dynamics → region_routing → rendering → compositing → temporal_refinement → output`.
+
+Rendering is forbidden from bypassing region routing, and identity-sensitive generated/inferred/fallback material cannot become authoritative memory. See `docs/architecture_contract.md`.
+
+`runtime_trace` is a top-level canonical stage summary; repeated per-step events stay under `step_execution` or nested event traces.
+
 ## Архитектура (сохранена модульность)
 1. `core/input_layer.py` — unified assets, image/video loading.
 2. `perception/*` — detector/pose/parser/face/objects/tracker adapters.

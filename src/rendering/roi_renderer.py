@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Literal
 
+from core.pipeline_contract import validate_rendering_context
 from core.region_ids import make_region_id, parse_region_id
 from core.routing_contracts import DecisionKind, ExecutionStrategy, RoutingInputStatus, RUNTIME_ROUTING_DECISION_KINDS
 from core.schema import BBox, GarmentSemanticProfile, GraphDelta, RegionDescriptor, RegionMemoryBundle, RegionRef, SceneGraph, VideoMemory
@@ -1245,6 +1246,7 @@ class PatchRenderer:
         transition_context: dict[str, object] | None = None,
     ) -> RenderedPatch:
         _ = (image_tensor, crop_tensor)
+        route_context = validate_rendering_context(region_id=region.region_id, transition_context=transition_context)
         x0, y0, x1, y1 = self._bbox_to_pixels(region.bbox, current_frame)
         roi = crop(current_frame, x0, y0, x1, y1)
         if _is_empty_roi(roi):
@@ -1361,6 +1363,12 @@ class PatchRenderer:
                 "fallback_reason": module_trace.get("backend_fallback_reason", "none"),
                 "tensor_conditioning_summary": (module_trace.get("tensor_batch_surface") or {}).get("conditioning_summary", {}),
             },
+            "region_route_decision": route_context,
+            "routing_region_id": region.region_id,
+            "canonical_region_id": route_context["canonical_region_id"],
+            "render_mode": route_context["render_mode"],
+            "material_provenance": route_context["material_provenance"],
+            "source_provenance": route_context["source_provenance"],
             "memory_dependency_summary": decision.memory_dependency,
             "entity_registration_summary": registration_summary,
             "confidence": confidence_payload["decomposition"],

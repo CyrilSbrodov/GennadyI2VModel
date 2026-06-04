@@ -29,7 +29,9 @@ def _graph_bbox_by_region(scene_graph: SceneGraph) -> dict[str, BBox]:
     out: dict[str, BBox] = {}
     for person in scene_graph.persons:
         for part in person.body_parts:
-            out[f"{person.person_id}:{part.part_type}"] = part.bbox
+            bbox = getattr(part, "bbox", None)
+            if isinstance(bbox, BBox):
+                out[f"{person.person_id}:{part.part_type}"] = bbox
     return out
 
 
@@ -40,6 +42,29 @@ def seed_input_region_observations(scene_graph: SceneGraph, mask_store: InMemory
     for person in scene_graph.persons:
         for part in person.body_parts:
             rid = f"{person.person_id}:{part.part_type}"
+            part_bbox = getattr(part, "bbox", None)
+            if not isinstance(part_bbox, BBox):
+                seeded.append(
+                    FrameRegionObservation(
+                        frame_index=scene_graph.frame_index,
+                        region_id=rid,
+                        bbox=BBox(0.0, 0.0, 0.0, 0.0),
+                        mask_ref=None,
+                        mask_kind="none",
+                        mask_provenance="geometry_missing",
+                        observation_source="no_geometry",
+                        confidence=0.0,
+                        evidence_strength_score=0.0,
+                        metadata_completeness_score=0.0,
+                        drift_score=1.0,
+                        stale_frame_count=0,
+                        is_generated_evidence=False,
+                        is_carry_forward=False,
+                        is_fallback_region=True,
+                        diagnostics={"unsupported": "missing_body_part_bbox"},
+                    )
+                )
+                continue
             mask_ref = part.mask_ref if isinstance(part.mask_ref, str) and part.mask_ref else None
             mask_ref_exists = bool(mask_ref and mask_store.get(mask_ref) is not None)
             if mask_ref_exists:
@@ -59,7 +84,7 @@ def seed_input_region_observations(scene_graph: SceneGraph, mask_store: InMemory
                 FrameRegionObservation(
                     frame_index=scene_graph.frame_index,
                     region_id=rid,
-                    bbox=part.bbox,
+                    bbox=part_bbox,
                     mask_ref=mask_ref,
                     mask_kind="binary" if mask_ref else "none",
                     mask_provenance=mask_provenance,
