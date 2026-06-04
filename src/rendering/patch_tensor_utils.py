@@ -8,6 +8,8 @@ def map_to_shape(value: np.ndarray | None, shape_hw: tuple[int, int], fill: floa
     if value is None:
         return np.full((h, w, 1), fill, dtype=np.float32)
     arr = np.asarray(value, dtype=np.float32)
+    while arr.ndim > 3 and arr.shape[-1] == 1:
+        arr = arr[..., 0]
     if arr.ndim == 2:
         arr = arr[..., None]
     if arr.ndim != 3 or arr.shape[:2] != (h, w):

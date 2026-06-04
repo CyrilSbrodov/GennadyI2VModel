@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from core.input_layer import InputAssetLayer
+from core.pipeline_contract import ContractValidationError, PipelineStage, validate_runtime_trace
 from core.schema import BBox, GraphDelta, ReferencePatchPayload, RegionMemoryBundle, RegionRef, SceneGraph
 from dynamics.state_update import apply_delta
 from learned.factory import BackendBundle, BackendConfig, LearnedBackendFactory
@@ -214,6 +215,44 @@ class GennadyEngine:
         else:
             arr = np.clip(arr, 0.0, 1.0)
         return arr.tolist()
+
+
+    @staticmethod
+    def _material_provenance_for_rendering(*, reference_material: object, region_memory_bundle: object, region_route: object | None) -> str:
+        if reference_material is not None and bool(getattr(reference_material, "material_trusted", False)):
+            return "memory_assisted"
+        if bool(getattr(region_route, "synthesis_required", False)):
+            return "generated"
+        if bool(getattr(region_memory_bundle, "has_current_reuse", False)) or bool(getattr(region_memory_bundle, "has_identity_reference", False)) or bool(getattr(region_memory_bundle, "has_appearance_reference", False)) or bool(getattr(region_memory_bundle, "has_garment_reference", False)):
+            return "memory_assisted"
+        if region_route is not None and str(getattr(region_route, "decision", "")) in {"direct_reuse", "temporal_stabilize", "local_deform_or_update", "expression_refine", "pose_exposure_update", "garment_transition_update"}:
+            return "observed"
+        return "unknown"
+
+    @staticmethod
+    def _rendering_route_context(*, region_id: str, canonical_region: str, region_route: object | None, region_metadata: dict[str, object], reference_material: object, region_memory_bundle: object) -> dict[str, object]:
+        if region_route is None:
+            raise ContractValidationError(f"Rendering for {region_id} has no region routing decision")
+        return {
+            "region_id": region_id,
+            "canonical_region_id": region_id,
+            "canonical_region": canonical_region,
+            "decision": str(getattr(region_route, "decision", "unknown")),
+            "render_mode": str(getattr(region_route, "renderer_mode_hint", "unknown") or "unknown"),
+            "renderer_mode_hint": str(getattr(region_route, "renderer_mode_hint", "unknown") or "unknown"),
+            "reveal_mode": str(getattr(region_route, "reveal_mode", "none") or "none"),
+            "synthesis_required": bool(getattr(region_route, "synthesis_required", False)),
+            "source_provenance": (
+                str(region_metadata.get("source_provenance"))
+                if str(region_metadata.get("source_provenance") or "") not in {"", "unknown"}
+                else str(region_metadata.get("canonical_provenance"))
+                if str(region_metadata.get("canonical_provenance") or "") not in {"", "unknown"}
+                else str(region_metadata.get("roi_source") or "unknown")
+            ),
+            "material_provenance": GennadyEngine._material_provenance_for_rendering(reference_material=reference_material, region_memory_bundle=region_memory_bundle, region_route=region_route),
+            "routing_confidence": float(getattr(region_route, "confidence", 0.0) or 0.0),
+            "routing_reasons": list(getattr(region_route, "reasons", [])),
+        }
 
     @staticmethod
     def _validate_patch_output_contract(patch_out: object, *, expected_region_id: str) -> dict[str, object]:
@@ -623,6 +662,11 @@ class GennadyEngine:
         scene_graph.global_context.fps = fps
         scene_graph.global_context.frame_size = perception_output.frame_size
         scene_graph.global_context.source_type = request.input_type
+        runtime_trace: list[dict[str, object]] = [
+            {"stage": PipelineStage.INPUT.value, "detail": "input_request_built"},
+            {"stage": PipelineStage.PERCEPTION.value, "detail": "perception_output_built"},
+            {"stage": PipelineStage.SCENE_GRAPH.value, "detail": "scene_graph_built"},
+        ]
 
         memory = self.memory_manager.initialize_from_scene(scene_graph)
         memory = self.memory_manager.update_from_frame(
@@ -637,6 +681,7 @@ class GennadyEngine:
                 "immutable_i2v_anchor": True,
             },
         )
+        runtime_trace.append({"stage": PipelineStage.MEMORY.value, "detail": "appearance_memory_initialized"})
         graph_encoding = self.backends.graph_encoder.encode(scene_graph)
         fallback_log: list[str] = []
         renderer_manifest_records: list[dict[str, object]] = []
@@ -652,6 +697,7 @@ class GennadyEngine:
             renderer_manifest_export_contract_version = "renderer_patch_manifest_v2"
 
         action_plan = self.intent_parser.parse(request.text, scene_graph=scene_graph)
+        runtime_trace.append({"stage": PipelineStage.INTENT.value, "detail": "intent_parsed"})
         text_encoding = self.backends.text_encoder.encode(request.text, scene_graph=scene_graph, action_plan=action_plan)
         text_contract = text_output_to_contract(request.text, text_encoding)
         text_parity = build_parity_result(
@@ -681,6 +727,7 @@ class GennadyEngine:
             max(1, len(state_plan.steps)),
             scene_graph.persons[0].person_id if scene_graph.persons else "scene",
         )
+        runtime_trace.append({"stage": PipelineStage.PLANNING.value, "detail": "transition_plan_expanded"})
 
         frames: list[list[list[list[float]]]] = [current_frame]
         graphs = [scene_graph]
@@ -688,7 +735,10 @@ class GennadyEngine:
         dynamics_metrics_log: list[str] = []
         channel_usage_log: list[dict[str, object]] = []
         step_debug: list[dict[str, object]] = []
-        previous_region_observations = seed_input_region_observations(scene_graph, self.perception.mask_store)
+        runtime_mask_store = getattr(self.perception, "mask_store", None)
+        if runtime_mask_store is None or not hasattr(runtime_mask_store, "get") or not hasattr(runtime_mask_store, "put"):
+            raise ContractValidationError("Perception pipeline must expose a mask_store with get/put before runtime mask propagation")
+        previous_region_observations = seed_input_region_observations(scene_graph, runtime_mask_store)
         propagation_debug: list[dict[str, object]] = []
         reconciliation_debug: list[dict[str, object]] = []
         step_reference_coverages: list[dict[str, object]] = []
@@ -722,6 +772,8 @@ class GennadyEngine:
                 identity_embeddings={entity_id: identity_embedding},
                 step_context={"step_index": planned_state.step_index, "memory": memory, "semantic_transition": planned_state.semantic_transition},
             )
+            if not any(item["stage"] == PipelineStage.DYNAMICS.value for item in runtime_trace):
+                runtime_trace.append({"stage": PipelineStage.DYNAMICS.value, "detail": "graph_delta_predicted"})
             transition_output = self.backends.dynamics_backend.predict_transition(transition_request)
             parity_contract = dynamics_io_to_contract(transition_request, transition_output)
             dynamics_parity = build_parity_result(
@@ -745,6 +797,8 @@ class GennadyEngine:
                 memory=memory,
                 semantic_transition=planned_state.semantic_transition,
             )
+            if not any(item["stage"] == PipelineStage.REGION_ROUTING.value for item in runtime_trace):
+                runtime_trace.append({"stage": PipelineStage.REGION_ROUTING.value, "detail": "region_routing_plan_built"})
             transition_diag = delta.transition_diagnostics if isinstance(delta.transition_diagnostics, dict) else {}
             transition_diag["region_routing_plan"] = {
                 make_region_id(region_plan.entity_id, d.canonical_region): {
@@ -850,12 +904,14 @@ class GennadyEngine:
                         "learned_human_state_contract": learned_human_state_contract,
                         "region_selection_rationale": transition_metadata.get("region_selection_rationale", {}),
                         "semantic_families": transition_metadata.get("semantic_families", []),
-                        "region_route_decision": {
-                            "decision": region_route.decision if region_route else "unknown",
-                            "reveal_mode": region_route.reveal_mode if region_route else "none",
-                            "renderer_mode_hint": region_route.renderer_mode_hint if region_route else "keep",
-                            "synthesis_required": region_route.synthesis_required if region_route else False,
-                        },
+                        "region_route_decision": self._rendering_route_context(
+                            region_id=region.region_id,
+                            canonical_region=canonical_region,
+                            region_route=region_route,
+                            region_metadata=region_metadata,
+                            reference_material=reference_material,
+                            region_memory_bundle=region_memory_bundle,
+                        ),
                         "region_memory_bundle": region_memory_bundle,
                         "region_memory_bundle_serialized": asdict(region_memory_bundle),
                         "region_memory_support_level": region_memory_bundle.memory_support_level,
@@ -874,6 +930,8 @@ class GennadyEngine:
                     identity_embedding=identity_embedding,
                     region_metadata=region_metadata,
                 )
+                if not any(item["stage"] == PipelineStage.RENDERING.value for item in runtime_trace):
+                    runtime_trace.append({"stage": PipelineStage.RENDERING.value, "detail": "roi_renderer_executed_with_routing_context"})
                 patch_out = self.backends.patch_backend.synthesize_patch(patch_request)
                 patch_contract_validation = self._validate_patch_output_contract(patch_out, expected_region_id=region.region_id)
                 if patch_contract_validation["issues"]:
@@ -1018,6 +1076,12 @@ class GennadyEngine:
                                 "reference_tensor_zero_fallback",
                                 "reference_tensor_input_channels",
                                 "region_id",
+                                "region_route_decision",
+                                "routing_region_id",
+                                "canonical_region_id",
+                                "render_mode",
+                                "material_provenance",
+                                "source_provenance",
                                 "transition_mode",
                                 "reference_payload_trusted",
                                 "material_gate_mean",
@@ -1046,6 +1110,8 @@ class GennadyEngine:
                     )
                 )
 
+            if not any(item["stage"] == PipelineStage.COMPOSITING.value for item in runtime_trace):
+                runtime_trace.append({"stage": PipelineStage.COMPOSITING.value, "detail": "patches_composited"})
             composed = self.compositor.compose(current_frame, patches, delta)
             temporal_channels = self.build_temporal_memory_channels(memory_channels)
             if patches:
@@ -1078,6 +1144,8 @@ class GennadyEngine:
                         "region_ids": [p.region.region_id for p in patches],
                     },
                 }
+            if not any(item["stage"] == PipelineStage.TEMPORAL_REFINEMENT.value for item in runtime_trace):
+                runtime_trace.append({"stage": PipelineStage.TEMPORAL_REFINEMENT.value, "detail": "temporal_refinement_executed"})
             temporal_request = TemporalRefinementRequest(
                 previous_frame=frames[-1],
                 current_composed_frame=composed,
@@ -1117,7 +1185,7 @@ class GennadyEngine:
                 scene_graph=next_scene_graph,
                 changed_regions=[r.region_id for r in changed_regions],
                 patch_outputs=patches,
-                mask_store=self.perception.mask_store,
+                mask_store=runtime_mask_store,
                 strict=profile.strict_checkpoint_requirements,
             )
             previous_region_observations = propagation_result.observations
@@ -1253,12 +1321,16 @@ class GennadyEngine:
             "error": renderer_manifest_export_error,
         }
 
+        if not any(item["stage"] == PipelineStage.OUTPUT.value for item in runtime_trace):
+            runtime_trace.append({"stage": PipelineStage.OUTPUT.value, "detail": "output_video_frames_ready"})
+        validate_runtime_trace(runtime_trace)
         video_uri = self._export_video(frames, fps)
         return InferenceArtifacts(
             frames=frames,
             scene_graphs=graphs,
             state_plan=state_plan,
             debug={
+                "runtime_trace": runtime_trace,
                 "overlay_log": overlay_log,
                 "dynamics_metrics": dynamics_metrics_log,
                 "step_execution": step_debug,

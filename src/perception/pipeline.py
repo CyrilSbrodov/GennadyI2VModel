@@ -139,6 +139,7 @@ class PerceptionPipeline:
         self._builtin_depth_fallback: MonoDepthEstimator | None = None
         self.strict_perception = cfg.strict_perception
         self.reset_mask_store_per_analyze = cfg.reset_mask_store_per_analyze
+        self.mask_store = DEFAULT_MASK_STORE
 
     @staticmethod
     def _parser_stack_config(config: ParserStackConfig | BackendConfig) -> ParserStackConfig:
@@ -445,6 +446,7 @@ class ParserOnlyPipeline:
         self._builtin_parser_fallback: HumanParser | None = None
         self.strict_perception = cfg.strict_perception
         self.reset_mask_store_per_analyze = cfg.reset_mask_store_per_analyze
+        self.mask_store = DEFAULT_MASK_STORE
 
     @staticmethod
     def _parser_stack_config(config: ParserStackConfig | BackendConfig) -> ParserStackConfig:

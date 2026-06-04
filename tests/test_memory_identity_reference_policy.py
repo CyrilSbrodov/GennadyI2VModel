@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from core.region_ids import make_region_id
 from core.schema import CanonicalRegionMemoryEntry, VideoMemory
 from memory.video_memory import MemoryManager
@@ -149,3 +151,40 @@ def test_non_identity_garment_reference_policy_still_works() -> None:
     assert outer.reliable_as_reference is True
     assert outer.reference_kind == "garment_reference"
     assert bundle.has_garment_reference is True
+
+
+@pytest.mark.parametrize("region", ["face", "head", "hair"])
+@pytest.mark.parametrize("source_flag,provenance", [("generated", "generated"), ("inferred", "parser"), ("fallback", "fallback")])
+def test_non_observed_identity_material_cannot_be_authoritative_memory(region: str, source_flag: str, provenance: str) -> None:
+    manager = MemoryManager()
+    entry = _entry(
+        region,
+        observed_directly=False,
+        generated=(source_flag in {"generated", "fallback"}),
+        inferred=(source_flag in {"inferred", "fallback"}),
+        evidence_score=0.95,
+        confidence=0.95,
+        provenance=provenance,
+    )
+    manager._refresh_reuse_policy(entry)
+    memory = _memory_with(entry)
+
+    bundle = manager.get_region_memory_bundle(memory, "p1", region)
+
+    assert entry.reliable_as_reference is False
+    assert entry.reference_kind != "identity_reference"
+    assert bundle.has_identity_reference is False
+
+
+@pytest.mark.parametrize("region", ["face", "head", "hair"])
+def test_observed_high_confidence_identity_material_can_be_authoritative_when_policy_allows(region: str) -> None:
+    manager = MemoryManager()
+    entry = _entry(region, observed_directly=True, generated=False, inferred=False, evidence_score=0.86, confidence=0.88)
+    manager._refresh_reuse_policy(entry)
+    memory = _memory_with(entry)
+
+    bundle = manager.get_region_memory_bundle(memory, "p1", region)
+
+    assert entry.reliable_as_reference is True
+    assert entry.reference_kind == "identity_reference"
+    assert bundle.has_identity_reference is True

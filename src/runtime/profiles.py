@@ -17,6 +17,7 @@ class RuntimeProfile:
     temporal_window: int
     frame_budget_ms: int
     debug_artifacts: bool = False
+    strict_checkpoint_requirements: bool = False
 
 
 LIGHTWEIGHT = RuntimeProfile(

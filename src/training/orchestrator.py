@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from core.pipeline_contract import ContractValidationError, PipelineStage
+from learned.factory import BackendConfig
 from evaluation.contracts import (
     build_graph_eval_payload,
     build_hidden_reconstruction_payload,
@@ -22,6 +24,53 @@ from training.temporal_transition_trainer import TemporalTransitionTrainer
 from training.human_state_transition_trainer import HumanStateTransitionTrainer
 from training.types import StageResult, StageTrainer, TrainingConfig
 
+CANONICAL_TRAINING_STAGE_ALIASES = {
+    "input": "input",
+    "perception": "perception",
+    "scene_graph": "scene_graph",
+    "memory": "memory",
+    "intent": "intent",
+    "planning": "planning",
+    "dynamics": "dynamics",
+    "region_routing": "region_routing",
+    "rendering": "rendering",
+    "compositing": "compositing",
+    "temporal_refinement": "temporal_refinement",
+    "output": "output",
+    # Explicit, non-ambiguous compatibility aliases.
+    "representation": "scene_graph",
+    "renderer": "rendering",
+    "patch_synthesis": "rendering",
+    "text_encoder": "intent",
+    "dynamics_transition": "dynamics",
+    "stage5_memory": "memory",
+}
+
+LEGACY_STAGE_ALIASES: dict[str, str] = {}
+
+
+def canonical_training_stage_name(stage_name: str) -> str:
+    name = str(stage_name or "").strip()
+    name = LEGACY_STAGE_ALIASES.get(name, name)
+    canonical = CANONICAL_TRAINING_STAGE_ALIASES.get(name)
+    if canonical is None:
+        known = sorted(set(CANONICAL_TRAINING_STAGE_ALIASES) | set(LEGACY_STAGE_ALIASES))
+        raise ContractValidationError(f"Unknown training stage {stage_name!r}. Known stages/aliases: {known}")
+    if canonical not in {stage.value for stage in PipelineStage}:
+        raise ContractValidationError(f"Training stage {stage_name!r} maps outside canonical pipeline: {canonical!r}")
+    return canonical
+
+
+class MemoryTrainer:
+    stage_name = "memory"
+
+    def train(self, config: TrainingConfig) -> StageResult:
+        raise NotImplementedError(
+            "Memory is a canonical first-class stage, but standalone memory training "
+            "is not implemented. Use existing MemoryDataset builders for data "
+            "contracts; do not normalize memory to representation."
+        )
+
 
 class ReplayBuffer:
     def __init__(self) -> None:
@@ -43,13 +92,13 @@ def evaluate_stage(result: StageResult) -> dict[str, float]:
         "identity_preservation": 1.0 - result.train_metrics.get("loss", 1.0),
     }
     contract_payload = result.val_metrics.get("contract_payload")
-    stage = result.stage_name
+    stage = canonical_training_stage_name(result.stage_name)
     eval_payloads = []
-    if isinstance(contract_payload, dict) and stage == "text_encoder":
+    if isinstance(contract_payload, dict) and stage == "intent":
         eval_payloads.append(text_action_alignment_eval(build_text_eval_payload(contract_payload)))
-    if isinstance(contract_payload, dict) and stage == "dynamics_transition":
+    if isinstance(contract_payload, dict) and stage == "dynamics":
         eval_payloads.append(graph_transition_eval(build_graph_eval_payload(contract_payload)))
-    if isinstance(contract_payload, dict) and stage == "patch_synthesis":
+    if isinstance(contract_payload, dict) and stage == "rendering":
         eval_payloads.append(patch_synthesis_eval(build_patch_eval_payload(contract_payload)))
         eval_payloads.append(hidden_region_reconstruction_eval(build_hidden_reconstruction_payload(contract_payload)))
     if isinstance(contract_payload, dict) and stage == "temporal_refinement":
@@ -70,6 +119,7 @@ def _build_stage_trainers() -> dict[str, StageTrainer]:
     trainers: list[StageTrainer] = [
         PerceptionTrainer(),
         RepresentationTrainer(),
+        MemoryTrainer(),
         DynamicsTrainer(),
         RendererTrainer(),
         TemporalTrainer(),
@@ -80,20 +130,27 @@ def _build_stage_trainers() -> dict[str, StageTrainer]:
 
 
 def train_learned_stage(stage_name: str, config: TrainingConfig, backend: str = "baseline") -> StageResult:
-    runner = build_stage_runner(stage_name, backend=backend, backend_config=config.learned_backend_config)
+    canonical = canonical_training_stage_name(stage_name)
+    if canonical == "rendering" and backend == "baseline":
+        backend = "numpy_local"
+    runner_stage = "text_encoder" if canonical == "intent" else ("patch_synthesis" if canonical == "rendering" else ("temporal_refinement" if canonical == "temporal_refinement" else stage_name))
+    backend_config = config.learned_backend_config
+    if canonical == "rendering" and backend_config is None:
+        backend_config = BackendConfig(patch_backend="baseline", dynamics_backend="baseline", temporal_backend="baseline")
+    runner = build_stage_runner(runner_stage, backend=backend, backend_config=backend_config)
     scaffold = StageScaffoldConfig(
-        stage_name=stage_name,
+        stage_name=runner_stage,
         model_backend=backend,
         batch_size=config.batch_size,
         learning_rate=config.learning_rate,
         epochs=config.epochs,
-        checkpoint_path=f"{config.checkpoint_dir}/{stage_name}.ckpt",
+        checkpoint_path=f"{config.checkpoint_dir}/{canonical}.ckpt",
         dataset_path=config.learned_dataset_path,
-        backend_config=config.learned_backend_config,
+        backend_config=backend_config,
     )
     result = runner.run(scaffold)
     return StageResult(
-        stage_name=result.stage_name,
+        stage_name=canonical,
         train_metrics=result.train_metrics or {"progress": 0.5, "loss": 0.5},
         val_metrics=result.val_metrics or {"score": 0.5},
         checkpoint_path=result.checkpoint_path,
@@ -101,33 +158,25 @@ def train_learned_stage(stage_name: str, config: TrainingConfig, backend: str = 
 
 
 def train_stage(stage_name: str, config: TrainingConfig) -> StageResult:
-    if stage_name in {"text_encoder", "patch_synthesis"}:
-        return train_learned_stage(stage_name, config)
-    if stage_name in {"dynamics_transition", "dynamics"}:
-        return DynamicsTrainer().train(config)
+    canonical = canonical_training_stage_name(stage_name)
+    if canonical in {"intent", "rendering", "temporal_refinement"} and stage_name in {"text_encoder", "intent", "patch_synthesis", "renderer", "rendering", "temporal_refinement"}:
+        return train_learned_stage(canonical, config)
+    if canonical == "dynamics":
+        result = DynamicsTrainer().train(config)
+        return StageResult(stage_name="dynamics", train_metrics=result.train_metrics, val_metrics=result.val_metrics, checkpoint_path=result.checkpoint_path)
     trainers = _build_stage_trainers()
-    if stage_name not in trainers:
-        known = ", ".join(sorted(trainers))
-        raise ValueError(f"Unknown stage '{stage_name}'. Available stages: {known}")
-    return trainers[stage_name].train(config)
+    trainer_key = "representation" if canonical == "scene_graph" else canonical
+    if trainer_key not in trainers:
+        known = ", ".join(sorted(set(trainers) | {"scene_graph", "rendering", "intent"}))
+        raise ContractValidationError(f"Unknown stage '{stage_name}'. Available stages: {known}")
+    result = trainers[trainer_key].train(config)
+    return StageResult(stage_name=canonical, train_metrics=result.train_metrics, val_metrics=result.val_metrics, checkpoint_path=result.checkpoint_path)
 
 
 def train_pipeline(config: TrainingConfig) -> list[StageResult]:
-    stage_map = {
-        "stage1_perception": "perception",
-        "stage2_representation": "representation",
-        "stage3_dynamics": "dynamics_transition",
-        "stage4_renderer": "renderer",
-        "stage5_memory": "representation",
-        "stage6_temporal": "temporal_refinement",
-        "stage6b_temporal_transition": "temporal_transition",
-        "stage6c_human_state_transition": "human_state_transition",
-        "stage7_instruction": "text_encoder",
-        "stage8_joint_tuning": "renderer",
-    }
     replay = ReplayBuffer()
     requested = config.stage_order
-    normalized = [stage_map.get(name, name) for name in requested]
+    normalized = [canonical_training_stage_name(name) for name in requested]
     results: list[StageResult] = []
     for stage_name in normalized:
         result = train_stage(stage_name, config)

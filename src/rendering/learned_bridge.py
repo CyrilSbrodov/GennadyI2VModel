@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from core.pipeline_contract import ContractValidationError, validate_rendering_context
 from core.schema import GraphDelta, VideoMemory
 from learned.interfaces import PatchSynthesisModel, PatchSynthesisOutput, PatchSynthesisRequest
 from rendering.roi_renderer import PatchRenderer
@@ -22,6 +23,7 @@ class LegacyDeterministicPatchSynthesisModel(PatchSynthesisModel):
         self.renderer = renderer or PatchRenderer()
 
     def synthesize_patch(self, request: PatchSynthesisRequest) -> PatchSynthesisOutput:
+        validate_rendering_context(region_id=request.region.region_id, transition_context=request.transition_context, region_metadata=request.region_metadata)
         delta = request.transition_context.get("graph_delta")
         memory = request.transition_context.get("video_memory")
         if not isinstance(delta, GraphDelta) or not isinstance(memory, VideoMemory):
@@ -134,6 +136,7 @@ class TrainablePatchSynthesisModel(PatchSynthesisModel):
         }
 
     def synthesize_patch(self, request: PatchSynthesisRequest) -> PatchSynthesisOutput:
+        route_context = validate_rendering_context(region_id=request.region.region_id, transition_context=request.transition_context, region_metadata=request.region_metadata)
         request_contract = summarize_request_contract(request)
         try:
             roi_before = _extract_roi(request.current_frame, request.region)
@@ -161,6 +164,12 @@ class TrainablePatchSynthesisModel(PatchSynthesisModel):
                     "torch_backend_used": torch_used,
                     "model_family": "local_conv_conditioned_patch_generator" if torch_used else "numpy_linear_patch_generator",
                     "conditioning_summary": batch_summary,
+                    "region_route_decision": route_context,
+                    "routing_region_id": request.region.region_id,
+                    "canonical_region_id": route_context["canonical_region_id"],
+                    "render_mode": route_context["render_mode"],
+                    "material_provenance": route_context["material_provenance"],
+                    "source_provenance": route_context["source_provenance"],
                     "conditioning": {
                         "has_graph_encoding": bool(request.graph_encoding),
                         "identity_dim": len(request.identity_embedding),
@@ -179,6 +188,8 @@ class TrainablePatchSynthesisModel(PatchSynthesisModel):
                 },
                 batch=batch,
             )
+        except ContractValidationError:
+            raise
         except (RendererInputError, RendererInferenceError, ValueError) as err:
             if self.strict_mode:
                 raise

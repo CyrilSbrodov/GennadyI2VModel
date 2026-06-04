@@ -809,8 +809,23 @@ class PatchSynthesisStageRunner(_BaseStageRunner):
         for idx, sample in enumerate(samples):
             memory = mm.initialize(sample["graph"])
             graph_enc = self.backends.graph_encoder.encode(sample["graph"])
+            route_context = {
+                "region_id": sample["region"].region_id,
+                "canonical_region_id": sample["region"].region_id,
+                "canonical_region": str(sample["region"].region_id).split(":", 1)[1] if ":" in str(sample["region"].region_id) else str(sample["region"].region_id),
+                "decision": "local_deform_or_update",
+                "render_mode": "refine",
+                "renderer_mode_hint": "refine",
+                "reveal_mode": "none",
+                "synthesis_required": False,
+                "source_provenance": "training_manifest",
+                "material_provenance": "observed",
+                "routing_confidence": 1.0,
+                "routing_reasons": ["training_patch_contract"],
+            }
             transition_context = {
-                "graph_delta": GraphDelta(affected_entities=["p1"], affected_regions=[sample["region"].region_id], region_transition_mode={sample["region"].region_id: "motion"}),
+                "graph_delta": GraphDelta(affected_entities=["p1"], affected_regions=[sample["region"].region_id], region_transition_mode={sample["region"].region_id: "motion"}, transition_diagnostics={"region_routing_plan": {sample["region"].region_id: route_context}}),
+                "region_route_decision": route_context,
                 "video_memory": memory,
                 "supervision_mode": "supervision" if any(sample.get(k) is not None for k in ("target_selected_strategy", "target_synthesis_mode", "target_hidden_lifecycle", "target_retrieval_richness", "target_region_metadata")) else "inference",
                 "has_ground_truth_targets": any(sample.get(k) is not None for k in ("target_selected_strategy", "target_synthesis_mode", "target_hidden_lifecycle", "target_retrieval_richness", "target_region_metadata")),
@@ -830,6 +845,7 @@ class PatchSynthesisStageRunner(_BaseStageRunner):
                 memory_channels={"identity": {"requested": True}, "garments": {}, "hidden_regions": sample.get("hidden_state", {})},
                 graph_encoding=graph_enc,
                 identity_embedding=[0.1 + 0.01 * idx] * 8,
+                region_metadata={"region_id": sample["region"].region_id, "source_provenance": "training_manifest"},
             )
             out = self.backends.patch_backend.synthesize_patch(req)
             contract = build_patch_synthesis_contract(
