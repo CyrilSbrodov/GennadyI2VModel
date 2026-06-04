@@ -59,3 +59,9 @@ Mask ownership is instance-local: every `PerceptionPipeline`/`ParserOnlyPipeline
 Single-image I2V identity is represented as `identity_observation_status="single_frame_anchor"` with `track_provenance="single_frame_observed"`; it is not treated as proven temporal tracking. In video perception, the first occurrence of a tracker id is `tracker_single_frame_observed`; only a repeated tracker id across frames becomes `multi_frame_tracked`.
 
 Face, head, and hair are identity-sensitive regions. Parser/face evidence for those regions is preserved with provenance, confidence, observation status, and mask evidence type. Missing face/head/hair evidence remains unknown/missing; generated or fallback face/head/hair material cannot be marked observed. Parser masks are marked as `parser_mask`; bbox-only projections must remain distinguishable as bbox/fallback/inferred evidence.
+
+## Sprint 2 body ontology lock
+
+The canonical adult human body ontology lives in `src/core/body_ontology.py` and is the single source for anatomical body-region IDs, parent/child topology, side, applicability policy, parser support, motion role, routing addressability, and memory family. Scene graph body-part construction, parser mappings, routing metadata, and memory reference families must preserve this ontology and must not collapse chest/breast/pelvis/groin/private/limb subregions into generic torso or pelvis blobs.
+
+Applicability, visibility, observation status, and parser support are independent. Not visible, not parsed, unknown, unsupported, or hidden regions must not become fake observed anatomy. Optional sex-specific/private regions are representation addresses only; this sprint does not add sex classification, hidden anatomy inference, reveal generation, explicit anatomy rendering, or soft-tissue physics.

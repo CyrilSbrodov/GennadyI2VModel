@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from core.body_ontology import CANONICAL_BODY_REGION_ORDER
 from core.schema import BodyPartNode, GarmentNode, GlobalSceneContext, PersonNode, RelationEdge, SceneGraph, SceneObjectNode
 from perception.pipeline import PerceptionOutput
 from representation.canonical_human_state import CanonicalHumanSceneProcessor, canonical_relations_to_edges, canonical_state_to_dict
@@ -44,22 +45,7 @@ class SceneGraphBuilder:
             canonical_states.append(canonical)
             canonical_regions = canonical.regions
 
-            body_part_order = [
-                "head",
-                "face",
-                "hair",
-                "neck",
-                "torso",
-                "left_arm",
-                "right_arm",
-                "left_hand",
-                "right_hand",
-                "pelvis",
-                "left_leg",
-                "right_leg",
-                "upper_body",
-                "lower_body",
-            ]
+            body_part_order = list(CANONICAL_BODY_REGION_ORDER)
             body_parser_meta: dict[str, dict[str, object]] = {}
             for raw_part in p.body_parts:
                 part_type = str(raw_part.get("part_type", "")).lower().strip()
@@ -101,6 +87,15 @@ class SceneGraphBuilder:
                         mask_evidence_type=getattr(region, "mask_evidence_type", "unknown"),
                         bbox_provenance=p.bbox_source,
                         suitable_for_memory_seeding=bool(getattr(region, "suitable_for_memory_seeding", False)),
+                        exists_in_ontology=bool(getattr(region, "exists_in_ontology", False)),
+                        applicability=str(getattr(region, "applicability", "unknown_applicability")),
+                        parent_region=getattr(region, "parent_region", None),
+                        child_regions=list(getattr(region, "child_regions", [])),
+                        symmetry_partner=getattr(region, "symmetry_partner", None),
+                        motion_role=str(getattr(region, "motion_role", "unknown")),
+                        memory_family=str(getattr(region, "memory_family", "unknown")),
+                        routing_enabled=bool(getattr(region, "routing_enabled", True)),
+                        parser_support_level=str(getattr(region, "parser_support_level", "unsupported")),
                     )
                 )
 

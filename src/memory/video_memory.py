@@ -6,6 +6,7 @@ import random
 
 import numpy as np
 
+from core.body_ontology import CANONICAL_BODY_REGION_ORDER, get_body_region_metadata
 from core.semantic_roi import SemanticROIHelper
 from core.region_ids import make_region_id, parse_region_id
 from core.reference_families import (
@@ -57,19 +58,7 @@ class MemoryManager:
         "appearance_reference": (0.58, 0.56),
     }
 
-    _CANONICAL_MEMORY_REGIONS = (
-        "face",
-        "hair",
-        "head",
-        "neck",
-        "torso",
-        "left_arm",
-        "right_arm",
-        "left_hand",
-        "right_hand",
-        "pelvis",
-        "left_leg",
-        "right_leg",
+    _CANONICAL_MEMORY_REGIONS = tuple(CANONICAL_BODY_REGION_ORDER) + (
         "upper_garment",
         "lower_garment",
         "outer_garment",
@@ -1449,7 +1438,15 @@ class MemoryManager:
             "accessories": "accessories",
             "garments": "upper_garment",
             "sleeves": "upper_garment",
-            "legs": "left_leg",
+            "legs": "legs",
+            "feet": "feet",
+            "chest": "chest",
+            "abdomen": "abdomen",
+            "hips": "hips",
+            "buttocks": "buttocks",
+            "left_breast": "left_breast",
+            "right_breast": "right_breast",
+            "external_genital_region": "external_genital_region",
         }
         canonical = direct.get(region_type)
         if canonical in self._CANONICAL_MEMORY_REGIONS:
@@ -1457,8 +1454,15 @@ class MemoryManager:
         return None
 
     def _memory_kind_for_region(self, canonical_region: str) -> str:
-        if canonical_region in {"face", "hair", "head", "neck"}:
-            return "identity"
+        meta = get_body_region_metadata(canonical_region)
+        if meta is not None:
+            if meta.memory_family == "identity":
+                return "identity"
+            if meta.memory_family == "private":
+                return "private"
+            if meta.memory_family == "soft_tissue":
+                return "body"
+            return "body" if meta.memory_family in {"body_shape", "skin"} else meta.memory_family
         if canonical_region in {"upper_garment", "lower_garment", "outer_garment", "inner_garment"}:
             return "garment"
         if canonical_region == "accessories":
@@ -1647,6 +1651,9 @@ class MemoryManager:
         canonical_regions = getattr(person, "canonical_regions", {}) or {}
         for canonical_name in self._CANONICAL_MEMORY_REGIONS:
             raw = canonical_regions.get(canonical_name, {}) if isinstance(canonical_regions, dict) else {}
+            applicability = str(raw.get("applicability", "applicable"))
+            if applicability in {"not_applicable", "unknown_applicability", "unsupported_by_current_parser"} and not raw.get("mask_ref"):
+                continue
             visibility = str(raw.get("visibility_state", "unknown_expected_region"))
             lifecycle_state = str(raw.get("lifecycle_state", "") or "").strip().lower()
             last_transition_mode = str(raw.get("last_transition_mode", "") or "").strip()

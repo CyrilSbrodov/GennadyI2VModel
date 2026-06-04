@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from core.body_ontology import CANONICAL_BODY_REGION_IDS
 from core.region_ids import parse_region_id
 from core.schema import BBox, GraphDelta, RegionRef, SceneGraph, VideoMemory
 from perception.mask_store import DEFAULT_MASK_STORE, InMemoryMaskStore
@@ -10,7 +11,7 @@ from runtime.region_routing import RegionRoutingDecision
 
 ROI_SOURCES = {"parser_mask_bbox", "body_part_keypoints", "garment_coverage", "person_bbox_fallback", "unknown"}
 SOURCE_NODE_TYPES = {"body_part", "garment", "face_region", "canonical_region", "fallback"}
-_BODY_REGIONS = {"head", "hair", "neck", "torso", "pelvis", "left_arm", "right_arm", "left_hand", "right_hand", "left_leg", "right_leg", "arms", "hands", "legs"}
+_BODY_REGIONS = set(CANONICAL_BODY_REGION_IDS)
 _FACE_REGIONS = {"face", "eyes", "mouth", "cheek"}
 _GARMENT_REGIONS = {"garments", "outer_garment", "upper_garment", "lower_garment", "inner_garment", "sleeves", "dress", "accessories"}
 _CRITICAL_FIELDS = ("region_id", "entity_id", "canonical_region", "bbox_xywh", "roi_source", "source_node_type")
@@ -245,6 +246,16 @@ def build_region_metadata(
         "canonical_source_regions": list(canonical.get("source_regions", [])) if isinstance(canonical.get("source_regions", []), list) else [],
         "canonical_coverage_hints": list(canonical.get("coverage_hints", [])) if isinstance(canonical.get("coverage_hints", []), list) else [],
         "canonical_attachment_hints": list(canonical.get("attachment_hints", [])) if isinstance(canonical.get("attachment_hints", []), list) else [],
+        "ontology_region_exists": bool(canonical.get("exists_in_ontology", canonical_region in _BODY_REGIONS)),
+        "applicability": str(canonical.get("applicability", "unknown_applicability")),
+        "observation_status": str(canonical.get("observation_status", getattr(source_node, "observation_status", "unknown") if source_node is not None else "unknown")),
+        "mask_evidence_type": str(canonical.get("mask_evidence_type", getattr(source_node, "mask_evidence_type", "unknown") if source_node is not None else "unknown")),
+        "parent_region": canonical.get("parent_region"),
+        "child_regions": list(canonical.get("child_regions", [])) if isinstance(canonical.get("child_regions", []), list) else [],
+        "symmetry_partner": canonical.get("symmetry_partner"),
+        "motion_role": str(canonical.get("motion_role", "unknown")),
+        "memory_family": str(canonical.get("memory_family", "unknown")),
+        "parser_support_level": str(canonical.get("parser_support_level", "unsupported")),
         "route_decision": route_decision.decision if route_decision is not None else "unknown",
         "renderer_mode_hint": route_decision.renderer_mode_hint if route_decision is not None else "unknown",
         "reveal_mode": route_decision.reveal_mode if route_decision is not None else "none",

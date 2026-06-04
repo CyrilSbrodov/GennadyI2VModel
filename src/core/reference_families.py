@@ -1,18 +1,12 @@
 from __future__ import annotations
 
-CORE_IDENTITY_REGIONS = {"face", "head", "hair"}
-SKIN_REFERENCE_REGIONS = {"neck", "left_hand", "right_hand", "hands"}
-BODY_SHAPE_REFERENCE_REGIONS = {
-    "torso",
-    "upper_body",
-    "lower_body",
-    "pelvis",
-    "left_arm",
-    "right_arm",
-    "left_leg",
-    "right_leg",
-    "legs",
-}
+from core.body_ontology import BODY_ONTOLOGY
+
+CORE_IDENTITY_REGIONS = {name for name, meta in BODY_ONTOLOGY.items() if meta.memory_family == "identity"} | {"face", "head", "hair", "scalp"}
+SKIN_REFERENCE_REGIONS = {name for name, meta in BODY_ONTOLOGY.items() if meta.memory_family == "skin"}
+BODY_SHAPE_REFERENCE_REGIONS = {name for name, meta in BODY_ONTOLOGY.items() if meta.memory_family == "body_shape"}
+SOFT_TISSUE_REFERENCE_REGIONS = {name for name, meta in BODY_ONTOLOGY.items() if meta.memory_family == "soft_tissue"}
+PRIVATE_REFERENCE_REGIONS = {name for name, meta in BODY_ONTOLOGY.items() if meta.memory_family == "private"}
 GARMENT_REFERENCE_REGIONS = {
     "upper_garment",
     "lower_garment",
@@ -27,6 +21,8 @@ REFERENCE_KIND_BY_FAMILY = {
     "identity": "identity_reference",
     "skin": "skin_reference",
     "body_shape": "body_shape_reference",
+    "soft_tissue": "body_shape_reference",
+    "private": "none",
     "garment": "garment_reference",
     "accessory": "accessory_reference",
 }
@@ -38,6 +34,10 @@ def reference_family_for_region(region_type: str) -> str:
         return "identity"
     if canonical in SKIN_REFERENCE_REGIONS:
         return "skin"
+    if canonical in SOFT_TISSUE_REFERENCE_REGIONS:
+        return "soft_tissue"
+    if canonical in PRIVATE_REFERENCE_REGIONS:
+        return "private"
     if canonical in BODY_SHAPE_REFERENCE_REGIONS:
         return "body_shape"
     if canonical in GARMENT_REFERENCE_REGIONS:
