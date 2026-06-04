@@ -48,7 +48,28 @@ class CanonicalRegionLifecyclePayload(TypedDict, total=False):
     last_update_source: str
 
 
-class CanonicalRegionPayload(CanonicalRegionPayloadBase, CanonicalRegionLifecyclePayload):
+
+
+class CanonicalRegionOntologyPayload(TypedDict, total=False):
+    exists_in_ontology: bool
+    applicability: str
+    parent_region: str | None
+    child_regions: list[str]
+    symmetry_partner: str | None
+    motion_role: str
+    memory_family: str
+    routing_enabled: bool
+    parser_support_level: str
+    anatomical_group: str
+    side: str
+    sex_applicability: str
+    identity_relevance: str
+    soft_tissue_relevance: str
+    clothing_interaction_relevance: str
+    provenance_requirement: str
+
+
+class CanonicalRegionPayload(CanonicalRegionPayloadBase, CanonicalRegionLifecyclePayload, CanonicalRegionOntologyPayload):
     pass
 
 
@@ -118,6 +139,15 @@ class BodyPartNode:
     mask_evidence_type: str = "unknown"
     bbox_provenance: str = "unknown"
     suitable_for_memory_seeding: bool = False
+    exists_in_ontology: bool = False
+    applicability: str = "unknown_applicability"
+    parent_region: str | None = None
+    child_regions: list[str] = field(default_factory=list)
+    symmetry_partner: str | None = None
+    motion_role: str = "unknown"
+    memory_family: str = "unknown"
+    routing_enabled: bool = True
+    parser_support_level: str = "unsupported"
 
 
 @dataclass(slots=True)

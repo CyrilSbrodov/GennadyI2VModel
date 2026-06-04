@@ -2,66 +2,42 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from core.body_ontology import BODY_ONTOLOGY, CANONICAL_BODY_REGION_ORDER, BodyRegionApplicability, get_body_region_metadata
 from core.schema import CanonicalRelationPayload, CanonicalRegionPayload, RelationEdge
 from perception.mask_projection import project_mask_to_frame
 from perception.mask_store import DEFAULT_MASK_STORE
 from perception.pipeline import ObjectFacts, PersonFacts
 
-_CANONICAL_REGION_ORDER = [
-    "head",
-    "face",
-    "hair",
-    "neck",
-    "torso",
-    "left_arm",
-    "right_arm",
-    "left_hand",
-    "right_hand",
-    "pelvis",
-    "left_leg",
-    "right_leg",
-    "upper_body",
-    "lower_body",
-    "upper_garment",
-    "lower_garment",
-    "outer_garment",
-    "inner_garment",
-    "accessories",
-]
+_GARMENT_REGION_ORDER = ("upper_garment", "lower_garment", "outer_garment", "inner_garment", "accessories")
+_CANONICAL_REGION_ORDER = list(CANONICAL_BODY_REGION_ORDER) + list(_GARMENT_REGION_ORDER)
 
 _COMPOSITE_CHILDREN = {
-    "head": ["face", "hair", "neck"],
-    "upper_body": ["torso", "left_arm", "right_arm", "left_hand", "right_hand"],
-    "lower_body": ["pelvis", "left_leg", "right_leg"],
+    name: list(meta.child_regions) for name, meta in BODY_ONTOLOGY.items() if meta.child_regions
 }
+_COMPOSITE_CHILDREN.update({
+    "upper_body": ["torso", "left_arm", "right_arm"],
+    "lower_body": ["pelvis", "left_leg", "right_leg"],
+    "arms": ["left_arm", "right_arm"],
+    "hands": ["left_hand", "right_hand"],
+    "legs": ["left_leg", "right_leg"],
+    "feet": ["left_foot", "right_foot"],
+})
 
 BODY_PART_MAP = {
-    "head": "head",
-    "neck": "neck",
-    "torso": "torso",
-    "pelvis": "pelvis",
-    "face": "face",
-    "hair": "hair",
-    "left_arm": "left_arm",
-    "left_upper_arm": "left_arm",
-    "left_lower_arm": "left_arm",
-    "right_arm": "right_arm",
-    "right_upper_arm": "right_arm",
-    "right_lower_arm": "right_arm",
-    "arms": "left_arm",
-    "left_hand": "left_hand",
-    "right_hand": "right_hand",
-    "hands": "left_hand",
-    "left_leg": "left_leg",
-    "left_upper_leg": "left_leg",
-    "left_lower_leg": "left_leg",
-    "right_leg": "right_leg",
-    "right_upper_leg": "right_leg",
-    "right_lower_leg": "right_leg",
-    "legs": "left_leg",
+    name: name for name in CANONICAL_BODY_REGION_ORDER
 }
+BODY_PART_MAP.update({
+    "arm": "arms",
+    "left_lower_arm": "left_forearm",
+    "right_lower_arm": "right_forearm",
+    "left_upper_leg": "left_thigh",
+    "right_upper_leg": "right_thigh",
+    "left_lower_leg": "left_calf",
+    "right_lower_leg": "right_calf",
+    "foot": "feet",
+})
 
-FACE_REGION_MAP = {"face": "face", "hair": "hair", "neck": "neck", "head": "head"}
+FACE_REGION_MAP = {"face": "face", "hair": "hair", "neck": "neck", "head": "head", "scalp": "scalp", "forehead": "forehead", "left_eye": "left_eye", "right_eye": "right_eye", "nose": "nose", "mouth": "mouth", "lips": "lips", "left_ear": "left_ear", "right_ear": "right_ear", "jaw": "jaw", "chin": "chin"}
 
 GARMENT_REGION_MAP = {
     "coat": "outer_garment",
@@ -128,6 +104,22 @@ class CanonicalRegion:
     observation_status: str = "unknown"
     mask_evidence_type: str = "unknown"
     suitable_for_memory_seeding: bool = False
+    exists_in_ontology: bool = False
+    applicability: str = "unknown_applicability"
+    parent_region: str | None = None
+    child_regions: list[str] = field(default_factory=list)
+    symmetry_partner: str | None = None
+    motion_role: str = "unknown"
+    memory_family: str = "unknown"
+    routing_enabled: bool = True
+    parser_support_level: str = "unsupported"
+    anatomical_group: str = "unknown"
+    side: str = "none"
+    sex_applicability: str = "unknown"
+    identity_relevance: str = "none"
+    soft_tissue_relevance: str = "none"
+    clothing_interaction_relevance: str = "unknown"
+    provenance_requirement: str = "unknown"
 
 
 @dataclass(slots=True)
@@ -149,7 +141,7 @@ class CanonicalPersonState:
 
 class CanonicalHumanNormalizer:
     def normalize(self, person: PersonFacts, person_id: str) -> CanonicalPersonState:
-        regions = {name: CanonicalRegion(canonical_name=name) for name in _CANONICAL_REGION_ORDER}
+        regions = {name: self._new_region(name) for name in _CANONICAL_REGION_ORDER}
         self._seed_composites(regions)
 
         for part in person.body_parts:
@@ -269,22 +261,45 @@ class CanonicalHumanNormalizer:
         return CanonicalPersonState(person_id=person_id, regions=regions)
 
     @staticmethod
+    def _new_region(name: str) -> CanonicalRegion:
+        region = CanonicalRegion(canonical_name=name)
+        meta = get_body_region_metadata(name)
+        if meta is None:
+            return region
+        region.exists_in_ontology = True
+        region.applicability = meta.applicability_policy.value
+        region.parent_region = meta.parent_region
+        region.child_regions = list(meta.child_regions)
+        region.symmetry_partner = _symmetry_partner(name)
+        region.motion_role = meta.motion_role
+        region.memory_family = meta.memory_family
+        region.routing_enabled = meta.routing_enabled
+        region.parser_support_level = meta.parser_support_level
+        region.anatomical_group = meta.group.value
+        region.side = meta.side.value
+        region.sex_applicability = meta.sex_applicability
+        region.identity_relevance = meta.identity_relevance
+        region.soft_tissue_relevance = meta.soft_tissue_relevance
+        region.clothing_interaction_relevance = meta.clothing_interaction_relevance
+        region.provenance_requirement = meta.provenance_requirement
+        return region
+
+    @staticmethod
     def _canonical_targets(raw_name: str, regions: dict[str, CanonicalRegion]) -> list[str]:
         raw = raw_name.lower().strip()
-        if raw == "arms":
-            return ["left_arm", "right_arm"]
-        if raw == "hands":
-            return ["left_hand", "right_hand"]
-        if raw == "legs":
-            return ["left_leg", "right_leg"]
+        if raw in {"arms", "hands", "legs", "feet"}:
+            return [raw]
         canonical = BODY_PART_MAP.get(raw, raw if raw in regions else "")
         return [canonical] if canonical else []
 
     @staticmethod
     def _seed_composites(regions: dict[str, CanonicalRegion]) -> None:
-        regions["head"].coverage_hints.extend(["face", "hair"])
-        regions["upper_body"].attachment_hints.append("torso")
-        regions["lower_body"].attachment_hints.append("pelvis")
+        if "head" in regions:
+            regions["head"].coverage_hints.extend(["face", "hair", "scalp"])
+        if "upper_body" in regions:
+            regions["upper_body"].attachment_hints.append("torso")
+        if "lower_body" in regions:
+            regions["lower_body"].attachment_hints.append("pelvis")
 
     @staticmethod
     def _finalize_composites(regions: dict[str, CanonicalRegion]) -> None:
@@ -330,6 +345,10 @@ class CanonicalHumanNormalizer:
 
         region.source_regions.append(raw_name)
         region.raw_sources.append(source)
+        if region.exists_in_ontology and region.applicability == BodyRegionApplicability.UNSUPPORTED_BY_CURRENT_PARSER.value:
+            region.applicability = BodyRegionApplicability.APPLICABLE.value
+        if region.exists_in_ontology and mask_ref and observation_status == "observed" and region.applicability != BodyRegionApplicability.NOT_APPLICABLE.value:
+            region.applicability = BodyRegionApplicability.APPLICABLE.value
 
         if evidence >= region.evidence_score:
             region.provenance = source
@@ -667,6 +686,22 @@ def canonical_state_to_dict(state: CanonicalPersonState) -> dict[str, object]:
                 attachment_hints=region.attachment_hints,
                 ownership_hints=region.ownership_hints,
                 coverage_hints=region.coverage_hints,
+                exists_in_ontology=region.exists_in_ontology,
+                applicability=region.applicability,
+                parent_region=region.parent_region,
+                child_regions=region.child_regions,
+                symmetry_partner=region.symmetry_partner,
+                motion_role=region.motion_role,
+                memory_family=region.memory_family,
+                routing_enabled=region.routing_enabled,
+                parser_support_level=region.parser_support_level,
+                anatomical_group=region.anatomical_group,
+                side=region.side,
+                sex_applicability=region.sex_applicability,
+                identity_relevance=region.identity_relevance,
+                soft_tissue_relevance=region.soft_tissue_relevance,
+                clothing_interaction_relevance=region.clothing_interaction_relevance,
+                provenance_requirement=region.provenance_requirement,
             )
             for name, region in state.regions.items()
         },
@@ -721,6 +756,16 @@ def _normalize_visibility_hint(visibility_hint: str) -> str:
     if hint in {"visible_strong", "clearly_visible"}:
         return "visible"
     return ""
+
+
+def _symmetry_partner(name: str) -> str | None:
+    if name.startswith("left_"):
+        partner = "right_" + name[len("left_") :]
+        return partner if partner in BODY_ONTOLOGY else None
+    if name.startswith("right_"):
+        partner = "left_" + name[len("right_") :]
+        return partner if partner in BODY_ONTOLOGY else None
+    return None
 
 
 def _source_weight(source: str) -> float:

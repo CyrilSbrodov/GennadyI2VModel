@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from core.body_ontology import is_canonical_body_region
+
 
 @dataclass(frozen=True, slots=True)
 class HumanParserClassMapping:
@@ -18,24 +20,53 @@ def _norm(name: str) -> str:
 
 _BODY = {
     "face": "face",
-    "skin": "torso",
     "hair": "hair",
     "head": "head",
+    "scalp": "scalp",
     "neck": "neck",
     "torso": "torso",
-    "chest": "torso",
-    "arms": "arms",
-    "arm": "arms",
+    "upper_body": "upper_body",
+    "lower_body": "lower_body",
+    "upper_torso": "upper_torso",
+    "lower_torso": "lower_torso",
+    "chest": "chest",
+    "left_chest": "left_chest",
+    "right_chest": "right_chest",
+    "abdomen": "abdomen",
+    "waist": "waist",
+    "back": "back",
     "left_arm": "left_arm",
     "right_arm": "right_arm",
+    "left_upper_arm": "left_upper_arm",
+    "right_upper_arm": "right_upper_arm",
+    "left_lower_arm": "left_forearm",
+    "right_lower_arm": "right_forearm",
+    "left_forearm": "left_forearm",
+    "right_forearm": "right_forearm",
     "left_hand": "left_hand",
     "right_hand": "right_hand",
     "hands": "hands",
-    "legs": "legs",
+    "arms": "arms",
+    "arm": "arms",
+    "pelvis": "pelvis",
+    "hips": "hips",
     "left_leg": "left_leg",
     "right_leg": "right_leg",
+    "left_upper_leg": "left_thigh",
+    "right_upper_leg": "right_thigh",
+    "left_lower_leg": "left_calf",
+    "right_lower_leg": "right_calf",
+    "left_thigh": "left_thigh",
+    "right_thigh": "right_thigh",
+    "left_calf": "left_calf",
+    "right_calf": "right_calf",
+    "legs": "legs",
+    "left_foot": "left_foot",
+    "right_foot": "right_foot",
     "feet": "feet",
     "foot": "feet",
+    "external_genital_region": "external_genital_region",
+    "male_external_genital_region": "male_external_genital_region",
 }
 
 _GARMENTS = {
@@ -74,9 +105,11 @@ def map_human_parser_class(class_name: str) -> HumanParserClassMapping:
         return HumanParserClassMapping(original, "background", "background")
     if key in _BODY:
         canonical = _BODY[key]
-        category = "face_hair" if canonical in {"face", "hair"} else "body_part"
+        category = "face_hair" if canonical in {"face", "hair", "scalp"} else "body_part"
         return HumanParserClassMapping(original, canonical, category)
     if key in _GARMENTS:
         canonical, garment_type = _GARMENTS[key]
         return HumanParserClassMapping(original, canonical, "garment" if canonical != "accessory" else "accessory", garment_type)
+    if is_canonical_body_region(key):
+        return HumanParserClassMapping(original, key, "body_part")
     return HumanParserClassMapping(original, key or "unknown", "unknown")

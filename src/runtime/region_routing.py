@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 
+from core.body_ontology import CANONICAL_BODY_REGION_ORDER
 from core.region_ids import make_region_id, parse_region_id
 from core.routing_contracts import DecisionKind, RUNTIME_ROUTING_DECISION_KINDS
 from core.schema import GraphDelta, RegionRef, RuntimeSemanticTransition, SceneGraph, VideoMemory
@@ -70,30 +71,18 @@ class RegionRoutingPlan:
 
 
 class CanonicalRegionRouter:
-    _CANONICAL_REGIONS = (
-        "face",
-        "hair",
-        "head",
-        "neck",
-        "torso",
-        "left_arm",
-        "right_arm",
-        "left_hand",
-        "right_hand",
-        "pelvis",
-        "left_leg",
-        "right_leg",
+    _CANONICAL_REGIONS = tuple(CANONICAL_BODY_REGION_ORDER) + (
         "upper_garment",
         "lower_garment",
         "outer_garment",
         "inner_garment",
         "accessories",
     )
-    _IDENTITY_SENSITIVE = {"face", "hair", "head"}
-    _DETAIL_SENSITIVE = {"face", "left_hand", "right_hand", "hair"}
-    _GARMENT_RELATED = {"upper_garment", "lower_garment", "outer_garment", "inner_garment", "torso", "left_arm", "right_arm"}
-    _GARMENT_EXPOSURE_REGIONS = {"torso", "left_arm", "right_arm"}
-    _POSE_RELATED = {"torso", "pelvis", "left_leg", "right_leg", "left_arm", "right_arm", "left_hand", "right_hand"}
+    _IDENTITY_SENSITIVE = {"face", "hair", "head", "scalp"}
+    _DETAIL_SENSITIVE = {"face", "left_hand", "right_hand", "hair", "left_eye", "right_eye", "mouth"}
+    _GARMENT_RELATED = {"upper_garment", "lower_garment", "outer_garment", "inner_garment", "torso", "upper_torso", "chest", "pelvis", "hips", "left_arm", "right_arm", "left_leg", "right_leg"}
+    _GARMENT_EXPOSURE_REGIONS = {"torso", "upper_torso", "chest", "abdomen", "pelvis", "hips", "left_arm", "right_arm", "left_leg", "right_leg"}
+    _POSE_RELATED = {"torso", "pelvis", "left_leg", "right_leg", "left_arm", "right_arm", "left_hand", "right_hand", "left_knee", "right_knee", "left_foot", "right_foot", "neck", "head"}
 
     def __init__(self, memory_manager: MemoryManager, roi_selector: ROISelector) -> None:
         self.memory_manager = memory_manager
@@ -201,6 +190,11 @@ class CanonicalRegionRouter:
                 confidence=float(memory_entry.confidence if memory_entry else 0.45),
             )
             decision = self._route_semantic(semantic, memory_support_level=memory_support_level)
+            payload = person.canonical_regions.get(region, {}) if person is not None and isinstance(person.canonical_regions, dict) else {}
+            block_reasons = self._observed_render_update_block_reasons(payload)
+            if decision.should_render and block_reasons:
+                decision.should_render = False
+                decision.reasons.extend(block_reasons)
             semantics.append(semantic)
             decisions.append(decision)
             if decision.should_render:
@@ -224,6 +218,31 @@ class CanonicalRegionRouter:
             decisions=decisions,
             render_regions=ordered_render,
         )
+
+    @staticmethod
+    def _observed_render_update_block_reasons(payload: object) -> list[str]:
+        if not isinstance(payload, dict):
+            return []
+        reasons: list[str] = []
+        applicability = str(payload.get("applicability", "applicable"))
+        observation = str(payload.get("observation_status", "unknown"))
+        visibility = str(payload.get("visibility_state", "unknown"))
+        parser_support = str(payload.get("parser_support_level", "unsupported"))
+        memory_family = str(payload.get("memory_family", "unknown"))
+        anatomical_group = str(payload.get("anatomical_group", "unknown"))
+        if memory_family == "private" or anatomical_group == "optional_private":
+            reasons.append("private_region_rendering_not_enabled")
+        if applicability in {"not_applicable", "unknown_applicability", "unsupported_by_current_parser"}:
+            reasons.append("ontology_state_blocks_observed_render_update")
+        if parser_support == "unsupported" and observation != "observed":
+            reasons.append("ontology_state_blocks_observed_render_update")
+        if observation in {"unknown", "missing", "fallback", "generated", "inferred"} and visibility not in {"visible", "partially_visible"}:
+            reasons.append("ontology_state_blocks_observed_render_update")
+        return list(dict.fromkeys(reasons))
+
+    @classmethod
+    def _allows_observed_render_update(cls, payload: object) -> bool:
+        return not cls._observed_render_update_block_reasons(payload)
 
     def _memory_support(self, memory_entry: object | None) -> tuple[str, list[str]]:
         if memory_entry is None:
