@@ -34,7 +34,9 @@ def test_pipeline_emits_real_predictions_with_sources_and_confidences() -> None:
     assert person.bbox_source.startswith("detector:")
     assert person.pose_confidence > 0
     assert person.pose_source.startswith("pose:")
-    assert person.mask_ref is not None
+    assert person.mask_ref is None
+    assert person.mask_source == "fallback"
+    assert person.mask_evidence_type == "missing"
     assert person.garments and "source" in person.garments[0]
 
     assert output.objects

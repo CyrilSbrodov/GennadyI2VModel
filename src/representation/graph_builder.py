@@ -39,7 +39,7 @@ class SceneGraphBuilder:
         canonical_states = []
 
         for idx, p in enumerate(perception.persons, start=1):
-            person_id = f"person_{idx}"
+            person_id = p.person_id or f"person_{idx}"
             canonical = self._canonical.process(p, person_id=person_id, frame_size=perception.frame_size, objects=perception.objects)
             canonical_states.append(canonical)
             canonical_regions = canonical.regions
@@ -79,6 +79,9 @@ class SceneGraphBuilder:
                 alternatives = [
                     f"raw:{','.join(region.source_regions) or 'none'}",
                     f"attachment:{','.join(region.attachment_hints) or 'none'}",
+                    f"observation_status:{getattr(region, 'observation_status', 'unknown')}",
+                    f"mask_evidence_type:{getattr(region, 'mask_evidence_type', 'unknown')}",
+                    f"provenance:{region.provenance}",
                 ]
                 if parser_class:
                     alternatives.append(f"parser_class:{parser_class}")
@@ -94,6 +97,10 @@ class SceneGraphBuilder:
                         source=region.provenance,
                         frame_index=frame_index,
                         alternatives=alternatives,
+                        observation_status=getattr(region, "observation_status", "unknown"),
+                        mask_evidence_type=getattr(region, "mask_evidence_type", "unknown"),
+                        bbox_provenance=p.bbox_source,
+                        suitable_for_memory_seeding=bool(getattr(region, "suitable_for_memory_seeding", False)),
                     )
                 )
 
@@ -117,6 +124,8 @@ class SceneGraphBuilder:
                     f"source_regions:{','.join(region.source_regions) or 'none'}",
                     f"ownership:{','.join(region.ownership_hints) or 'person'}",
                     f"layer_hint:{g_name}",
+                    f"provenance:{region.provenance}",
+                    f"mask_evidence_type:{getattr(region, 'mask_evidence_type', 'unknown')}",
                 ]
                 if parser_class:
                     alternatives.append(f"parser_class:{parser_class}")
@@ -169,7 +178,7 @@ class SceneGraphBuilder:
             persons.append(
                 PersonNode(
                     person_id=person_id,
-                    track_id=p.track_id or person_id,
+                    track_id=p.track_id,
                     bbox=p.bbox,
                     mask_ref=p.mask_ref,
                     pose_state=p.pose,
@@ -180,7 +189,13 @@ class SceneGraphBuilder:
                     confidence=self._calibrate_confidence(p.bbox_confidence, p.bbox_source),
                     source=p.bbox_source,
                     frame_index=frame_index,
-                    alternatives=["scene_object", "canonical_human_state"],
+                    alternatives=["scene_object", "canonical_human_state", f"identity_status:{p.identity_observation_status}", f"track_provenance:{p.track_provenance}"],
+                    track_confidence=p.track_confidence,
+                    track_provenance=p.track_provenance,
+                    identity_observation_status=p.identity_observation_status,
+                    bbox_provenance=p.bbox_source,
+                    mask_evidence_type=p.mask_evidence_type,
+                    suitable_for_memory_seeding=p.suitable_for_memory_seeding,
                     canonical_regions=canonical_payload["regions"],
                     region_relations=canonical_payload["relations"],
                 )

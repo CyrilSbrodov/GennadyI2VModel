@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import itertools
+from typing import Any
 
 
 @dataclass(slots=True)
@@ -80,6 +81,28 @@ class InMemoryMaskStore:
             }
             for ref, item in self._items.items()
         }
+
+
+
+
+def mask_store_from_frame(frame: Any, *, allow_legacy_default: bool = False) -> InMemoryMaskStore:
+    """Return the explicit per-run mask store carried by a frame context.
+
+    Production perception paths must receive an InMemoryMaskStore via
+    PerceptionFrameContext["mask_store"]. Legacy helper/tests may opt into
+    DEFAULT_MASK_STORE by passing allow_legacy_default=True.
+    """
+
+    store = frame.get("mask_store") if hasattr(frame, "get") else None
+    if isinstance(store, InMemoryMaskStore):
+        return store
+    if allow_legacy_default:
+        return DEFAULT_MASK_STORE
+    raise RuntimeError("Perception frame context is missing explicit InMemoryMaskStore; production mask writes cannot use DEFAULT_MASK_STORE")
+
+
+def legacy_mask_store_from_frame(frame: Any) -> InMemoryMaskStore:
+    return mask_store_from_frame(frame, allow_legacy_default=True)
 
 
 DEFAULT_MASK_STORE = InMemoryMaskStore()

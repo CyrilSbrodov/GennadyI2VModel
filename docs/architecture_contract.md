@@ -49,3 +49,13 @@ Generated, inferred, or fallback material cannot become authoritative identity m
 ## Training/eval naming
 
 Runtime, training, and evaluation code must use canonical stage semantics. `memory` remains a first-class stage and must not be normalized into `representation`. Legacy renderer names (`renderer`, `patch_synthesis`) normalize to the canonical `rendering` stage rather than diverging.
+
+## Sprint 1 perception evidence contract
+
+Perception is a strict source of observed facts, not a place to manufacture scene evidence. `PerceptionPipeline` now emits explicit person identity, tracking, mask, confidence, provenance, observation-status, and memory-seeding fields. Observed regions must carry observed detector/parser/face provenance; inferred, fallback, generated, synthetic, unknown, or missing evidence must remain labeled as such and must not be normalized into observed evidence.
+
+Mask ownership is instance-local: every `PerceptionPipeline`/`ParserOnlyPipeline` owns an `InMemoryMaskStore`, attaches it to the frame context, snapshots it into `PerceptionOutput.mask_store`, and clears it per request when `reset_mask_store_per_analyze=True`. Production mask writers must fail loudly when no explicit frame-context mask store exists; `DEFAULT_MASK_STORE` is legacy/test-only. Any explicitly referenced legacy masks adopted for compatibility are tagged `adopted_legacy_default_store`/`not_production_observed` and cannot be treated as authoritative production-observed evidence. Video analysis clears once for the sequence and reuses the same store across frames so tracker and mask references stay coherent. Runtime rejects perception objects that do not expose a valid `mask_store`.
+
+Single-image I2V identity is represented as `identity_observation_status="single_frame_anchor"` with `track_provenance="single_frame_observed"`; it is not treated as proven temporal tracking. In video perception, the first occurrence of a tracker id is `tracker_single_frame_observed`; only a repeated tracker id across frames becomes `multi_frame_tracked`.
+
+Face, head, and hair are identity-sensitive regions. Parser/face evidence for those regions is preserved with provenance, confidence, observation status, and mask evidence type. Missing face/head/hair evidence remains unknown/missing; generated or fallback face/head/hair material cannot be marked observed. Parser masks are marked as `parser_mask`; bbox-only projections must remain distinguishable as bbox/fallback/inferred evidence.

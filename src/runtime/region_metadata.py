@@ -4,7 +4,7 @@ from typing import Any
 
 from core.region_ids import parse_region_id
 from core.schema import BBox, GraphDelta, RegionRef, SceneGraph, VideoMemory
-from perception.mask_store import DEFAULT_MASK_STORE
+from perception.mask_store import DEFAULT_MASK_STORE, InMemoryMaskStore
 from representation.scene_graph_queries import SceneGraphQueries
 from runtime.region_routing import RegionRoutingDecision
 
@@ -81,10 +81,11 @@ def _resolve_source_node(person: object | None, canonical_region: str, canonical
     return "fallback", None
 
 
-def _mask_metadata(mask_ref: str | None) -> dict[str, Any]:
+def _mask_metadata(mask_ref: str | None, mask_store: InMemoryMaskStore | None = None) -> dict[str, Any]:
     if not mask_ref:
         return {}
-    stored = DEFAULT_MASK_STORE.get(mask_ref)
+    store = mask_store or DEFAULT_MASK_STORE
+    stored = store.get(mask_ref)
     if stored is None:
         return {"mask_ref": mask_ref, "mask_lookup_missing": True}
     extra = stored.extra if isinstance(stored.extra, dict) else {}
@@ -189,6 +190,7 @@ def build_region_metadata(
     region: RegionRef,
     route_decision: RegionRoutingDecision | None,
     delta: GraphDelta | None = None,
+    mask_store: InMemoryMaskStore | None = None,
 ) -> dict[str, object]:
     trace: list[str] = ["region_metadata_bridge:v1"]
     parse_error = ""
@@ -215,7 +217,7 @@ def build_region_metadata(
         source_node_type = "fallback" if not canonical else source_node_type
 
     alternatives = list(getattr(source_node, "alternatives", [])) if source_node is not None else []
-    mask_meta = _mask_metadata(mask_ref)
+    mask_meta = _mask_metadata(mask_ref, mask_store=mask_store)
     parser_class_name = mask_meta.get("parser_class_name") or _extract_alt_value(alternatives, "parser_class:")
     parser_class_id = mask_meta.get("parser_class_id") or _extract_alt_value(alternatives, "class_id:")
 

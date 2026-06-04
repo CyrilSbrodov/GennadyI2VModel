@@ -125,6 +125,9 @@ class CanonicalRegion:
     evidence_score: float = 0.0
     visibility_score: float = 0.0
     mask_score: float = 0.0
+    observation_status: str = "unknown"
+    mask_evidence_type: str = "unknown"
+    suitable_for_memory_seeding: bool = False
 
 
 @dataclass(slots=True)
@@ -159,6 +162,9 @@ class CanonicalHumanNormalizer:
                     mask_ref=part.get("mask_ref"),
                     confidence=float(part.get("confidence", 0.0)),
                     visibility_hint=str(part.get("visibility", "")),
+                    observation_status=str(part.get("observation_status", "observed" if part.get("mask_ref") else "unknown")),
+                    mask_evidence_type=str(part.get("mask_evidence_type", "parser_mask" if part.get("mask_ref") else "missing")),
+                    suitable_for_memory_seeding=bool(part.get("suitable_for_memory_seeding", False)),
                     coverage_hints=person.coverage_hints.get(raw, []),
                 )
 
@@ -172,6 +178,9 @@ class CanonicalHumanNormalizer:
                     confidence=person.mask_confidence,
                     visibility_hint=person.visibility_hints.get(raw_name, ""),
                     coverage_hints=person.coverage_hints.get(raw_name, []),
+                    observation_status="observed",
+                    mask_evidence_type="parser_mask",
+                    suitable_for_memory_seeding=person.suitable_for_memory_seeding,
                 )
 
         for region in person.face_regions:
@@ -185,6 +194,9 @@ class CanonicalHumanNormalizer:
                 source=str(region.get("source", "unknown")),
                 mask_ref=region.get("mask_ref"),
                 confidence=float(region.get("confidence", 0.0)),
+                observation_status=str(region.get("observation_status", "observed" if region.get("mask_ref") else "unknown")),
+                mask_evidence_type=str(region.get("mask_evidence_type", "parser_mask" if region.get("mask_ref") else "missing")),
+                suitable_for_memory_seeding=bool(region.get("suitable_for_memory_seeding", False)),
             )
 
         for raw_name, mask_ref in person.face_region_masks.items():
@@ -198,6 +210,9 @@ class CanonicalHumanNormalizer:
                 mask_ref=mask_ref,
                 confidence=person.mask_confidence,
                 visibility_hint=person.visibility_hints.get(raw_name, ""),
+                observation_status="observed",
+                mask_evidence_type="parser_mask",
+                suitable_for_memory_seeding=person.suitable_for_memory_seeding,
             )
 
         for garment in person.garments:
@@ -305,6 +320,9 @@ class CanonicalHumanNormalizer:
         ownership_hint: str = "",
         coverage_hints: list[str] | None = None,
         attachment_hints: list[str] | None = None,
+        observation_status: str = "unknown",
+        mask_evidence_type: str = "unknown",
+        suitable_for_memory_seeding: bool = False,
     ) -> None:
         conf = max(0.0, min(1.0, confidence))
         src_weight = _source_weight(source)
@@ -318,6 +336,10 @@ class CanonicalHumanNormalizer:
             region.evidence_score = evidence
 
         region.confidence = max(region.confidence, conf)
+        if evidence >= region.evidence_score:
+            region.observation_status = observation_status
+            region.mask_evidence_type = mask_evidence_type
+            region.suitable_for_memory_seeding = suitable_for_memory_seeding
 
         if mask_ref:
             mask_evidence = evidence + 0.2
@@ -639,6 +661,9 @@ def canonical_state_to_dict(state: CanonicalPersonState) -> dict[str, object]:
                 confidence=round(region.confidence, 4),
                 visibility_state=region.visibility_state,
                 provenance=region.provenance,
+                observation_status=region.observation_status,
+                mask_evidence_type=region.mask_evidence_type,
+                suitable_for_memory_seeding=region.suitable_for_memory_seeding,
                 attachment_hints=region.attachment_hints,
                 ownership_hints=region.ownership_hints,
                 coverage_hints=region.coverage_hints,
