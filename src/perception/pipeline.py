@@ -9,7 +9,7 @@ from core.input_layer import AssetFrame
 from core.schema import BBox, ExpressionState, OrientationState, PoseState
 from perception.detector import BackendConfig, Detector, DetectorOutput, YoloPersonDetectorAdapter
 from perception.frame_context import FrameLike, ensure_frame_context, unwrap_frame
-from perception.mask_store import DEFAULT_MASK_STORE
+from perception.mask_store import DEFAULT_MASK_STORE, InMemoryMaskStore
 from perception.face import EmoNetFaceAnalyzerAdapter, FaceAnalyzer, FacePrediction
 from perception.objects import MonoDepthEstimator, ObjectDetector, ObjectPrediction, YoloObjectDetectorAdapter
 from perception.parser import HumanParser, ParserStackConfig, ParsingPrediction, SegFormerHumanParserAdapter
@@ -74,6 +74,12 @@ class PersonFacts:
     provenance_by_region: dict[str, str] = field(default_factory=dict)
     parser_class_names: dict[str, str] = field(default_factory=dict)
     region_mask_refs: dict[str, list[str]] = field(default_factory=dict)
+    person_id: str = ""
+    bbox_observation_status: str = "observed"
+    mask_evidence_type: str = "unknown"
+    track_provenance: str = "unknown"
+    identity_observation_status: str = "unknown"
+    suitable_for_memory_seeding: bool = False
 
 
 @dataclass(slots=True)
@@ -139,7 +145,50 @@ class PerceptionPipeline:
         self._builtin_depth_fallback: MonoDepthEstimator | None = None
         self.strict_perception = cfg.strict_perception
         self.reset_mask_store_per_analyze = cfg.reset_mask_store_per_analyze
-        self.mask_store = DEFAULT_MASK_STORE
+        self.mask_store = InMemoryMaskStore()
+
+
+    def _adopt_referenced_legacy_masks(self, out: PerceptionOutput) -> None:
+        """Adopt masks produced by legacy/test modules that still wrote DEFAULT_MASK_STORE.
+
+        Production adapters receive the instance store through frame context. This bridge is
+        limited to refs explicitly returned in the current PerceptionOutput, so unrelated
+        DEFAULT_MASK_STORE entries do not leak into the pipeline-owned store.
+        """
+
+        refs: set[str] = set()
+        for person in out.persons:
+            for ref in [person.mask_ref, *person.body_part_masks.values(), *person.face_region_masks.values(), *person.garment_masks.values(), *person.accessory_masks.values(), *person.background_masks.values()]:
+                if ref:
+                    refs.add(ref)
+            for collection in (person.body_parts, person.face_regions, person.garments):
+                for item in collection:
+                    ref = item.get("mask_ref") if isinstance(item, dict) else None
+                    if ref:
+                        refs.add(str(ref))
+            for values in person.region_mask_refs.values():
+                refs.update(str(ref) for ref in values if ref)
+        for ref in refs:
+            if self.mask_store.get(ref) is not None:
+                continue
+            stored = DEFAULT_MASK_STORE.get(ref)
+            if stored is None:
+                continue
+            extra = dict(stored.extra)
+            extra.update({"adopted_legacy_default_store": True, "original_source": stored.source})
+            self.mask_store.put(
+                stored.payload,
+                confidence=stored.confidence,
+                source=f"legacy_adopted:{stored.source}",
+                prefix="adopted_legacy",
+                mask_kind=stored.mask_kind,
+                backend=f"legacy_adopted:{stored.backend}",
+                roi_bbox=stored.roi_bbox,
+                frame_size=stored.frame_size,
+                tags=list(stored.tags) + ["adopted_legacy_default_store", "not_production_observed"],
+                extra=extra,
+                ref=stored.ref,
+            )
 
     @staticmethod
     def _parser_stack_config(config: ParserStackConfig | BackendConfig) -> ParserStackConfig:
@@ -239,8 +288,9 @@ class PerceptionPipeline:
     def analyze(self, frame: FrameLike, *, reset_mask_store: bool | None = None) -> PerceptionOutput:
         should_reset = self.reset_mask_store_per_analyze if reset_mask_store is None else reset_mask_store
         if should_reset:
-            DEFAULT_MASK_STORE.clear()
+            self.mask_store.clear()
         frame_ctx = ensure_frame_context(frame)
+        frame_ctx.put("mask_store", self.mask_store)
         out = PerceptionOutput()
         warnings = out.warnings
 
@@ -311,7 +361,7 @@ class PerceptionPipeline:
         )
 
         persons: list[PersonFacts] = []
-        for person in detection_out.persons:
+        for idx, person in enumerate(detection_out.persons, start=1):
             pose = pose_predictions.get(person.detection_id)
             parsed = parsing_predictions.get(person.detection_id)
             face = face_predictions.get(person.detection_id)
@@ -338,23 +388,41 @@ class PerceptionPipeline:
                     for g in parsed.garments
                 ]
                 body_parts = [
-                    {"part_type": b.part_type, "mask_ref": b.mask_ref, "confidence": b.confidence, "visibility": b.visibility, "source": b.source, "bbox_xyxy": b.bbox_xyxy, "pixel_count": b.pixel_count, "parser_class_name": b.parser_class_name, "class_id": b.class_id}
+                    {"part_type": b.part_type, "mask_ref": b.mask_ref, "confidence": b.confidence, "visibility": b.visibility, "source": b.source, "bbox_xyxy": b.bbox_xyxy, "pixel_count": b.pixel_count, "parser_class_name": b.parser_class_name, "class_id": b.class_id, "observation_status": "observed" if b.mask_ref else "unknown", "provenance": b.source, "mask_evidence_type": "parser_mask" if b.mask_ref else "missing", "suitable_for_memory_seeding": bool(b.mask_ref and b.confidence >= 0.5)}
                     for b in parsed.body_parts
                 ]
                 face_regions = [
-                    {"region_type": r.region_type, "mask_ref": r.mask_ref, "confidence": r.confidence, "source": r.source, "bbox_xyxy": r.bbox_xyxy, "pixel_count": r.pixel_count, "parser_class_name": r.parser_class_name, "class_id": r.class_id}
+                    {"region_type": r.region_type, "mask_ref": r.mask_ref, "confidence": r.confidence, "source": r.source, "bbox_xyxy": r.bbox_xyxy, "pixel_count": r.pixel_count, "parser_class_name": r.parser_class_name, "class_id": r.class_id, "observation_status": "observed" if r.mask_ref else "unknown", "provenance": r.source, "mask_evidence_type": "parser_mask" if r.mask_ref else "missing", "suitable_for_memory_seeding": bool(r.mask_ref and r.confidence >= 0.5)}
                     for r in parsed.face_regions
                 ]
 
             person_depth = 1.0 - (person.bbox.y + person.bbox.h)
+            parser_mask_ref = parsed.mask_ref if (parsed and parsed.mask_ref) else None
+            detector_mask_ref = person.mask_ref
+            person_mask_ref = parser_mask_ref or detector_mask_ref
+            person_mask_source = parsed.source if parser_mask_ref else (person.mask_source or "fallback")
+            person_mask_confidence = parsed.mask_confidence if parser_mask_ref else person.mask_confidence
+            track_provenance = "single_frame_observed"
+            identity_status = "single_frame_anchor"
+            track_id = None
+            track_confidence = person.confidence
+            if getattr(self, "_perception_video_tracking_active", False) and tracked:
+                previous_video_track_ids = getattr(self, "_perception_video_seen_track_ids", set())
+                current_video_track_ids = getattr(self, "_perception_video_current_track_ids", set())
+                track_id = tracked.track_id
+                track_confidence = tracked.confidence
+                track_provenance = tracked.source
+                identity_status = "multi_frame_tracked" if tracked.track_id in previous_video_track_ids else "tracker_single_frame_observed"
+                current_video_track_ids.add(tracked.track_id)
+                self._perception_video_current_track_ids = current_video_track_ids
             persons.append(
                 PersonFacts(
                     bbox=person.bbox,
                     bbox_confidence=person.confidence,
                     bbox_source=person.source,
-                    mask_ref=(parsed.mask_ref if (parsed and parsed.mask_ref) else person.mask_ref),
-                    mask_confidence=(parsed.mask_confidence if (parsed and parsed.mask_ref) else person.mask_confidence),
-                    mask_source=(parsed.source if (parsed and parsed.mask_ref) else (person.mask_source or "fallback")),
+                    mask_ref=person_mask_ref,
+                    mask_confidence=person_mask_confidence,
+                    mask_source=person_mask_source,
                     pose=pose.pose if pose else PoseState(),
                     pose_confidence=pose.confidence if pose else 0.0,
                     pose_source=pose.source if pose else "fallback",
@@ -364,9 +432,9 @@ class PerceptionPipeline:
                     orientation=face.orientation if face else OrientationState(),
                     orientation_confidence=face.orientation_confidence if face else 0.0,
                     orientation_source=face.source if face else "fallback",
-                    track_id=tracked.track_id if tracked else None,
-                    track_confidence=tracked.confidence if tracked else 0.0,
-                    track_source=tracked.source if tracked else "fallback",
+                    track_id=track_id,
+                    track_confidence=track_confidence,
+                    track_source=track_provenance,
                     garments=garments,
                     hand_landmarks=pose.hand_landmarks if pose else {},
                     face_landmarks=face.face_landmarks if face else (pose.face_landmarks if pose else []),
@@ -384,6 +452,12 @@ class PerceptionPipeline:
                     provenance_by_region=(parsed.enriched.provenance_by_region if parsed else {}),
                     parser_class_names=(parsed.enriched.parser_class_names if parsed else {}),
                     region_mask_refs=(parsed.enriched.region_mask_refs if parsed else {}),
+                    person_id=f"person_{idx}",
+                    bbox_observation_status="observed",
+                    mask_evidence_type=("parser_mask" if parser_mask_ref else ("detector_instance_mask" if detector_mask_ref else "missing")),
+                    track_provenance=track_provenance,
+                    identity_observation_status=identity_status,
+                    suitable_for_memory_seeding=bool(person_mask_ref and person_mask_confidence >= 0.5),
                 )
             )
 
@@ -401,7 +475,8 @@ class PerceptionPipeline:
             out.input_mode = "frame_tensor"
         out.module_fallbacks["input_mode"] = out.input_mode
 
-        out.mask_store = DEFAULT_MASK_STORE.snapshot_metadata()
+        self._adopt_referenced_legacy_masks(out)
+        out.mask_store = self.mask_store.snapshot_metadata()
         refs_by_canonical: dict[str, list[str]] = {}
         parser_classes: dict[str, str] = {}
         for person in out.persons:
@@ -427,11 +502,20 @@ class PerceptionPipeline:
 
     def analyze_video(self, frames: list[FrameLike], batch_size: int = 4) -> list[PerceptionOutput]:
         if self.reset_mask_store_per_analyze:
-            DEFAULT_MASK_STORE.clear()
+            self.mask_store.clear()
         outputs: list[PerceptionOutput] = []
-        for start in range(0, len(frames), max(1, batch_size)):
-            for frame in frames[start : start + max(1, batch_size)]:
-                outputs.append(self.analyze(frame, reset_mask_store=False))
+        self._perception_video_tracking_active = True
+        self._perception_video_seen_track_ids: set[str] = set()
+        try:
+            for start in range(0, len(frames), max(1, batch_size)):
+                for frame in frames[start : start + max(1, batch_size)]:
+                    self._perception_video_current_track_ids: set[str] = set()
+                    outputs.append(self.analyze(frame, reset_mask_store=False))
+                    self._perception_video_seen_track_ids.update(self._perception_video_current_track_ids)
+        finally:
+            self._perception_video_tracking_active = False
+            self._perception_video_seen_track_ids = set()
+            self._perception_video_current_track_ids = set()
         return outputs
 
 
@@ -446,7 +530,50 @@ class ParserOnlyPipeline:
         self._builtin_parser_fallback: HumanParser | None = None
         self.strict_perception = cfg.strict_perception
         self.reset_mask_store_per_analyze = cfg.reset_mask_store_per_analyze
-        self.mask_store = DEFAULT_MASK_STORE
+        self.mask_store = InMemoryMaskStore()
+
+
+    def _adopt_referenced_legacy_masks(self, out: PerceptionOutput) -> None:
+        """Adopt masks produced by legacy/test modules that still wrote DEFAULT_MASK_STORE.
+
+        Production adapters receive the instance store through frame context. This bridge is
+        limited to refs explicitly returned in the current PerceptionOutput, so unrelated
+        DEFAULT_MASK_STORE entries do not leak into the pipeline-owned store.
+        """
+
+        refs: set[str] = set()
+        for person in out.persons:
+            for ref in [person.mask_ref, *person.body_part_masks.values(), *person.face_region_masks.values(), *person.garment_masks.values(), *person.accessory_masks.values(), *person.background_masks.values()]:
+                if ref:
+                    refs.add(ref)
+            for collection in (person.body_parts, person.face_regions, person.garments):
+                for item in collection:
+                    ref = item.get("mask_ref") if isinstance(item, dict) else None
+                    if ref:
+                        refs.add(str(ref))
+            for values in person.region_mask_refs.values():
+                refs.update(str(ref) for ref in values if ref)
+        for ref in refs:
+            if self.mask_store.get(ref) is not None:
+                continue
+            stored = DEFAULT_MASK_STORE.get(ref)
+            if stored is None:
+                continue
+            extra = dict(stored.extra)
+            extra.update({"adopted_legacy_default_store": True, "original_source": stored.source})
+            self.mask_store.put(
+                stored.payload,
+                confidence=stored.confidence,
+                source=f"legacy_adopted:{stored.source}",
+                prefix="adopted_legacy",
+                mask_kind=stored.mask_kind,
+                backend=f"legacy_adopted:{stored.backend}",
+                roi_bbox=stored.roi_bbox,
+                frame_size=stored.frame_size,
+                tags=list(stored.tags) + ["adopted_legacy_default_store", "not_production_observed"],
+                extra=extra,
+                ref=stored.ref,
+            )
 
     @staticmethod
     def _parser_stack_config(config: ParserStackConfig | BackendConfig) -> ParserStackConfig:
@@ -505,10 +632,11 @@ class ParserOnlyPipeline:
     def analyze(self, frame: FrameLike, profiler: StageTimer | None = None, *, reset_mask_store: bool | None = None) -> PerceptionOutput:
         should_reset = self.reset_mask_store_per_analyze if reset_mask_store is None else reset_mask_store
         if should_reset:
-            DEFAULT_MASK_STORE.clear()
+            self.mask_store.clear()
         out = PerceptionOutput()
         timer = profiler or StageTimer(enabled=False)
         frame_ctx = ensure_frame_context(frame)
+        frame_ctx.put("mask_store", self.mask_store)
         frame_ctx.put("profiler", timer)
 
         with timer.track("detector"):
@@ -537,7 +665,7 @@ class ParserOnlyPipeline:
             )
 
         persons: list[PersonFacts] = []
-        for person in detection_out.persons:
+        for idx, person in enumerate(detection_out.persons, start=1):
             parsed = parsing_predictions.get(person.detection_id)
             persons.append(
                 PersonFacts(
@@ -558,14 +686,14 @@ class ParserOnlyPipeline:
                     orientation_source="disabled:parser-only",
                     track_id=None,
                     track_confidence=0.0,
-                    track_source="disabled:parser-only",
+                    track_source="single_frame_observed",
                     garments=[{"type": g.garment_type, "state": g.state, "confidence": g.confidence, "source": g.source, "mask_ref": g.mask_ref, "coverage_targets": g.coverage_targets, "attachment_targets": g.attachment_targets, "layer_hint": g.layer_hint} for g in (parsed.garments if parsed else [])],
                     hand_landmarks={},
                     face_landmarks=[],
                     depth_order=1.0 - (person.bbox.y + person.bbox.h),
                     occlusion_hints=(parsed.occlusion_hints if parsed else []),
-                    body_parts=[{"part_type": b.part_type, "mask_ref": b.mask_ref, "confidence": b.confidence, "visibility": b.visibility, "source": b.source} for b in (parsed.body_parts if parsed else [])],
-                    face_regions=[{"region_type": r.region_type, "mask_ref": r.mask_ref, "confidence": r.confidence, "source": r.source} for r in (parsed.face_regions if parsed else [])],
+                    body_parts=[{"part_type": b.part_type, "mask_ref": b.mask_ref, "confidence": b.confidence, "visibility": b.visibility, "source": b.source, "provenance": b.source, "observation_status": "observed" if b.mask_ref else "unknown", "mask_evidence_type": "parser_mask" if b.mask_ref else "missing", "suitable_for_memory_seeding": bool(b.mask_ref and b.confidence >= 0.5)} for b in (parsed.body_parts if parsed else [])],
+                    face_regions=[{"region_type": r.region_type, "mask_ref": r.mask_ref, "confidence": r.confidence, "source": r.source, "provenance": r.source, "observation_status": "observed" if r.mask_ref else "unknown", "mask_evidence_type": "parser_mask" if r.mask_ref else "missing", "suitable_for_memory_seeding": bool(r.mask_ref and r.confidence >= 0.5)} for r in (parsed.face_regions if parsed else [])],
                     garment_masks=(parsed.enriched.garment_masks if parsed else {}),
                     body_part_masks=(parsed.enriched.body_part_masks if parsed else {}),
                     face_region_masks=(parsed.enriched.face_region_masks if parsed else {}),
@@ -576,6 +704,12 @@ class ParserOnlyPipeline:
                     provenance_by_region=(parsed.enriched.provenance_by_region if parsed else {}),
                     parser_class_names=(parsed.enriched.parser_class_names if parsed else {}),
                     region_mask_refs=(parsed.enriched.region_mask_refs if parsed else {}),
+                    person_id=f"person_{idx}",
+                    bbox_observation_status="observed",
+                    mask_evidence_type=("parser_mask" if (parsed and parsed.mask_ref) else "missing"),
+                    track_provenance="single_frame_observed",
+                    identity_observation_status="single_frame_anchor",
+                    suitable_for_memory_seeding=bool(parsed and parsed.mask_ref and parsed.mask_confidence >= 0.5),
                 )
             )
         out.persons = persons
@@ -590,7 +724,8 @@ class ParserOnlyPipeline:
             "objects": "disabled:parser-only",
             "depth": "disabled:parser-only",
         }
-        out.mask_store = DEFAULT_MASK_STORE.snapshot_metadata()
+        self._adopt_referenced_legacy_masks(out)
+        out.mask_store = self.mask_store.snapshot_metadata()
         refs_by_canonical: dict[str, list[str]] = {}
         parser_classes: dict[str, str] = {}
         for person in out.persons:

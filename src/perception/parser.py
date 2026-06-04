@@ -12,7 +12,7 @@ from perception.detector import BackendConfig, PersonDetection
 from perception.frame_context import FrameLike, PerceptionFrameContext
 from perception.human_parser_mapping import map_human_parser_class
 from perception.image_ops import crop_rgb, frame_to_numpy_rgb
-from perception.mask_store import DEFAULT_MASK_STORE
+from perception.mask_store import DEFAULT_MASK_STORE, InMemoryMaskStore, mask_store_from_frame
 
 
 @dataclass(slots=True)
@@ -213,11 +213,12 @@ def _remember_region_ref(enriched: EnrichedParsingPayload, key: str, ref: str | 
 
 def _store_mask(
     mask: "object",
-    confidence: float,
+    mask_store: InMemoryMaskStore | float,
+    confidence: float | str,
     source: str,
     prefix: str,
     kind: str,
-    backend: str,
+    backend: str | None = None,
     *,
     roi_bbox: tuple[float, float, float, float] | None = None,
     frame_size: tuple[int, int] | None = None,
@@ -226,11 +227,23 @@ def _store_mask(
     class_id: int | None = None,
 ) -> str | None:
     try:
+        if not isinstance(mask_store, InMemoryMaskStore):
+            # Backward-compatible direct helper calls use DEFAULT_MASK_STORE explicitly.
+            backend = str(kind)
+            kind = str(prefix)
+            prefix = str(source)
+            source = str(confidence)
+            confidence = float(mask_store)
+            runtime_store = DEFAULT_MASK_STORE
+        else:
+            runtime_store = mask_store
+            confidence = float(confidence)
+            backend = str(backend or "unknown")
         arr = _safe_array(mask)
         if not arr or max((max(row) if row else 0 for row in arr), default=0) <= 0:
             return None
         pixel_count, bbox_xyxy = _mask_stats(arr, roi_bbox=roi_bbox)
-        return DEFAULT_MASK_STORE.put(
+        return runtime_store.put(
             arr,
             confidence=confidence,
             source=source,
@@ -597,11 +610,13 @@ class ParserFusionEngine:
         atr: AdapterSegmentationOutput,
         facer: AdapterSegmentationOutput,
         frame_size: tuple[int, int] | None = None,
+        mask_store: InMemoryMaskStore | None = None,
     ) -> ParsingPrediction:
         garments: list[GarmentPrediction] = []
         body_parts: list[BodyPartMaskPrediction] = []
         face_regions: list[FaceRegionPrediction] = []
         enriched = EnrichedParsingPayload()
+        runtime_mask_store = mask_store or mask_store_from_frame(person, allow_legacy_default=True)
 
         person_union_parts = [mask for _, mask in fashn.masks.items()]
         if not person_union_parts:
@@ -618,6 +633,7 @@ class ParserFusionEngine:
                             union_mask[y][x] = 1
             pref = _store_mask(
                 union_mask,
+                runtime_mask_store,
                 _mask_conf(union_mask),
                 "parser:fusion",
                 "person",
@@ -640,6 +656,7 @@ class ParserFusionEngine:
             source = "parser:schp_pascal" if part in pascal.masks else "parser:fashn"
             ref = _store_mask(
                 mask,
+                runtime_mask_store,
                 conf,
                 source,
                 f"parser_{person.detection_id}_{mapping.canonical_region_type}",
@@ -691,6 +708,7 @@ class ParserFusionEngine:
                 src = f"parser:{source_name}"
                 ref = _store_mask(
                     mask,
+                    runtime_mask_store,
                     conf,
                     src,
                     f"parser_{person.detection_id}_{mapping.garment_type or mapping.canonical_region_type}",
@@ -735,6 +753,7 @@ class ParserFusionEngine:
                 conf = fashn.confidences.get(acc, 0.0)
                 ref = _store_mask(
                     fashn.masks[acc],
+                    runtime_mask_store,
                     conf,
                     "parser:fashn",
                     "accessory",
@@ -754,6 +773,7 @@ class ParserFusionEngine:
         if "background" in fashn.masks:
             bg_ref = _store_mask(
                 fashn.masks["background"],
+                runtime_mask_store,
                 fashn.confidences.get("background", 0.0),
                 "parser:fashn",
                 "parser_background",
@@ -780,6 +800,7 @@ class ParserFusionEngine:
             src = "parser:facer" if facer.masks else "parser:fashn"
             ref = _store_mask(
                 mask,
+                runtime_mask_store,
                 conf,
                 src,
                 "face",
@@ -859,9 +880,9 @@ class SegFormerHumanParserAdapter:
     def _builtin_parse(self, frame: FrameLike, person: PersonDetection) -> ParsingPrediction:
         feats = frame_to_features(frame)
         return ParsingPrediction(
-            mask_ref=f"mask::builtin::{person.detection_id}",
-            mask_confidence=min(0.99, max(0.2, feats[2])),
-            source="parser:human-stack:builtin",
+            mask_ref=None,
+            mask_confidence=0.0,
+            source="parser:human-stack:builtin:no_observed_mask",
             garments=[
                 GarmentPrediction("top", "visible", min(0.95, max(0.1, feats[0])), "parser:human-stack:builtin"),
             ],
@@ -909,9 +930,9 @@ class SegFormerHumanParserAdapter:
 
             if profiler:
                 with profiler.track("fusion"):
-                    fused = self.fusion.fuse(person, fashn, pascal, atr, facer, frame_size=frame_size)
+                    fused = self.fusion.fuse(person, fashn, pascal, atr, facer, frame_size=frame_size, mask_store=mask_store_from_frame(frame))
             else:
-                fused = self.fusion.fuse(person, fashn, pascal, atr, facer, frame_size=frame_size)
+                fused = self.fusion.fuse(person, fashn, pascal, atr, facer, frame_size=frame_size, mask_store=mask_store_from_frame(frame))
 
             self.last_runtime_formats[person.detection_id] = {
                 "fashn": fashn.runtime_format,

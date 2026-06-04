@@ -32,6 +32,9 @@ class CanonicalRegionPayloadBase(TypedDict):
     confidence: float
     visibility_state: VisibilityState | str
     provenance: str
+    observation_status: str
+    mask_evidence_type: str
+    suitable_for_memory_seeding: bool
     attachment_hints: list[str]
     ownership_hints: list[str]
     coverage_hints: list[str]
@@ -111,6 +114,10 @@ class BodyPartNode:
     frame_index: int = 0
     timestamp: float | None = None
     alternatives: list[str] = field(default_factory=list)
+    observation_status: str = "unknown"
+    mask_evidence_type: str = "unknown"
+    bbox_provenance: str = "unknown"
+    suitable_for_memory_seeding: bool = False
 
 
 @dataclass(slots=True)
@@ -166,6 +173,12 @@ class PersonNode:
     frame_index: int = 0
     timestamp: float | None = None
     alternatives: list[str] = field(default_factory=list)
+    track_confidence: float = 0.0
+    track_provenance: str = "unknown"
+    identity_observation_status: str = "unknown"
+    bbox_provenance: str = "unknown"
+    mask_evidence_type: str = "unknown"
+    suitable_for_memory_seeding: bool = False
     canonical_regions: dict[str, CanonicalRegionPayload] = field(default_factory=dict)
     region_relations: list[CanonicalRelationPayload] = field(default_factory=list)
 

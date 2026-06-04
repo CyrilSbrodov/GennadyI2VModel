@@ -10,7 +10,7 @@ from core.schema import BBox
 from perception.backend import BackendInferenceEngine, CheckpointManager, CheckpointSpec, frame_to_features
 from perception.frame_context import FrameLike
 from perception.image_ops import frame_to_numpy_rgb, rgb_to_bgr, xyxy_to_norm_bbox
-from perception.mask_store import DEFAULT_MASK_STORE
+from perception.mask_store import InMemoryMaskStore, mask_store_from_frame
 
 
 @dataclass(slots=True)
@@ -84,7 +84,7 @@ class YoloPersonDetectorAdapter:
         return self._model
 
     @staticmethod
-    def _mask_to_ref(mask: "object", *, detection_id: str, conf: float, source: str, bbox: BBox, frame_size: tuple[int, int]) -> tuple[str | None, float]:
+    def _mask_to_ref(mask: "object", *, detection_id: str, conf: float, source: str, bbox: BBox, frame_size: tuple[int, int], mask_store: InMemoryMaskStore) -> tuple[str | None, float]:
         if mask is None:
             return None, 0.0
         if hasattr(mask, "detach"):
@@ -112,7 +112,7 @@ class YoloPersonDetectorAdapter:
         ys, xs = np.where(bin_mask > 0)
         bbox_xyxy = (float(xs.min()) / max(1, frame_size[0]), float(ys.min()) / max(1, frame_size[1]), float(xs.max() + 1) / max(1, frame_size[0]), float(ys.max() + 1) / max(1, frame_size[1]))
         mask_conf = max(0.0, min(1.0, float(conf)))
-        ref = DEFAULT_MASK_STORE.put(
+        ref = mask_store.put(
             bin_mask.tolist(),
             confidence=mask_conf,
             source=source,
@@ -128,6 +128,7 @@ class YoloPersonDetectorAdapter:
 
     def _detect_ultralytics(self, frame: FrameLike) -> DetectorOutput:
         image = frame_to_numpy_rgb(frame)
+        mask_store = mask_store_from_frame(frame)
         model = self._load_ultralytics()
         results = model.predict(
             source=rgb_to_bgr(image.rgb),
@@ -162,6 +163,7 @@ class YoloPersonDetectorAdapter:
                         source="yolo_person_seg",
                         bbox=bbox,
                         frame_size=(image.width, image.height),
+                        mask_store=mask_store,
                     )
                 persons.append(
                     PersonDetection(

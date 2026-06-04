@@ -21,6 +21,7 @@ from learned.parity import (
 )
 from memory.summaries import AppearanceMemorySummarizer
 from memory.video_memory import MemoryManager
+from perception.contracts import validate_perception_output
 from perception.pipeline import PerceptionBackendsConfig, PerceptionPipeline
 from planning.transition_engine import StatePlan, TransitionPlanner
 from rendering.compositor import Compositor
@@ -657,6 +658,13 @@ class GennadyEngine:
         current_frame = self._normalize_frame_tensor(first_frame.tensor, field_name="input_frame") if first_frame else self._debug_seed_frame_tensor(profile)
         perception_input = first_frame if first_frame else current_frame
         perception_output = self.perception.analyze(perception_input)
+        perception_mask_store = getattr(self.perception, "mask_store", None)
+        if perception_mask_store is None or not hasattr(perception_mask_store, "get") or not hasattr(perception_mask_store, "put"):
+            raise ContractValidationError("Perception pipeline must expose a mask_store with get/put before scene graph construction")
+        try:
+            validate_perception_output(perception_output, perception_mask_store).raise_for_violations()
+        except ValueError as exc:
+            raise ContractValidationError(str(exc)) from exc
         perception_output.frame_size = (shape(current_frame)[1], shape(current_frame)[0])
         scene_graph = self.graph_builder.build(perception_output, frame_index=0)
         scene_graph.global_context.fps = fps
@@ -851,6 +859,7 @@ class GennadyEngine:
                     region=region,
                     route_decision=region_route,
                     delta=delta,
+                    mask_store=runtime_mask_store,
                 )
                 transition_metadata = transition_output.metadata if isinstance(transition_output.metadata, dict) else {}
                 learned_temporal_contract = transition_metadata.get("temporal_transition_contract", {})
