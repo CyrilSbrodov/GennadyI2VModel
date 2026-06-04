@@ -44,7 +44,7 @@ class TimingReport:
         self.sections[name] = round(perf_counter() - started, 6)
 
     def as_dict(self) -> dict[str, float]:
-        total = sum(self.sections.values())
+        total = sum(v for k, v in self.sections.items() if k != "total_pipeline")
         out = dict(self.sections)
         out["total_measured_sec"] = round(total, 6)
         return out
