@@ -23,6 +23,7 @@ from memory.summaries import AppearanceMemorySummarizer
 from memory.video_memory import MemoryManager
 from perception.contracts import validate_perception_output
 from perception.pipeline import PerceptionBackendsConfig, PerceptionPipeline
+from planning.action_plan import ActionPlanner, PlannerIntent, PlannerValidationError
 from planning.transition_engine import StatePlan, TransitionPlanner
 from rendering.compositor import Compositor
 from rendering.roi_renderer import ROISelector, RenderedPatch
@@ -134,6 +135,7 @@ class GennadyEngine:
         self.graph_builder = SceneGraphBuilder()
         self.memory_manager = MemoryManager()
         self.intent_parser = IntentParser()
+        self.action_planner = ActionPlanner()
         self.planner = TransitionPlanner()
         self.roi_selector = ROISelector()
         self.region_router = CanonicalRegionRouter(self.memory_manager, self.roi_selector)
@@ -720,6 +722,15 @@ class GennadyEngine:
         for severity in ("errors", "warnings", "traces"):
             for issue in text_parity.get(severity, []):
                 fallback_log.append(f"step=0:text_semantic_{severity}={issue}")
+        try:
+            planner_action_plan = self.action_planner.plan(PlannerIntent(raw_text=request.text, strict=False), scene_graph)
+        except PlannerValidationError as exc:
+            raise ContractValidationError(str(exc)) from exc
+        if not planner_action_plan.supported:
+            reason = ";".join(planner_action_plan.unsupported_reasons) or str(planner_action_plan.unsupported_code or "unknown")
+            fallback_log.append(f"planner_action_plan_unsupported:{reason}")
+        for fragment in getattr(planner_action_plan, "unsupported_fragments", ()):
+            fallback_log.append(f"planner_action_plan_partial_unsupported:{fragment}")
         state_plan = self.planner.expand(
             scene_graph,
             action_plan,
@@ -735,7 +746,7 @@ class GennadyEngine:
             max(1, len(state_plan.steps)),
             scene_graph.persons[0].person_id if scene_graph.persons else "scene",
         )
-        runtime_trace.append({"stage": PipelineStage.PLANNING.value, "detail": "transition_plan_expanded"})
+        runtime_trace.append({"stage": PipelineStage.PLANNING.value, "detail": "action_plan_contract_created" if planner_action_plan.supported else "unsupported_action_plan_recorded"})
 
         frames: list[list[list[list[float]]]] = [current_frame]
         graphs = [scene_graph]
@@ -847,6 +858,9 @@ class GennadyEngine:
             for region in changed_regions[: profile.max_roi_count]:
                 patch_channels = self.build_patch_memory_channels(memory_channels)
                 region_route = region_plan.decision_for_region_id(region.region_id)
+                if region_route is None:
+                    fallback_log.append(f"step={planned_state.step_index}:skipped_unrouted_region={region.region_id}")
+                    continue
                 try:
                     region_entity_id, canonical_region = parse_region_id(region.region_id)
                 except ValueError:
@@ -1340,6 +1354,7 @@ class GennadyEngine:
             state_plan=state_plan,
             debug={
                 "runtime_trace": runtime_trace,
+                "planner_action_plan": planner_action_plan.as_dict(),
                 "overlay_log": overlay_log,
                 "dynamics_metrics": dynamics_metrics_log,
                 "step_execution": step_debug,
