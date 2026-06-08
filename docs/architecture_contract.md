@@ -65,3 +65,13 @@ Face, head, and hair are identity-sensitive regions. Parser/face evidence for th
 The canonical adult human body ontology lives in `src/core/body_ontology.py` and is the single source for anatomical body-region IDs, parent/child topology, side, applicability policy, parser support, motion role, routing addressability, and memory family. Scene graph body-part construction, parser mappings, routing metadata, and memory reference families must preserve this ontology and must not collapse chest/breast/pelvis/groin/private/limb subregions into generic torso or pelvis blobs.
 
 Applicability, visibility, observation status, and parser support are independent. Not visible, not parsed, unknown, unsupported, or hidden regions must not become fake observed anatomy. Optional sex-specific/private regions are representation addresses only; this sprint does not add sex classification, hidden anatomy inference, reveal generation, explicit anatomy rendering, or soft-tissue physics.
+
+## Sprint 3 identity / appearance memory policy
+
+The `memory` stage is a strict typed policy boundary. Canonical region candidates are assessed before they can become memory, with separate `identity`, `skin`, `body_shape`, `soft_tissue`, `garment`, `accessory`, `private`, and `unknown` families. Identity memory is distinct from appearance, garment, body-shape, soft-tissue, and private memory.
+
+Authoritative identity memory is limited to directly observed high-confidence identity-sensitive regions (`face`, `head`, `hair`, `scalp`, ears, and future face subregion addresses when real evidence exists) with direct non-bbox mask evidence from observed face, parser, or input material. Generic detector material alone is not authoritative identity by default. Generated, inferred, fallback, synthetic/training-synthetic, hidden, unknown, unsupported, and private material must not become authoritative identity memory, must not overwrite observed identity anchors, and must remain traceable as weak/diagnostic/rejected policy outcomes.
+
+Private/sex-specific ontology regions are no-reference by default (`reference_kind="none"`). They may remain representation addresses but are not identity memory, are excluded from authoritative retrieval bundles, and do not imply reveal generation or private/anatomical rendering.
+
+Memory retrieval must be family-specific: identity requests receive identity references only when policy allowed them, garment requests receive garment references, body/skin/soft-tissue requests receive non-identity appearance references, and private requests receive no authoritative reference. Memory summaries expose compact policy status and counts. The engine must not create fake identity embeddings; missing identity descriptors remain explicitly absent.

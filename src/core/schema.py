@@ -430,6 +430,21 @@ class CanonicalRegionMemoryEntry:
     last_observed_frame: int | None = None
     reveal_lifecycle: str = "unknown"
     last_transition: str = "stable"
+    applicability: str = "applicable"
+    observation_status: str = "unknown"
+    mask_evidence_type: str = "missing"
+    parser_support_level: str = "unknown"
+    source_frame_kind: str = "unknown"
+    memory_family: str = "unknown"
+    authority: str = "weak"
+    material_provenance: str = "unknown"
+    policy_decision: str = "unknown"
+    policy_reasons: list[str] = field(default_factory=list)
+    can_seed_identity: bool = False
+    can_seed_appearance: bool = False
+    can_seed_reveal: bool = False
+    can_overwrite_authoritative: bool = False
+    embedding_absent: bool = True
 
 
 @dataclass(slots=True)
@@ -502,6 +517,17 @@ class RegionMemoryBundle:
     reveal_lifecycle: str = "unknown"
     memory_support_level: MemorySupportLevel = "none"
     retrieval_reasons: list[str] = field(default_factory=list)
+    policy_trace: list[str] = field(default_factory=list)
+    memory_family: str = "unknown"
+    reference_kind: str = "none"
+    authority: str = "unknown"
+    material_provenance: str = "unknown"
+    policy_decision: str = "unknown"
+    policy_reasons: list[str] = field(default_factory=list)
+    can_seed_identity: bool = False
+    can_seed_appearance: bool = False
+    can_seed_reveal: bool = False
+    can_overwrite_authoritative: bool = False
     has_current_reuse: bool = False
     has_identity_reference: bool = False
     has_appearance_reference: bool = False

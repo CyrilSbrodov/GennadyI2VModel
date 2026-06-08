@@ -55,6 +55,15 @@ class CanonicalRegionMemorySummary:
     reveal_lifecycle: str
     source_frame: int
     last_transition: str
+    memory_family: str = "unknown"
+    reference_kind: str = "none"
+    authority: str = "weak"
+    material_provenance: str = "unknown"
+    policy_decision: str = "unknown"
+    policy_reasons: list[str] = field(default_factory=list)
+    can_seed_identity: bool = False
+    can_seed_appearance: bool = False
+    can_seed_reveal: bool = False
 
 
 @dataclass(slots=True)
@@ -64,6 +73,8 @@ class AppearanceMemorySummary:
     body_regions: dict[str, BodyRegionSummary] = field(default_factory=dict)
     hidden_regions: dict[str, HiddenRegionSummary] = field(default_factory=dict)
     canonical_regions: dict[str, CanonicalRegionMemorySummary] = field(default_factory=dict)
+    policy_counts: dict[str, int] = field(default_factory=dict)
+    family_counts: dict[str, int] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -72,6 +83,8 @@ class AppearanceMemorySummary:
             "body_regions": {k: asdict(v) for k, v in self.body_regions.items()},
             "hidden_regions": {k: asdict(v) for k, v in self.hidden_regions.items()},
             "canonical_regions": {k: asdict(v) for k, v in self.canonical_regions.items()},
+            "policy_counts": dict(self.policy_counts),
+            "family_counts": dict(self.family_counts),
         }
 
 
@@ -123,13 +136,33 @@ class AppearanceMemorySummarizer:
                 reveal_lifecycle=rec.reveal_lifecycle,
                 source_frame=rec.source_frame,
                 last_transition=rec.last_transition,
+                memory_family=rec.memory_family,
+                reference_kind=rec.reference_kind,
+                authority=rec.authority,
+                material_provenance=rec.material_provenance,
+                policy_decision=rec.policy_decision,
+                policy_reasons=rec.policy_reasons[:],
+                can_seed_identity=rec.can_seed_identity,
+                can_seed_appearance=rec.can_seed_appearance,
+                can_seed_reveal=rec.can_seed_reveal,
             )
             for rec_id, rec in memory.canonical_region_memory.items()
         }
+        policy_counts = {
+            "authoritative_references": sum(1 for rec in memory.canonical_region_memory.values() if rec.authority == "authoritative"),
+            "authoritative_identity_entries": sum(1 for rec in memory.canonical_region_memory.values() if rec.memory_family == "identity" and rec.authority == "authoritative"),
+            "diagnostic_or_rejected_entries": sum(1 for rec in memory.canonical_region_memory.values() if rec.authority in {"diagnostic_only", "rejected"}),
+            "generated_inferred_fallback_entries": sum(1 for rec in memory.canonical_region_memory.values() if rec.material_provenance in {"generated", "inferred", "fallback", "synthetic"}),
+            "private_no_reference_entries": sum(1 for rec in memory.canonical_region_memory.values() if rec.memory_family == "private" and rec.reference_kind == "none"),
+        }
+        families = {rec.memory_family for rec in memory.canonical_region_memory.values()}
+        family_counts = {family: sum(1 for rec in memory.canonical_region_memory.values() if rec.memory_family == family) for family in sorted(families)}
         return AppearanceMemorySummary(
             identity=identity,
             garments=garments,
             body_regions=body_regions,
             hidden_regions=hidden_regions,
             canonical_regions=canonical_regions,
+            policy_counts=policy_counts,
+            family_counts=family_counts,
         )

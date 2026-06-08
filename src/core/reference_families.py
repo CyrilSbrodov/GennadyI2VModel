@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from core.body_ontology import BODY_ONTOLOGY
 
-CORE_IDENTITY_REGIONS = {name for name, meta in BODY_ONTOLOGY.items() if meta.memory_family == "identity"} | {"face", "head", "hair", "scalp"}
-SKIN_REFERENCE_REGIONS = {name for name, meta in BODY_ONTOLOGY.items() if meta.memory_family == "skin"}
+CORE_IDENTITY_REGIONS = {name for name, meta in BODY_ONTOLOGY.items() if meta.memory_family == "identity"}
+SKIN_REFERENCE_REGIONS = {name for name, meta in BODY_ONTOLOGY.items() if meta.memory_family == "skin"} | {"hands"}
 BODY_SHAPE_REFERENCE_REGIONS = {name for name, meta in BODY_ONTOLOGY.items() if meta.memory_family == "body_shape"}
 SOFT_TISSUE_REFERENCE_REGIONS = {name for name, meta in BODY_ONTOLOGY.items() if meta.memory_family == "soft_tissue"}
 PRIVATE_REFERENCE_REGIONS = {name for name, meta in BODY_ONTOLOGY.items() if meta.memory_family == "private"}
