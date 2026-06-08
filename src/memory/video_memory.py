@@ -6,7 +6,7 @@ import random
 
 import numpy as np
 
-from core.body_ontology import CANONICAL_BODY_REGION_ORDER, get_body_region_metadata
+from core.body_ontology import CANONICAL_BODY_REGION_ORDER
 from core.semantic_roi import SemanticROIHelper
 from core.region_ids import make_region_id, parse_region_id
 from core.reference_families import (
@@ -15,7 +15,15 @@ from core.reference_families import (
     CORE_IDENTITY_REGIONS as SHARED_CORE_IDENTITY_REGIONS,
     GARMENT_REFERENCE_REGIONS as SHARED_GARMENT_REFERENCE_REGIONS,
     SKIN_REFERENCE_REGIONS as SHARED_SKIN_REFERENCE_REGIONS,
+    SOFT_TISSUE_REFERENCE_REGIONS as SHARED_SOFT_TISSUE_REFERENCE_REGIONS,
     reference_kind_for_region,
+)
+from memory.memory_policy import (
+    MemoryAuthority,
+    MemoryFamily,
+    assess_memory_candidate,
+    classify_memory_family,
+    memory_reference_kind,
 )
 from core.schema import (
     BBox,
@@ -39,12 +47,14 @@ class MemoryManager:
     IDENTITY_SENSITIVE_REGIONS = SHARED_CORE_IDENTITY_REGIONS
     SKIN_REFERENCE_REGIONS = SHARED_SKIN_REFERENCE_REGIONS
     BODY_SHAPE_REGIONS = SHARED_BODY_SHAPE_REFERENCE_REGIONS
+    SOFT_TISSUE_REGIONS = SHARED_SOFT_TISSUE_REFERENCE_REGIONS
     GARMENT_REFERENCE_REGIONS = SHARED_GARMENT_REFERENCE_REGIONS
     ACCESSORY_REFERENCE_REGIONS = SHARED_ACCESSORY_REFERENCE_REGIONS
     APPEARANCE_SENSITIVE_REGIONS = (
         SHARED_CORE_IDENTITY_REGIONS
         | SHARED_BODY_SHAPE_REFERENCE_REGIONS
         | SHARED_SKIN_REFERENCE_REGIONS
+        | SHARED_SOFT_TISSUE_REFERENCE_REGIONS
         | SHARED_GARMENT_REFERENCE_REGIONS
         | SHARED_ACCESSORY_REFERENCE_REGIONS
     )
@@ -86,7 +96,7 @@ class MemoryManager:
 
     def _is_core_identity_region(self, region_type: str) -> bool:
         canonical = self._canonical_from_region_type(region_type) or region_type
-        return canonical in self.CORE_IDENTITY_REGIONS
+        return classify_memory_family(canonical) == MemoryFamily.IDENTITY
 
     def _is_identity_sensitive_region(self, region_type: str) -> bool:
         return self._is_core_identity_region(region_type)
@@ -163,12 +173,7 @@ class MemoryManager:
 
     def _reference_kind_for_region(self, region_type: str) -> str:
         canonical = self._canonical_from_region_type(region_type) or region_type
-        kind = reference_kind_for_region(canonical)
-        if kind != "none":
-            return kind
-        if canonical in self.APPEARANCE_SENSITIVE_REGIONS:
-            return "appearance_reference"
-        return "none"
+        return memory_reference_kind(classify_memory_family(canonical))
 
     def _reference_thresholds(self, reference_kind: str) -> tuple[float, float]:
         return self.REFERENCE_THRESHOLDS.get(reference_kind, self.REFERENCE_THRESHOLDS["appearance_reference"])
@@ -760,6 +765,11 @@ class MemoryManager:
                 reasons.append("reference_unreliable")
             if not entry.reliable_for_reuse:
                 reasons.append("reuse_unreliable")
+            reasons.append(f"memory_family:{entry.memory_family}")
+            reasons.append(f"authority:{entry.authority}")
+            reasons.append(f"material_provenance:{entry.material_provenance}")
+            reasons.append(f"policy_decision:{entry.policy_decision}")
+            reasons.extend(entry.policy_reasons)
 
         all_references = (
             identity_reference,
@@ -849,6 +859,17 @@ class MemoryManager:
             reveal_lifecycle=entry.reveal_lifecycle if entry else "unknown",
             memory_support_level=support_level,
             retrieval_reasons=reasons,
+            policy_trace=[r for r in reasons if r.startswith(("policy_", "family:", "material:", "memory_family:", "authority:", "material_provenance:"))],
+            memory_family=(entry.memory_family if entry else classify_memory_family(canonical_region).value),
+            reference_kind=(entry.reference_kind if entry else memory_reference_kind(classify_memory_family(canonical_region))),
+            authority=(entry.authority if entry else "unknown"),
+            material_provenance=(entry.material_provenance if entry else "unknown"),
+            policy_decision=(entry.policy_decision if entry else "missing"),
+            policy_reasons=(entry.policy_reasons[:] if entry else ["missing_memory_entry"]),
+            can_seed_identity=(entry.can_seed_identity if entry else False),
+            can_seed_appearance=(entry.can_seed_appearance if entry else False),
+            can_seed_reveal=(entry.can_seed_reveal if entry else False),
+            can_overwrite_authoritative=(entry.can_overwrite_authoritative if entry else False),
             has_current_reuse=current_reuse is not None,
             has_identity_reference=identity_reference is not None,
             has_appearance_reference=appearance_reference is not None,
@@ -1447,6 +1468,9 @@ class MemoryManager:
             "left_breast": "left_breast",
             "right_breast": "right_breast",
             "external_genital_region": "external_genital_region",
+            "male_external_genital_region": "male_external_genital_region",
+            "female_pelvic_region": "female_pelvic_region",
+            "male_pelvic_region": "male_pelvic_region",
         }
         canonical = direct.get(region_type)
         if canonical in self._CANONICAL_MEMORY_REGIONS:
@@ -1454,20 +1478,13 @@ class MemoryManager:
         return None
 
     def _memory_kind_for_region(self, canonical_region: str) -> str:
-        meta = get_body_region_metadata(canonical_region)
-        if meta is not None:
-            if meta.memory_family == "identity":
-                return "identity"
-            if meta.memory_family == "private":
-                return "private"
-            if meta.memory_family == "soft_tissue":
-                return "body"
-            return "body" if meta.memory_family in {"body_shape", "skin"} else meta.memory_family
-        if canonical_region in {"upper_garment", "lower_garment", "outer_garment", "inner_garment"}:
-            return "garment"
-        if canonical_region == "accessories":
-            return "accessory"
-        return "body"
+        family = classify_memory_family(canonical_region)
+        if family == MemoryFamily.UNKNOWN:
+            if canonical_region in {"upper_garment", "lower_garment", "outer_garment", "inner_garment", "garments", "sleeves"}:
+                return "garment"
+            if canonical_region == "accessories":
+                return "accessory"
+        return family.value
 
     def _visibility_to_reveal_lifecycle(self, visibility: str) -> str:
         if visibility in {"visible", "partially_visible"}:
@@ -1548,26 +1565,38 @@ class MemoryManager:
             and (entry.reveal_lifecycle != "newly_revealed" or entry.evidence_score >= 0.62)
             and entry.reveal_lifecycle not in {"newly_occluded", "currently_hidden"}
         )
-        reference_kind = self._reference_kind_for_region(entry.canonical_region)
-        strong_direct_reference = False
-        if reference_kind == "identity_reference":
-            strong_direct_reference = self._can_update_identity_reference(
-                region_type=entry.canonical_region,
-                observed_directly=entry.observed_directly,
-                generated=entry.generated,
-                inferred=entry.inferred,
-                evidence_score=entry.evidence_score,
-                confidence=entry.confidence,
-                reveal_lifecycle=entry.reveal_lifecycle,
-            )
-            if not strong_direct_reference:
-                reference_kind = "none"
-        elif reference_kind != "none":
-            strong_direct_reference = self._can_update_strong_reference(entry, reference_kind)
-        entry.reference_kind = reference_kind
-        entry.reliable_as_reference = bool(reference_kind != "none" and strong_direct_reference)
+        assessment = assess_memory_candidate(
+            canonical_region=entry.canonical_region,
+            confidence=entry.confidence,
+            evidence_score=entry.evidence_score,
+            observed_directly=entry.observed_directly,
+            generated=entry.generated,
+            inferred=entry.inferred,
+            provenance=entry.provenance,
+            visibility_state=str(entry.visibility_state),
+            mask_ref=entry.mask_ref,
+            applicability=entry.applicability,
+            observation_status=entry.observation_status,
+            mask_evidence_type=entry.mask_evidence_type,
+            parser_support_level=entry.parser_support_level,
+            reveal_lifecycle=entry.reveal_lifecycle,
+            source_frame_kind=entry.source_frame_kind,
+        )
+        entry.memory_family = assessment.memory_family.value
+        entry.authority = assessment.authority.value
+        entry.material_provenance = assessment.material_provenance.value
+        entry.policy_decision = assessment.policy_decision
+        entry.policy_reasons = list(assessment.policy_reasons)
+        entry.can_seed_identity = assessment.can_seed_identity
+        entry.can_seed_appearance = assessment.can_seed_appearance
+        entry.can_seed_reveal = assessment.can_seed_reveal
+        entry.can_overwrite_authoritative = assessment.can_overwrite_authoritative
+        entry.reference_kind = assessment.reference_kind
+        entry.reliable_as_reference = bool(assessment.authority in {MemoryAuthority.AUTHORITATIVE, MemoryAuthority.REUSABLE} and assessment.reference_kind != "none")
+        entry.reliable_for_reuse = bool(entry.reliable_for_reuse and assessment.can_seed_appearance and assessment.authority != MemoryAuthority.REJECTED)
         entry.suitable_for_reveal = bool(
-            entry.reliable_for_reuse
+            assessment.can_seed_reveal
+            and entry.reliable_for_reuse
             and entry.evidence_score >= 0.52
             and entry.freshness_frames <= 8
             and entry.reveal_lifecycle not in {"newly_occluded", "expected_unknown"}
@@ -1654,6 +1683,10 @@ class MemoryManager:
             applicability = str(raw.get("applicability", "applicable"))
             if applicability in {"not_applicable", "unknown_applicability", "unsupported_by_current_parser"} and not raw.get("mask_ref"):
                 continue
+            observation_status = str(raw.get("observation_status", "unknown"))
+            mask_evidence_type = str(raw.get("mask_evidence_type", "parser_mask" if raw.get("mask_ref") else "missing"))
+            parser_support_level = str(raw.get("parser_support_level", "unknown"))
+            source_frame_kind = str(raw.get("source_frame_kind", raw.get("frame_source", "unknown")))
             visibility = str(raw.get("visibility_state", "unknown_expected_region"))
             lifecycle_state = str(raw.get("lifecycle_state", "") or "").strip().lower()
             last_transition_mode = str(raw.get("last_transition_mode", "") or "").strip()
@@ -1671,6 +1704,8 @@ class MemoryManager:
                 raw.get("update_source"),
                 last_update_source,
                 provenance,
+                observation_status,
+                source_frame_kind,
             )
             observed_directly, inferred, evidence_score = self._derive_observation_semantics(
                 canonical_name=canonical_name,
@@ -1716,6 +1751,11 @@ class MemoryManager:
                 last_observed_frame=(frame_index if observed_directly else None),
                 reveal_lifecycle=lifecycle_state if lifecycle_state in {"newly_revealed", "newly_occluded", "visibility_changed"} else self._visibility_to_reveal_lifecycle(resolved_visibility),
                 last_transition="stable",
+                applicability=applicability,
+                observation_status=observation_status,
+                mask_evidence_type=mask_evidence_type,
+                parser_support_level=parser_support_level,
+                source_frame_kind=source_frame_kind,
             )
             transition_parts = [lifecycle_state or "stable"]
             if last_transition_mode:
@@ -1829,6 +1869,26 @@ class MemoryManager:
                 current.last_transition = "preserve_identity_on_occlusion"
             self._refresh_reuse_policy(current)
             return
+        if (
+            current.reliable_as_reference
+            and current.reference_kind != "none"
+            and current.observed_directly
+            and not current.generated
+            and not current.inferred
+            and (
+                candidate.generated
+                or candidate.inferred
+                or not candidate.observed_directly
+                or candidate.authority in {"diagnostic_only", "rejected"}
+                or candidate.reference_kind == "none"
+                or candidate.evidence_score + 0.12 < current.evidence_score
+                or candidate.confidence + 0.12 < current.confidence
+            )
+        ):
+            current.freshness_frames = max(0, candidate.source_frame - current.source_frame)
+            current.last_transition = "preserve_observed_reference_from_weaker_candidate"
+            self._refresh_reuse_policy(current)
+            return
         candidate_strength = self._entry_strength(candidate)
         current_strength = self._entry_strength(current)
         current.freshness_frames = max(0, candidate.source_frame - current.source_frame)
@@ -1898,6 +1958,11 @@ class MemoryManager:
             last_observed_frame=(source_frame if observed_directly else (existing.last_observed_frame if existing else None)),
             reveal_lifecycle=(self._visibility_to_reveal_lifecycle(visibility) if observed_directly else (existing.reveal_lifecycle if existing else self._visibility_to_reveal_lifecycle(visibility))),
             last_transition="refresh_from_frame",
+            applicability=(existing.applicability if existing is not None else "applicable"),
+            observation_status=("observed" if observed_directly else "generated" if generated else "inferred"),
+            mask_evidence_type=(existing.mask_evidence_type if existing is not None else ("parser_mask" if observed_directly else "missing")),
+            parser_support_level=(existing.parser_support_level if existing is not None else "unknown"),
+            source_frame_kind=("generated_runtime_frame" if generated else "observed_input_frame" if observed_directly else "unknown"),
         )
         self._refresh_reuse_policy(candidate)
         self._upsert_canonical_memory(memory, candidate)

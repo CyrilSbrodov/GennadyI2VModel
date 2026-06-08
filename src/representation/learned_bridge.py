@@ -21,7 +21,9 @@ class BaselineIdentityAppearanceEncoder(IdentityAppearanceEncoder):
         identity = memory_summary.get("identity", {}) if isinstance(memory_summary, dict) else {}
         rec = identity.get(entity_id, {}) if isinstance(identity, dict) else {}
         emb = rec.get("embedding", []) if isinstance(rec, dict) else []
-        return [float(x) for x in emb] if emb else [0.0] * 8
+        # No fake identity embedding is synthesized here. If the memory layer has
+        # no real descriptor/embedding, callers receive an empty contract payload.
+        return [float(x) for x in emb] if emb else []
 
 
 def summarize_memory(memory) -> dict[str, object]:

@@ -36,6 +36,10 @@ def _entry(
         freshness_frames=0,
         last_observed_frame=0 if observed_directly else None,
         reveal_lifecycle=reveal_lifecycle,
+        observation_status="observed" if observed_directly else ("generated" if generated else "inferred"),
+        mask_evidence_type="parser_mask" if observed_directly else "missing",
+        parser_support_level="direct",
+        source_frame_kind="generated_runtime_frame" if generated else ("observed_input_frame" if observed_directly else "unknown"),
     )
 
 

@@ -211,7 +211,9 @@ for n, p, parser in [
     ("jaw", "face", "unsupported"), ("chin", "face", "unsupported"), ("neck", "head", "direct"),
 ]:
     side = BodyRegionSide.LEFT if n.startswith("left_") else BodyRegionSide.RIGHT if n.startswith("right_") else BodyRegionSide.MIDLINE
-    _BASE[n] = _m(n, parent=p, side=side, group=BodyRegionGroup.CORE_IDENTITY, motion="identity_anchor", identity="strong", parser=parser, memory="identity", seeding=n in {"head", "hair", "face"})
+    memory_family = "skin" if n == "neck" else "identity"
+    identity_relevance = "supporting_non_authoritative" if n == "neck" else "strong"
+    _BASE[n] = _m(n, parent=p, side=side, group=BodyRegionGroup.CORE_IDENTITY, motion="identity_anchor", identity=identity_relevance, parser=parser, memory=memory_family, seeding=n in {"head", "hair", "face"})
 # Torso
 for n, p in [("torso", None), ("upper_torso", "torso"), ("lower_torso", "torso"), ("chest", "upper_torso"), ("left_chest", "chest"), ("right_chest", "chest"), ("abdomen", "lower_torso"), ("waist", "lower_torso"), ("back", "torso"), ("upper_back", "back"), ("lower_back", "back"), ("left_shoulder", "upper_torso"), ("right_shoulder", "upper_torso"), ("left_shoulder_blade", "upper_back"), ("right_shoulder_blade", "upper_back")]:
     side = BodyRegionSide.LEFT if n.startswith("left_") else BodyRegionSide.RIGHT if n.startswith("right_") else BodyRegionSide.MIDLINE
