@@ -34,6 +34,14 @@ def test_engine_runs_transition_loop(tmp_path: Path) -> None:
     assert dynamics_contract["rendered_pixels_generated"] is False
     assert dynamics_contract["memory_write_performed"] is False
     assert dynamics_contract["observed_evidence_created"] is False
+    reveal_contract = artifacts.debug["reveal_occlusion_contract"]
+    assert reveal_contract["contract_version"] == "reveal_occlusion_contract_v1"
+    assert reveal_contract["supported"] is True
+    assert any("снимает пальто" in fragment for fragment in reveal_contract["trace"]["unsupported_planner_fragments"])
+    assert reveal_contract["region_routing_called"] is False
+    assert reveal_contract["rendered_pixels_generated"] is False
+    assert reveal_contract["memory_write_performed"] is False
+    assert reveal_contract["observed_evidence_created"] is False
     assert artifacts.debug["overlay_log"]
 
 
@@ -51,8 +59,10 @@ def test_engine_runtime_trace_uses_canonical_pipeline_order(tmp_path: Path) -> N
     for mandatory_stage in CANONICAL_STAGE_NAMES:
         assert mandatory_stage in stages
     assert "dynamics_graph_delta_contract" in artifacts.debug
+    assert "reveal_occlusion_contract" in artifacts.debug
     assert min(i for i, stage in enumerate(stages) if stage == "planning") < min(i for i, stage in enumerate(stages) if stage == "dynamics")
-    assert min(i for i, stage in enumerate(stages) if stage == "dynamics") < min(i for i, stage in enumerate(stages) if stage == "region_routing")
+    assert min(i for i, stage in enumerate(stages) if stage == "dynamics") < min(i for i, stage in enumerate(stages) if stage == "reveal")
+    assert min(i for i, stage in enumerate(stages) if stage == "reveal") < min(i for i, stage in enumerate(stages) if stage == "region_routing")
     assert min(i for i, stage in enumerate(stages) if stage == "region_routing") < min(i for i, stage in enumerate(stages) if stage == "rendering")
     for step in artifacts.debug["step_execution"]:
         for patch in step["patch"]:
