@@ -24,6 +24,7 @@ from memory.summaries import AppearanceMemorySummarizer
 from memory.video_memory import MemoryManager
 from perception.contracts import validate_perception_output
 from perception.pipeline import PerceptionBackendsConfig, PerceptionPipeline
+from reveal.reveal_contract import build_reveal_handoff
 from planning.action_plan import ActionPlanner, PlannerIntent, PlannerValidationError
 from planning.transition_engine import StatePlan, TransitionPlanner
 from rendering.compositor import Compositor
@@ -751,6 +752,14 @@ class GennadyEngine:
         dynamics_handoff = build_dynamics_handoff(planner_action_plan)
         dynamics_graph_delta_contract = dynamics_handoff.graph_delta_contract.as_dict()
         runtime_trace.append({"stage": PipelineStage.DYNAMICS.value, "detail": "graph_delta_contract_created" if dynamics_handoff.supported else "unsupported_graph_delta_contract_recorded"})
+        reveal_handoff = build_reveal_handoff(
+            scene_graph=scene_graph,
+            memory=memory,
+            graph_delta_contract=dynamics_handoff.graph_delta_contract,
+            current_frame_index=scene_graph.frame_index,
+        )
+        reveal_occlusion_contract = reveal_handoff.reveal_contract.as_dict()
+        runtime_trace.append({"stage": PipelineStage.REVEAL.value, "detail": "reveal_occlusion_contract_created" if reveal_handoff.supported else "unsupported_reveal_occlusion_contract_recorded"})
         if not dynamics_handoff.supported:
             fallback_log.append("dynamics_graph_delta_contract_unsupported_planner_input")
         for fragment in dynamics_handoff.trace.unsupported_planner_fragments:
@@ -1364,6 +1373,7 @@ class GennadyEngine:
                 "runtime_trace": runtime_trace,
                 "planner_action_plan": planner_action_plan.as_dict(),
                 "dynamics_graph_delta_contract": dynamics_graph_delta_contract,
+                "reveal_occlusion_contract": reveal_occlusion_contract,
                 "overlay_log": overlay_log,
                 "dynamics_metrics": dynamics_metrics_log,
                 "step_execution": step_debug,

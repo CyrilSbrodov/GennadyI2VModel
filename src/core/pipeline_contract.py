@@ -18,6 +18,7 @@ class PipelineStage(str, Enum):
     INTENT = "intent"
     PLANNING = "planning"
     DYNAMICS = "dynamics"
+    REVEAL = "reveal"
     REGION_ROUTING = "region_routing"
     RENDERING = "rendering"
     COMPOSITING = "compositing"
@@ -33,6 +34,7 @@ CANONICAL_PIPELINE_ORDER: tuple[PipelineStage, ...] = (
     PipelineStage.INTENT,
     PipelineStage.PLANNING,
     PipelineStage.DYNAMICS,
+    PipelineStage.REVEAL,
     PipelineStage.REGION_ROUTING,
     PipelineStage.RENDERING,
     PipelineStage.COMPOSITING,
