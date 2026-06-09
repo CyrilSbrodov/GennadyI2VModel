@@ -9,6 +9,7 @@ import numpy as np
 from core.input_layer import InputAssetLayer
 from core.pipeline_contract import ContractValidationError, PipelineStage, validate_runtime_trace
 from core.schema import BBox, GraphDelta, ReferencePatchPayload, RegionMemoryBundle, RegionRef, SceneGraph
+from dynamics.graph_delta_contract import build_dynamics_handoff
 from dynamics.state_update import apply_delta
 from learned.factory import BackendBundle, BackendConfig, LearnedBackendFactory
 from learned.interfaces import DynamicsTransitionRequest, PatchSynthesisRequest, TemporalRefinementRequest
@@ -747,6 +748,13 @@ class GennadyEngine:
             scene_graph.persons[0].person_id if scene_graph.persons else "scene",
         )
         runtime_trace.append({"stage": PipelineStage.PLANNING.value, "detail": "action_plan_contract_created" if planner_action_plan.supported else "unsupported_action_plan_recorded"})
+        dynamics_handoff = build_dynamics_handoff(planner_action_plan)
+        dynamics_graph_delta_contract = dynamics_handoff.graph_delta_contract.as_dict()
+        runtime_trace.append({"stage": PipelineStage.DYNAMICS.value, "detail": "graph_delta_contract_created" if dynamics_handoff.supported else "unsupported_graph_delta_contract_recorded"})
+        if not dynamics_handoff.supported:
+            fallback_log.append("dynamics_graph_delta_contract_unsupported_planner_input")
+        for fragment in dynamics_handoff.trace.unsupported_planner_fragments:
+            fallback_log.append(f"dynamics_graph_delta_contract_partial_unsupported:{fragment}")
 
         frames: list[list[list[list[float]]]] = [current_frame]
         graphs = [scene_graph]
@@ -1355,6 +1363,7 @@ class GennadyEngine:
             debug={
                 "runtime_trace": runtime_trace,
                 "planner_action_plan": planner_action_plan.as_dict(),
+                "dynamics_graph_delta_contract": dynamics_graph_delta_contract,
                 "overlay_log": overlay_log,
                 "dynamics_metrics": dynamics_metrics_log,
                 "step_execution": step_debug,
