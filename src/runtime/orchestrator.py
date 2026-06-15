@@ -34,6 +34,7 @@ from representation.learned_bridge import summarize_memory
 from runtime.profiles import PROFILES, RuntimeProfile
 from runtime.region_metadata import build_region_metadata
 from runtime.region_routing import CanonicalRegionRouter
+from runtime.region_routing_contract import build_region_routing_handoff
 from runtime.i2v_frame_planner import I2VFramePlanEntry, plan_i2v_frames
 from runtime.region_mask_propagation import propagate_region_masks_for_frame, seed_input_region_observations
 from text.intent_parser import IntentParser
@@ -760,6 +761,15 @@ class GennadyEngine:
         )
         reveal_occlusion_contract = reveal_handoff.reveal_contract.as_dict()
         runtime_trace.append({"stage": PipelineStage.REVEAL.value, "detail": "reveal_occlusion_contract_created" if reveal_handoff.supported else "unsupported_reveal_occlusion_contract_recorded"})
+        region_routing_handoff = build_region_routing_handoff(
+            scene_graph=scene_graph,
+            graph_delta_contract=dynamics_handoff.graph_delta_contract,
+            reveal_contract=reveal_handoff.reveal_contract,
+            memory=memory,
+        )
+        region_routing_contract = region_routing_handoff.region_routing_contract.as_dict()
+        region_routing_allowed_ids = set(region_routing_handoff.region_routing_contract.renderable_region_ids)
+        runtime_trace.append({"stage": PipelineStage.REGION_ROUTING.value, "detail": "region_routing_contract_created"})
         if not dynamics_handoff.supported:
             fallback_log.append("dynamics_graph_delta_contract_unsupported_planner_input")
         for fragment in dynamics_handoff.trace.unsupported_planner_fragments:
@@ -852,7 +862,13 @@ class GennadyEngine:
             }
             transition_diag["region_transition_semantics"] = region_plan.as_debug_dict()["transition_semantics"]
             delta.transition_diagnostics = transition_diag
-            changed_regions = region_plan.render_regions or self.roi_selector.select(scene_graph, delta)
+            candidate_regions = region_plan.render_regions or self.roi_selector.select(scene_graph, delta)
+            changed_regions = []
+            for region in candidate_regions:
+                if region.region_id in region_routing_allowed_ids:
+                    changed_regions.append(region)
+                else:
+                    fallback_log.append(f"step={planned_state.step_index}:blocked_by_region_routing_contract_no_renderable_decision:{region.region_id}")
             frame_plan_added_regions: list[str] = []
             frame_plan_missing_regions: list[str] = []
             if frame_plan_entry and frame_plan_entry.affected_regions:
@@ -863,6 +879,9 @@ class GennadyEngine:
                     resolved = self._resolve_planned_region(scene_graph, self.roi_selector, planned_region_id)
                     if resolved is None:
                         frame_plan_missing_regions.append(planned_region_id)
+                        continue
+                    if resolved.region_id not in region_routing_allowed_ids:
+                        fallback_log.append(f"step={planned_state.step_index}:blocked_by_region_routing_contract_no_renderable_decision:{resolved.region_id}")
                         continue
                     changed_regions.append(resolved)
                     existing_ids.add(planned_region_id)
@@ -1374,6 +1393,7 @@ class GennadyEngine:
                 "planner_action_plan": planner_action_plan.as_dict(),
                 "dynamics_graph_delta_contract": dynamics_graph_delta_contract,
                 "reveal_occlusion_contract": reveal_occlusion_contract,
+                "region_routing_contract": region_routing_contract,
                 "overlay_log": overlay_log,
                 "dynamics_metrics": dynamics_metrics_log,
                 "step_execution": step_debug,
