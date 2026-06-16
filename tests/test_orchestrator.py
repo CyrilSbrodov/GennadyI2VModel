@@ -48,6 +48,9 @@ def test_engine_runs_transition_loop(tmp_path: Path) -> None:
     assert routing_contract["memory_write_performed"] is False
     assert routing_contract["observed_evidence_created"] is False
     assert all(not d["render_candidate_allowed"] for d in routing_contract["decisions"] if d["blocked"] or d["diagnostic_only"])
+    renderer_summary = artifacts.debug["roi_renderer_contract_summary"]
+    assert renderer_summary["contract_version"] == "roi_renderer_contract_v1"
+    assert renderer_summary["requests_built"] == renderer_summary["outputs_validated"]
     assert artifacts.debug["overlay_log"]
 
 
@@ -92,3 +95,8 @@ def test_engine_runtime_trace_uses_canonical_pipeline_order(tmp_path: Path) -> N
             trace = patch["execution_trace"]
             assert trace["region_route_decision"]["region_id"] == patch["region_id"]
             assert trace["region_route_decision"]["decision"] != "unknown"
+            renderer_contract = trace["roi_renderer_contract"]
+            assert renderer_contract["region_id"] == patch["region_id"]
+            assert renderer_contract["observed_evidence_created"] is False
+            assert renderer_contract["identity_memory_created"] is False
+            assert renderer_contract["memory_write_allowed"] is False
