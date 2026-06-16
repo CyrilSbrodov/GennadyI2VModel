@@ -14,6 +14,7 @@ from learned.interfaces import (
     TextEncoder,
 )
 from rendering.learned_bridge import LegacyDeterministicPatchSynthesisModel, TrainablePatchSynthesisModel
+from rendering.learned_roi_renderer import LightweightROIRendererBackend
 from rendering.temporal_bridge import LegacyBaselineTemporalConsistencyModel, TrainableTemporalConsistencyBackend
 from representation.learned_bridge import BaselineGraphEncoder, BaselineIdentityAppearanceEncoder
 from text.learned_bridge import BaselineTextEncoderAdapter
@@ -120,6 +121,8 @@ class LearnedBackendFactory:
         raise ValueError(f"Unknown dynamics backend: {name}")
 
     def _build_patch(self, name: str) -> PatchSynthesisModel:
+        if name in {"lightweight_roi", "learned_roi_renderer"}:
+            return LightweightROIRendererBackend(checkpoint_path=self.config.patch_checkpoint_path, enabled=True, device="cpu")
         if name in {"trainable_local", "learned_primary"}:
             if runtime_forbids_fallbacks(self._runtime_mode) and not self.config.patch_checkpoint_path:
                 raise RuntimeError("strict learned runtime requires patch checkpoint")

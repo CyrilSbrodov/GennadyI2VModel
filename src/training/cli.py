@@ -9,6 +9,7 @@ from training.types import TrainingConfig
 from training.renderer_observed_pairs_builder import build_renderer_manifest_from_observed_pairs
 from training.temporal_observed_sequences_builder import build_temporal_manifest_from_observed_sequences
 from training.dynamics_observed_transitions_builder import build_dynamics_manifest_from_observed_transitions
+from rendering.learned_roi_renderer import train_lightweight_roi_renderer
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -30,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
             "renderer_manifest_from_observed_pairs",
             "temporal_manifest_from_observed_sequences",
             "dynamics_manifest_from_observed_transitions",
+            "train_roi_renderer",
         ],
     )
     parser.add_argument("--epochs", type=int, default=2)
@@ -46,6 +48,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--strict-dataset", action="store_true", help="Enable strict supervised dataset policy.")
     parser.add_argument("--observed-transitions-path", default="", help="Observed graph transitions JSON input path (dynamics_observed_transition_manifest_input_v1).")
     parser.add_argument("--renderer-backend", default="numpy_local", choices=["numpy_local", "torch_local"], help="Renderer training backend.")
+    parser.add_argument("--manifest", default="", help="Observed ROI pair manifest for train_roi_renderer.")
+    parser.add_argument("--out", default="", help="Checkpoint output path for train_roi_renderer.")
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda", "auto"])
+    parser.add_argument("--roi-size", "--image-size", dest="roi_size", type=int, default=16)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--resume", default="")
     return parser
 
 
@@ -64,7 +75,14 @@ def main() -> None:
         config.temporal_target_role_policy = "supervised_only"
         config.dynamics_target_role_policy = "supervised_only"
 
-    if args.stage == "renderer_manifest_from_observed_pairs":
+    if args.stage == "train_roi_renderer":
+        if not args.manifest:
+            raise ValueError("--manifest is required for train_roi_renderer")
+        if not args.out:
+            raise ValueError("--out is required for train_roi_renderer")
+        metrics = train_lightweight_roi_renderer(args.manifest, args.out, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, device=args.device, roi_size=args.roi_size, seed=args.seed, max_samples=args.max_samples, strict=bool(args.strict), resume=args.resume)
+        payload = [{"stage": "train_roi_renderer", "metrics": metrics, "checkpoint": metrics.get("checkpoint_path", "")}]
+    elif args.stage == "renderer_manifest_from_observed_pairs":
         if not args.observed_pairs_path:
             raise ValueError("--observed-pairs-path is required for renderer_manifest_from_observed_pairs")
         if not args.output_path:
@@ -93,6 +111,8 @@ def main() -> None:
         payload = [{"stage": r.stage_name, "val": r.val_metrics, "checkpoint": r.checkpoint_path} for r in results]
     else:
         if args.stage in {"renderer", "temporal_refinement", "dynamics_transition"} and args.strict_dataset and not args.learned_dataset_path:
+            if args.stage == "renderer":
+                raise ValueError("--learned-dataset-path is required for supervised renderer training")
             raise ValueError("--learned-dataset-path is required for supervised training")
         result = train_stage(args.stage, config)
         row = {"stage": result.stage_name, "val": result.val_metrics, "checkpoint": result.checkpoint_path}
