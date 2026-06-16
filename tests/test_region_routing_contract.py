@@ -383,3 +383,20 @@ def test_validation_fails_loudly_for_contract_violations() -> None:
         validate_region_routing_decision(replace(identity, memory_write_performed=True))
     with pytest.raises(RegionRoutingValidationError, match="observed_evidence_claimed"):
         validate_region_routing_decision(replace(identity, observed_evidence_created=True))
+
+
+def test_renderable_decision_for_region_id_skips_diagnostic_first_decision():
+    routeable = next(d for d in build_region_routing_handoff(scene_graph=_scene(), graph_delta_contract=_graph("face", "expression_delta"), reveal_contract=RevealContract(), memory=VideoMemory()).region_routing_contract.decisions if d.region_id == "p1:face")
+    diagnostic = replace(
+        routeable,
+        decision_type=RegionRoutingDecisionType.ROUTE_OCCLUSION_REASONING_ONLY.value,
+        route_allowed=False,
+        render_candidate_allowed=False,
+        diagnostic_only=True,
+        roi_required=False,
+    )
+    contract = RegionRoutingContract(decisions=(diagnostic, routeable), renderable_region_ids=(routeable.region_id,))
+
+    assert contract.decision_for_region_id("p1:face") is diagnostic
+    assert contract.renderable_decision_for_region_id("p1:face") is routeable
+    assert contract.renderable_decision_for_region_id("p1:torso") is None

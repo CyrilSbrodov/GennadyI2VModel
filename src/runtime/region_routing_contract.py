@@ -278,6 +278,19 @@ class RegionRoutingContract:
                 return decision
         return None
 
+    def renderable_decision_for_region_id(self, region_id: str) -> RegionRoutingDecision | None:
+        for decision in self.decisions:
+            if (
+                decision.region_id == region_id
+                and decision.route_allowed
+                and decision.render_candidate_allowed
+                and not decision.blocked
+                and not decision.diagnostic_only
+                and decision.roi_required
+            ):
+                return decision
+        return None
+
 
 @dataclass(frozen=True, slots=True)
 class RegionRoutingHandoffResult:

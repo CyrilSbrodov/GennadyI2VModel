@@ -29,6 +29,7 @@ from planning.action_plan import ActionPlanner, PlannerIntent, PlannerValidation
 from planning.transition_engine import StatePlan, TransitionPlanner
 from rendering.compositor import Compositor
 from rendering.roi_renderer import ROISelector, RenderedPatch
+from rendering.roi_renderer_contract import build_roi_render_request, wrap_roi_render_output
 from representation.graph_builder import SceneGraphBuilder
 from representation.learned_bridge import summarize_memory
 from runtime.profiles import PROFILES, RuntimeProfile
@@ -769,6 +770,7 @@ class GennadyEngine:
         )
         region_routing_contract = region_routing_handoff.region_routing_contract.as_dict()
         region_routing_allowed_ids = set(region_routing_handoff.region_routing_contract.renderable_region_ids)
+        roi_renderer_contract_summary = {"contract_version": "roi_renderer_contract_v1", "requests_built": 0, "outputs_validated": 0, "blocked": 0, "renderable_region_ids": list(region_routing_allowed_ids)}
         runtime_trace.append({"stage": PipelineStage.REGION_ROUTING.value, "detail": "region_routing_contract_created"})
         if not dynamics_handoff.supported:
             fallback_log.append("dynamics_graph_delta_contract_unsupported_planner_input")
@@ -892,6 +894,21 @@ class GennadyEngine:
             step_hidden_reconstruction = False
             step_hidden_cases = 0
             for region in changed_regions[: profile.max_roi_count]:
+                region_route = region_routing_handoff.region_routing_contract.renderable_decision_for_region_id(region.region_id)
+                if region_route is None:
+                    roi_renderer_contract_summary["blocked"] = int(roi_renderer_contract_summary.get("blocked", 0)) + 1
+                    fallback_log.append(f"step={planned_state.step_index}:blocked_by_roi_renderer_contract_missing_route_decision:{region.region_id}")
+                    continue
+                roi_bbox = (region.bbox.x, region.bbox.y, region.bbox.w, region.bbox.h)
+                roi_render_request = build_roi_render_request(
+                    route_decision=region_route,
+                    routing_contract=region_routing_handoff.region_routing_contract,
+                    roi_bbox=roi_bbox,
+                    current_frame_shape=shape(current_frame),
+                    input_frame_ref="runtime_current_frame",
+                    frame_index=len(frames) - 1,
+                )
+                roi_renderer_contract_summary["requests_built"] = int(roi_renderer_contract_summary.get("requests_built", 0)) + 1
                 patch_channels = self.build_patch_memory_channels(memory_channels)
                 region_route = region_plan.decision_for_region_id(region.region_id)
                 if region_route is None:
@@ -963,6 +980,8 @@ class GennadyEngine:
                         "learned_human_state_contract": learned_human_state_contract,
                         "region_selection_rationale": transition_metadata.get("region_selection_rationale", {}),
                         "semantic_families": transition_metadata.get("semantic_families", []),
+                        "roi_renderer_contract": roi_render_request.as_dict(),
+                        "roi_renderer_training_metadata": roi_render_request.to_training_metadata(),
                         "region_route_decision": self._rendering_route_context(
                             region_id=region.region_id,
                             canonical_region=canonical_region,
@@ -992,6 +1011,17 @@ class GennadyEngine:
                 if not any(item["stage"] == PipelineStage.RENDERING.value for item in runtime_trace):
                     runtime_trace.append({"stage": PipelineStage.RENDERING.value, "detail": "roi_renderer_executed_with_routing_context"})
                 patch_out = self.backends.patch_backend.synthesize_patch(patch_request)
+                roi_render_output = wrap_roi_render_output(
+                    request=roi_render_request,
+                    patch_ref=f"runtime_patch:step={planned_state.step_index}:region={region.region_id}",
+                    patch_shape=(patch_out.height, patch_out.width, patch_out.channels),
+                    alpha_mask_ref=f"runtime_alpha:step={planned_state.step_index}:region={region.region_id}",
+                    mask_info={"runtime_alpha_mask": True, "observed_evidence_created": False},
+                )
+                patch_out.execution_trace = dict(patch_out.execution_trace)
+                patch_out.execution_trace["roi_renderer_contract"] = roi_render_output.as_dict()
+                patch_out.execution_trace["roi_renderer_training_metadata"] = roi_render_request.to_training_metadata()
+                roi_renderer_contract_summary["outputs_validated"] = int(roi_renderer_contract_summary.get("outputs_validated", 0)) + 1
                 patch_contract_validation = self._validate_patch_output_contract(patch_out, expected_region_id=region.region_id)
                 if patch_contract_validation["issues"]:
                     raise ValueError(f"Patch contract violation at step={planned_state.step_index}, region={region.region_id}: {patch_contract_validation['issues']}")
@@ -1093,6 +1123,7 @@ class GennadyEngine:
                         },
                         "parity": patch_parity,
                         "contract_validation": patch_contract_validation,
+                        "renderer_contract": roi_render_output.as_dict(),
                         "execution_trace": {
                             key: patch_out.execution_trace.get(key)
                             for key in (
@@ -1135,6 +1166,8 @@ class GennadyEngine:
                                 "reference_tensor_zero_fallback",
                                 "reference_tensor_input_channels",
                                 "region_id",
+                                "roi_renderer_contract",
+                                "roi_renderer_training_metadata",
                                 "region_route_decision",
                                 "routing_region_id",
                                 "canonical_region_id",
@@ -1394,6 +1427,7 @@ class GennadyEngine:
                 "dynamics_graph_delta_contract": dynamics_graph_delta_contract,
                 "reveal_occlusion_contract": reveal_occlusion_contract,
                 "region_routing_contract": region_routing_contract,
+                "roi_renderer_contract_summary": roi_renderer_contract_summary,
                 "overlay_log": overlay_log,
                 "dynamics_metrics": dynamics_metrics_log,
                 "step_execution": step_debug,
